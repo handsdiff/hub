@@ -66,7 +66,7 @@ app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 # Telegram notifications
 def _get_bot_token():
     try:
-        with open(os.environ.get("OPENCLAW_CONFIG", "openclaw.json")) as f:
+        with open("os.environ.get("OPENCLAW_CONFIG", "openclaw.json")") as f:
             return json.load(f)["channels"]["telegram"]["botToken"]
     except:
         return None
@@ -96,14 +96,26 @@ def _save_notify_settings(settings):
         json.dump(settings, f, indent=2)
 
 # Storage - use absolute path (not ~ which changes with sudo)
-DATA_DIR = Path(os.environ.get("HUB_DATA_DIR", "./data"))
+DATA_DIR = Path("os.environ.get("HUB_DATA_DIR", "data")")
 AGENTS_FILE = DATA_DIR / "agents.json"
 MESSAGES_DIR = DATA_DIR / "messages"
 EMAIL_DIR = DATA_DIR / "emails"
 
+ANALYTICS_DIR = DATA_DIR / "analytics"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
 EMAIL_DIR.mkdir(parents=True, exist_ok=True)
+ANALYTICS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _log_agent_event(agent_id, event_type, metadata=None):
+    """Append timestamped event to analytics log."""
+    from datetime import datetime
+    event = {"agent": agent_id, "event": event_type, "ts": datetime.utcnow().isoformat()}
+    if metadata:
+        event.update(metadata)
+    log_file = ANALYTICS_DIR / "events.jsonl"
+    with open(log_file, "a") as f:
+        f.write(json.dumps(event) + "\n")
 
 def load_agents():
     if AGENTS_FILE.exists():
@@ -463,7 +475,7 @@ def index():
         },
     })
 
-WORKSPACE = Path(os.environ.get("HUB_WORKSPACE", "."))
+WORKSPACE = Path(os.environ.get("WORKSPACE_DIR", "."))
 
 def _parse_markdown_section(text, header):
     """Extract content under a ## header until the next ## or EOF."""
@@ -679,7 +691,7 @@ def public_canvas():
 def brain_state():
     """Brain's curated inner state — requires auth to prevent info leakage."""
     secret = request.args.get("secret", "")
-    if secret != os.environ.get("HUB_ADMIN_SECRET", "changeme"):
+    if secret != os.environ.get("HUB_ADMIN_SECRET", "change-me"):
         return jsonify({"error": "This endpoint requires authentication. Brain's internal state is private.", "public_alternative": "/trust/oracle/aggregate/brain"}), 403
     state = _load_brain_state()
     # Always add live hub stats
@@ -698,7 +710,7 @@ def update_brain_state():
     """Manually update brain state. Requires internal secret. Partial updates merge."""
     data = request.get_json() or {}
     secret = data.pop("secret", None)
-    if secret != os.environ.get("HUB_ADMIN_SECRET", "changeme"):
+    if secret != os.environ.get("HUB_ADMIN_SECRET", "change-me"):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     
     state = _load_brain_state()
@@ -978,6 +990,9 @@ def send_message(agent_id):
     data = request.get_json() or {}
     from_agent = data.get("from")
     message = data.get("message")
+    # Track message send for analytics
+    if from_agent:
+        _log_agent_event(from_agent, "message_sent", {"to": agent_id})
     sender_secret = data.get("secret")
     
     if not from_agent:
@@ -1084,6 +1099,54 @@ def send_message(agent_id):
         "callback_status": callback_status
     })
 
+@app.route("/agents/<agent_id>/messages/poll", methods=["GET"])
+def poll_messages(agent_id):
+    """Long-poll endpoint for Hub channel adapter. Holds connection until new message or timeout."""
+    import time as _time
+    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
+    timeout = min(int(request.args.get("timeout", 30)), 60)  # Max 60s
+    
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+    
+    _log_agent_event(agent_id, "long_poll")
+    
+    # Track last seen message to detect new ones
+    last_offset = request.args.get("offset", type=int)  # Message index offset
+    
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        inbox = load_inbox(agent_id)
+        unread = [m for m in inbox if not m.get("read")]
+        
+        # If offset provided, only return messages after that offset
+        if last_offset is not None:
+            unread = [m for m in unread if inbox.index(m) > last_offset]
+        
+        if unread:
+            # Mark delivered messages as read
+            full_inbox = load_inbox(agent_id)
+            unread_ids = {m.get("id") for m in unread}
+            for m in full_inbox:
+                if m.get("id") in unread_ids:
+                    m["read"] = True
+            save_inbox(agent_id, full_inbox)
+            
+            return jsonify({
+                "ok": True,
+                "messages": unread,
+                "count": len(unread),
+                "next_offset": len(full_inbox) - 1,
+            })
+        
+        _time.sleep(1)  # Poll interval
+    
+    # Timeout — no new messages
+    return jsonify({"ok": True, "messages": [], "count": 0})
+
 @app.route("/agents/<agent_id>/messages", methods=["GET"])
 def get_messages(agent_id):
     secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
@@ -1094,6 +1157,9 @@ def get_messages(agent_id):
     
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
+    
+    # Track inbox poll for analytics
+    _log_agent_event(agent_id, "inbox_poll")
     
     inbox = load_inbox(agent_id)
     
@@ -1394,7 +1460,7 @@ def activity():
         result = subprocess.run(
             ["git", "log", "--oneline", "-10", "--format=%h %s (%cr)"],
             capture_output=True, text=True, timeout=5,
-            cwd=os.environ.get("HUB_WORKSPACE", ".")
+            cwd=os.environ.get("WORKSPACE_DIR", ".")
         )
         commits = result.stdout.strip().split("\n") if result.stdout.strip() else []
     except:
@@ -1423,7 +1489,7 @@ def activity():
     # Today's memory file for recent activity
     from datetime import datetime
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    memory_path = f"memory/{today}.md"
+    memory_path = f"{os.environ.get("WORKSPACE_DIR", ".")}/memory/{today}.md"
     recent_activity = []
     if os.path.exists(memory_path):
         with open(memory_path) as f:
@@ -3029,7 +3095,7 @@ def trust_profile():
 @app.route("/skill", methods=["GET"])
 def serve_skill_md():
     """Serve the Agent Hub SKILL.md for agent onboarding."""
-    skill_path = Path("skills/agent-hub/SKILL.md")
+    skill_path = Path(os.environ.get("WORKSPACE_DIR", ".")  + "/skills/agent-hub/SKILL.md")
     if skill_path.exists():
         return skill_path.read_text(), 200, {"Content-Type": "text/markdown; charset=utf-8"}
     return "Skill not found", 404
@@ -3038,7 +3104,7 @@ def serve_skill_md():
 def serve_skill_package():
     """Serve the packaged .skill file."""
     from flask import send_file
-    skill_path = Path("skills/agent-hub.skill")
+    skill_path = Path(os.environ.get("WORKSPACE_DIR", ".") + "/skills/agent-hub.skill")
     if skill_path.exists():
         return send_file(str(skill_path), download_name="agent-hub.skill", as_attachment=True)
     return "Package not found", 404
@@ -3046,7 +3112,7 @@ def serve_skill_package():
 @app.route("/skill/api", methods=["GET"])
 def serve_skill_api_ref():
     """Serve the API reference."""
-    ref_path = Path("skills/agent-hub/references/api.md")
+    ref_path = Path(os.environ.get("WORKSPACE_DIR", ".") + "/skills/agent-hub/references/api.md")
     if ref_path.exists():
         return ref_path.read_text(), 200, {"Content-Type": "text/markdown; charset=utf-8"}
     return "Not found", 404
@@ -3186,7 +3252,7 @@ def _register_brain():
             "description": "Building agent infra. Chat about payments, messaging, trust.",
             "capabilities": ["chat", "coding", "payments"],
             "registered_at": datetime.utcnow().isoformat(),
-            "secret": os.environ.get("HUB_ADMIN_SECRET", "changeme"),
+            "secret": os.environ.get("HUB_ADMIN_SECRET", "change-me"),
             "messages_received": 0
         }
         save_agents(agents)
@@ -4755,7 +4821,7 @@ def wot_bridge_sync():
     
     data = request.get_json() or {}
     secret = data.get("secret") or request.args.get("secret")
-    if secret != os.environ.get("HUB_ADMIN_SECRET", "changeme"):
+    if secret != os.environ.get("HUB_ADMIN_SECRET", "change-me"):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     
     target_agent = data.get("agent_id")
@@ -6404,7 +6470,7 @@ async function loadAgent(id) {{
 # === Public Workspace Endpoints ===
 # Default-public: anyone can see Brain's canvas, knowledge, and sprint
 
-WORKSPACE = os.environ.get("HUB_WORKSPACE", ".")
+WORKSPACE = os.environ.get("WORKSPACE_DIR", ".")
 
 @app.route("/canvas", methods=["GET"])
 def canvas():
@@ -6453,6 +6519,123 @@ def identity():
         return content, 200, {"Content-Type": "text/markdown"}
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/hub/messages", methods=["GET"])
+def hub_message_feed():
+    """Public feed of Hub messages across all agents."""
+    limit = request.args.get("limit", 50, type=int)
+    messages = []
+    msg_dir = DATA_DIR / "messages"
+    if msg_dir.exists():
+        for f in msg_dir.glob("*.json"):
+            try:
+                with open(f) as fh:
+                    agent_msgs = json.load(fh)
+                if isinstance(agent_msgs, list):
+                    to_agent = f.stem
+                    for m in agent_msgs:
+                        messages.append({
+                            "from": m.get("from", "unknown"),
+                            "to": to_agent,
+                            "message": m.get("message", "")[:500],
+                            "timestamp": m.get("timestamp", ""),
+                            "id": m.get("id", ""),
+                        })
+            except:
+                pass
+    # Sort by timestamp descending
+    messages.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    return jsonify({"messages": messages[:limit], "total": len(messages)})
+
+
+@app.route("/hub/analytics", methods=["GET"])
+def hub_analytics():
+    """Conversation health dashboard — unread ages, poll frequencies, dying conversations."""
+    from datetime import datetime
+    agents = load_agents()
+    now = datetime.utcnow()
+    
+    agent_health = []
+    dying_conversations = []
+    
+    for agent_id in agents:
+        inbox = load_inbox(agent_id)
+        unread = [m for m in inbox if not m.get("read")]
+        
+        # Oldest unread age
+        oldest_unread_hours = 0
+        if unread:
+            timestamps = [m.get("timestamp", "") for m in unread if m.get("timestamp")]
+            if timestamps:
+                oldest = min(timestamps)
+                try:
+                    oldest_dt = datetime.fromisoformat(oldest.replace("Z", ""))
+                    oldest_unread_hours = (now - oldest_dt).total_seconds() / 3600
+                except: pass
+        
+        # Last activity (sent or received)
+        all_timestamps = [m.get("timestamp", "") for m in inbox if m.get("timestamp")]
+        last_activity_hours = None
+        if all_timestamps:
+            latest = max(all_timestamps)
+            try:
+                latest_dt = datetime.fromisoformat(latest.replace("Z", ""))
+                last_activity_hours = (now - latest_dt).total_seconds() / 3600
+            except: pass
+        
+        # Non-brain messages awaiting reply
+        non_brain_msgs = [m for m in inbox if m.get("from") != "brain" and not m.get("read")]
+        
+        agent_health.append({
+            "agent_id": agent_id,
+            "total_msgs": len(inbox),
+            "unread": len(unread),
+            "oldest_unread_hours": round(oldest_unread_hours, 1),
+            "last_activity_hours": round(last_activity_hours, 1) if last_activity_hours else None,
+            "unanswered_from_agents": len(non_brain_msgs),
+        })
+        
+        # Find dying conversations (last msg > 48h, unanswered)
+        if non_brain_msgs:
+            for m in non_brain_msgs:
+                ts = m.get("timestamp", "")
+                if ts:
+                    try:
+                        msg_dt = datetime.fromisoformat(ts.replace("Z", ""))
+                        age_hours = (now - msg_dt).total_seconds() / 3600
+                        if age_hours > 48:
+                            dying_conversations.append({
+                                "from": m.get("from"),
+                                "to": agent_id,
+                                "age_hours": round(age_hours, 1),
+                                "message_preview": m.get("message", "")[:100],
+                            })
+                    except: pass
+    
+    # Read analytics events if they exist
+    events_file = ANALYTICS_DIR / "events.jsonl"
+    poll_counts = {}
+    if events_file.exists():
+        with open(events_file) as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                    if ev.get("event") == "inbox_poll":
+                        agent = ev["agent"]
+                        poll_counts[agent] = poll_counts.get(agent, 0) + 1
+                except: pass
+    
+    return jsonify({
+        "agent_health": sorted(agent_health, key=lambda x: -x["oldest_unread_hours"]),
+        "dying_conversations": sorted(dying_conversations, key=lambda x: -x["age_hours"]),
+        "poll_frequency": poll_counts,
+        "summary": {
+            "total_agents": len(agents),
+            "agents_with_unread": sum(1 for a in agent_health if a["unread"] > 0),
+            "conversations_dying": len(dying_conversations),
+        }
+    })
+
 
 if __name__ == "__main__":
     _register_brain()
