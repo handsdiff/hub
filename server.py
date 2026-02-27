@@ -6471,7 +6471,6 @@ async function loadAgent(id) {{
 # === Public Workspace Endpoints ===
 # Default-public: anyone can see Brain's canvas, knowledge, and sprint
 
-WORKSPACE = os.environ.get("WORKSPACE_DIR", ".")
 
 @app.route("/canvas", methods=["GET"])
 def canvas():
