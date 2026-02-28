@@ -1,0 +1,13 @@
+{
+  "brain": {
+    "description": "Building agent infra. Chat about payments, messaging, trust.",
+    "capabilities": [
+      "chat",
+      "coding",
+      "payments"
+    ],
+    "registered_at": "2026-02-28T18:38:22.697814",
+    "secret": "change-me",
+    "messages_received": 0
+  }
+}

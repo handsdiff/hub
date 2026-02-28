@@ -63,6 +63,39 @@ def get_hub_price():
 STATIC_DIR = Path(__file__).parent / "static"
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 
+@app.after_request
+def _track_errors(response):
+    """Log 4xx/5xx responses to analytics for debugging failed agent interactions."""
+    if response.status_code >= 400 and response.status_code != 429:  # skip poll 429 spam
+        from datetime import datetime
+        try:
+            error_data = response.get_json(silent=True) or {}
+            error_msg = error_data.get("error", response.status)
+        except Exception:
+            error_msg = str(response.status)
+        # Extract agent hint from URL path
+        path = request.path
+        agent_hint = ""
+        if "/agents/" in path:
+            parts = path.split("/agents/")
+            if len(parts) > 1:
+                agent_hint = parts[1].split("/")[0]
+        event = {
+            "agent": agent_hint or "unknown",
+            "event": "api_error",
+            "status": response.status_code,
+            "endpoint": f"{request.method} {path}",
+            "error": str(error_msg)[:200],
+            "ts": datetime.utcnow().isoformat()
+        }
+        log_file = Path(os.environ.get("HUB_DATA_DIR", "data")) / "analytics" / "errors.jsonl"
+        try:
+            with open(log_file, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except Exception:
+            pass  # never crash on logging
+    return response
+
 # Telegram notifications
 def _get_bot_token():
     try:
@@ -1099,6 +1132,11 @@ def send_message(agent_id):
         "callback_status": callback_status
     })
 
+# Track active long-poll connections per agent to prevent flood
+_active_polls = {}  # agent_id -> threading.Event for wakeup
+_active_poll_count = {}  # agent_id -> int (concurrent connection count)
+_MAX_CONCURRENT_POLLS = 2  # Max simultaneous long-polls per agent
+
 @app.route("/agents/<agent_id>/messages/poll", methods=["GET"])
 def poll_messages(agent_id):
     """Long-poll endpoint for Hub channel adapter. Holds connection until new message or timeout."""
@@ -1112,50 +1150,64 @@ def poll_messages(agent_id):
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
     
-    _log_agent_event(agent_id, "long_poll")
+    # Reject excess concurrent polls for this agent
+    current = _active_poll_count.get(agent_id, 0)
+    if current >= _MAX_CONCURRENT_POLLS:
+        return jsonify({
+            "ok": True, "messages": [], "count": 0,
+            "retry_after": timeout,
+            "note": f"Too many concurrent polls ({current}). Wait and retry."
+        }), 429
     
-    # Track last seen message to detect new ones
-    last_offset = request.args.get("offset", type=int)  # Message index offset
+    _active_poll_count[agent_id] = current + 1
     
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
-        inbox = load_inbox(agent_id)
-        unread = [m for m in inbox if not m.get("read")]
+    try:
+        # Track last seen message to detect new ones
+        last_offset = request.args.get("offset", type=int)  # Message index offset
         
-        # If offset provided, only return messages after that offset
-        if last_offset is not None:
-            unread = [m for m in unread if inbox.index(m) > last_offset]
+        # Check once up front, then sleep longer between checks
+        poll_interval = 2  # seconds between disk reads
+        deadline = _time.time() + timeout
         
-        if unread:
-            # Mark delivered messages as read
-            full_inbox = load_inbox(agent_id)
-            unread_ids = {m.get("id") for m in unread}
-            for m in full_inbox:
-                if m.get("id") in unread_ids:
-                    m["read"] = True
-            save_inbox(agent_id, full_inbox)
+        while _time.time() < deadline:
+            inbox = load_inbox(agent_id)
+            unread = [m for m in inbox if not m.get("read")]
             
-            # Map fields for channel adapter compatibility
-            adapted = []
-            for m in unread:
-                adapted.append({
-                    "messageId": m.get("id", ""),
-                    "from": m.get("from", ""),
-                    "text": m.get("message", ""),
-                    "timestamp": m.get("timestamp", ""),
+            # If offset provided, only return messages after that offset
+            if last_offset is not None:
+                unread = [m for m in unread if inbox.index(m) > last_offset]
+            
+            if unread:
+                # Mark delivered messages as read
+                unread_ids = {m.get("id") for m in unread}
+                for m in inbox:
+                    if m.get("id") in unread_ids:
+                        m["read"] = True
+                save_inbox(agent_id, inbox)
+                
+                # Map fields for channel adapter compatibility
+                adapted = []
+                for m in unread:
+                    adapted.append({
+                        "messageId": m.get("id", ""),
+                        "from": m.get("from", ""),
+                        "text": m.get("message", ""),
+                        "timestamp": m.get("timestamp", ""),
+                    })
+                
+                return jsonify({
+                    "ok": True,
+                    "messages": adapted,
+                    "count": len(adapted),
+                    "next_offset": len(inbox) - 1,
                 })
             
-            return jsonify({
-                "ok": True,
-                "messages": adapted,
-                "count": len(adapted),
-                "next_offset": len(full_inbox) - 1,
-            })
+            _time.sleep(poll_interval)
         
-        _time.sleep(1)  # Poll interval
-    
-    # Timeout — no new messages
-    return jsonify({"ok": True, "messages": [], "count": 0})
+        # Timeout — no new messages
+        return jsonify({"ok": True, "messages": [], "count": 0})
+    finally:
+        _active_poll_count[agent_id] = max(0, _active_poll_count.get(agent_id, 1) - 1)
 
 @app.route("/agents/<agent_id>/messages", methods=["GET"])
 def get_messages(agent_id):
@@ -6635,14 +6687,51 @@ def hub_analytics():
                         poll_counts[agent] = poll_counts.get(agent, 0) + 1
                 except: pass
     
+    # Delivery status per agent
+    delivery_status = []
+    for agent_id, agent_data in agents.items():
+        callback = agent_data.get("callback_url", "")
+        has_callback = bool(callback)
+        has_poll = agent_id in poll_counts
+        delivery_status.append({
+            "agent_id": agent_id,
+            "callback_url": callback or None,
+            "has_callback": has_callback,
+            "has_polled": has_poll,
+            "poll_count": poll_counts.get(agent_id, 0),
+            "delivery": "callback" if has_callback else ("poll" if has_poll else "NONE"),
+        })
+
+    # Error summary
+    errors_file = ANALYTICS_DIR / "errors.jsonl"
+    error_counts = {}
+    recent_errors = []
+    if errors_file.exists():
+        with open(errors_file) as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                    agent = ev.get("agent", "unknown")
+                    error_counts[agent] = error_counts.get(agent, 0) + 1
+                    recent_errors.append(ev)
+                except: pass
+        recent_errors = recent_errors[-20:]  # last 20
+
     return jsonify({
         "agent_health": sorted(agent_health, key=lambda x: -x["oldest_unread_hours"]),
         "dying_conversations": sorted(dying_conversations, key=lambda x: -x["age_hours"]),
         "poll_frequency": poll_counts,
+        "delivery_status": delivery_status,
+        "recent_errors": recent_errors,
+        "error_counts_by_agent": error_counts,
         "summary": {
             "total_agents": len(agents),
             "agents_with_unread": sum(1 for a in agent_health if a["unread"] > 0),
             "conversations_dying": len(dying_conversations),
+            "agents_no_delivery": sum(1 for d in delivery_status if d["delivery"] == "NONE"),
+            "agents_with_callback": sum(1 for d in delivery_status if d["has_callback"]),
+            "agents_who_polled": sum(1 for d in delivery_status if d["has_polled"]),
+            "total_api_errors": sum(error_counts.values()),
         }
     })
 
