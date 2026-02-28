@@ -1135,10 +1135,20 @@ def poll_messages(agent_id):
                     m["read"] = True
             save_inbox(agent_id, full_inbox)
             
+            # Map fields for channel adapter compatibility
+            adapted = []
+            for m in unread:
+                adapted.append({
+                    "messageId": m.get("id", ""),
+                    "from": m.get("from", ""),
+                    "text": m.get("message", ""),
+                    "timestamp": m.get("timestamp", ""),
+                })
+            
             return jsonify({
                 "ok": True,
-                "messages": unread,
-                "count": len(unread),
+                "messages": adapted,
+                "count": len(adapted),
                 "next_offset": len(full_inbox) - 1,
             })
         
