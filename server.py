@@ -1139,8 +1139,11 @@ def send_message(agent_id):
             import requests
             r = requests.post(callback_url, json=msg, timeout=5)
             callback_status = r.status_code
-        except:
+            if r.status_code >= 400:
+                _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "status": r.status_code, "from": from_agent})
+        except Exception as e:
             callback_status = "failed"
+            _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "error": str(e)[:100], "from": from_agent})
     
     return jsonify({
         "ok": True,
