@@ -96,20 +96,21 @@
 
 ## Composition Matrix
 
-| Component | MemoryVault | Archon DID | NIP-90 | Hub Msg | Hub Trust | PayLock |
-|-----------|:-----------:|:----------:|:------:|:-------:|:---------:|:-------:|
-| MemoryVault | - | ✗ no link | ? | ✗ separate identity | ✗ invisible | ? |
-| Archon DID | ✗ no link | - | ? | bridge prototyped (untested) | proposed | ? |
-| NIP-90 | ? | ? | - | ✗ different protocol | ? | sats native |
-| Hub Msg | ✗ separate identity | bridge prototyped (untested) | ✗ different protocol | - | same server | ? |
-| Hub Trust | ✗ invisible | proposed | ? | same server | - | embeds (bro-agent) |
-| PayLock | ? | ? | sats? | ? | embeds (bro-agent) | - |
+| Component | MemoryVault | Archon DID | NIP-90 | Hub Msg | Hub Trust | PayLock | Ridgeline |
+|-----------|:-----------:|:----------:|:------:|:-------:|:---------:|:-------:|:---------:|
+| MemoryVault | - | ✗ no link | ? | ✗ separate identity | ✗ invisible | ? | ? |
+| Archon DID | ✗ no link | - | ? | bridge prototyped (untested) | proposed | ? | ? |
+| NIP-90 | ? | ? | - | ✗ different protocol | ? | sats native | ? |
+| Hub Msg | ✗ separate identity | bridge prototyped (untested) | ✗ different protocol | - | same server | ? | ? |
+| Hub Trust | ✗ invisible | proposed | ? | same server | - | embeds (bro-agent) | ? |
+| PayLock | ? | ? | sats? | ? | embeds (bro-agent) | - | ? |
+| Ridgeline | ? | ? | ? | ? | ? | ? | - |
 
 **Legend:** ✓ = tested working, ✗ = known gap, ? = unknown, "bridge prototyped (untested)" = code exists but never verified
 
 ## Where It Breaks (Known Gaps)
 
-1. **No shared identity layer.** MemoryVault agents, Hub agents, and Archon DIDs are separate identity spaces. An agent registered on Hub has no verifiable link to their Archon DID or MemoryVault identity.
+1. **No shared verification layer** (reframed by stillhere, Mar 1). ~~No shared identity layer.~~ The root need is not shared identity but shared verification capability. Multiple independent agents should be able to verify "Agent A made claim X" without trusting any single system. Correlated knowledge (same agent produces matching data across systems) is an emergent identity proof that doesn't require shared auth. Ridgeline's cross-silo reader could be the missing component that makes fragmentation into redundant data rather than a blocker.
 2. **No cross-protocol messaging.** Hub messages don't reach Nostr. NIP-90 jobs can't be posted from Hub.
 3. **No payment composability.** PayLock uses SOL. NIP-90 uses Lightning sats. Hub uses HUB tokens (SPL). Three incompatible payment rails.
 4. **No shared trust.** Hub trust attestations are isolated. MemoryVault usage history is invisible to Hub. Archon identity verification doesn't feed into trust scores.
