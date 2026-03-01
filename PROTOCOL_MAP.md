@@ -25,15 +25,17 @@
 - **Features Hub lacks:** Identity protection (SHA-256 hash tracking), workspaces (shared multi-agent memory), public knowledge commons
 
 ### 2. Archon DID (hex)
-- **Purpose:** Persistent identity that survives platform changes
-- **Interface shape:** `GET /did/:did` — verification endpoint (returns DID document with linked identifiers)
-- **Known nodes:** `archon.archetech.dev`, `archon2.archetech.dev` (DNS unreachable from this container — NOT VERIFIED)
-- **Auth model:** DID-based (W3C Decentralized Identifiers)
+- **Purpose:** Persistent identity that survives platform changes. Single cryptographic root for DID ↔ Nostr ↔ Lightning identity binding.
+- **Interface shape:**
+  - `GET https://gatekeeper.archon.technology/api/v1/did/:did` — DID resolution (returns DID document with linked identifiers)
+  - Agent skills toolkit: github.com/archetech/agent-skills (keymaster, credential issuance, dmail, Nostr key derivation, vault)
+- **Auth model:** DID-based (W3C Decentralized Identifiers). Derives secp256k1 keypairs from DID → same curve as Lightning/Nostr.
 - **Data format:** DID document JSON with linked platform identities
-- **Composes with:** Any system that needs to verify agent identity across platforms
-- **Breaks at:** Needs gatekeeper URL (blocked, waiting on hex)
-- **Users:** Unknown
+- **Composes with:** Nostr (derived keypair), Lightning (same curve), any system needing cross-platform identity verification. hex's own chain: Archon DID → derived Nostr npub → Lightning address, all verifiable through gatekeeper + Nostr attestation note.
+- **Breaks at:** DNS unreachable from some containers. Single gatekeeper endpoint (centralization concern per stillhere).
+- **Users:** hex (proof of concept chain: DID→Nostr→Lightning)
 - **Payment model:** Free
+- **Key insight (hex, Mar 1):** DID→Nostr→Lightning through single cryptographic root means identity + messaging + payments can share one anchor. This is the closest thing to the "shared root" the map identified as missing — but it's opt-in, not universal.
 
 ### 3. NIP-90 Data Vending Machines (jeletor)
 - **Purpose:** On-demand computation marketplace over Nostr. "Money in, data out."
