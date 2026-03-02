@@ -22,6 +22,7 @@ def _ensure_deps():
 _ensure_deps()
 
 from flask import Flask, request, jsonify
+from flask_sock import Sock
 import json
 import os
 import secrets
@@ -62,6 +63,12 @@ def get_hub_price():
 
 STATIC_DIR = Path(__file__).parent / "static"
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
+sock = Sock(app)
+
+# ── WebSocket connections for real-time message push ──
+# Maps agent_id -> list of active WebSocket connections
+_ws_connections: dict[str, list] = {}
+_ws_lock = __import__("threading").Lock()
 
 @app.after_request
 def _track_errors(response):
@@ -1098,6 +1105,9 @@ def send_message(agent_id):
     
     print(f"[MSG] {from_agent} -> {agent_id}: {message[:50]}...")
     
+    # WebSocket push (real-time delivery to connected clients)
+    _ws_push_message(agent_id, msg)
+    
     # Telegram push notification
     notify = _load_notify_settings()
     if agent_id in notify:
@@ -1155,7 +1165,7 @@ def send_message(agent_id):
 # Track active long-poll connections per agent to prevent flood
 _active_polls = {}  # agent_id -> threading.Event for wakeup
 _active_poll_count = {}  # agent_id -> int (concurrent connection count)
-_MAX_CONCURRENT_POLLS = 2  # Max simultaneous long-polls per agent
+_MAX_CONCURRENT_POLLS = 5  # Max simultaneous long-polls per agent (raised from 2 — adapter retries on 429 without backoff)
 
 @app.route("/agents/<agent_id>/messages/poll", methods=["GET"])
 def poll_messages(agent_id):
@@ -1173,11 +1183,16 @@ def poll_messages(agent_id):
     # Reject excess concurrent polls for this agent
     current = _active_poll_count.get(agent_id, 0)
     if current >= _MAX_CONCURRENT_POLLS:
+        # Return 200 with empty messages instead of 429 — adapters without backoff
+        # will retry 429 immediately causing a flood. 200 with retry_after hint
+        # lets the adapter treat it as "no messages" and wait normally.
+        import time as _t2
+        _t2.sleep(min(timeout, 10))  # Hold the connection to slow down retry
         return jsonify({
             "ok": True, "messages": [], "count": 0,
             "retry_after": timeout,
             "note": f"Too many concurrent polls ({current}). Wait and retry."
-        }), 429
+        }), 200
     
     _active_poll_count[agent_id] = current + 1
     
@@ -1228,6 +1243,100 @@ def poll_messages(agent_id):
         return jsonify({"ok": True, "messages": [], "count": 0})
     finally:
         _active_poll_count[agent_id] = max(0, _active_poll_count.get(agent_id, 1) - 1)
+
+@sock.route("/agents/<agent_id>/ws")
+def ws_messages(ws, agent_id):
+    """WebSocket endpoint for real-time message push.
+    
+    Connect: ws://host/agents/{agent_id}/ws
+    Send auth immediately: {"secret": "your_secret"}
+    Receive: {"type": "message", "data": {...}} for each new message
+    """
+    import time as _time
+
+    # First message must be auth
+    try:
+        auth = json.loads(ws.receive(timeout=10))
+    except Exception:
+        ws.send(json.dumps({"ok": False, "error": "Auth timeout — send {\"secret\": \"...\"} within 10s"}))
+        return
+
+    secret = auth.get("secret", "")
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        ws.send(json.dumps({"ok": False, "error": "Invalid agent_id or secret"}))
+        return
+
+    ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id}))
+
+    # Register this connection
+    with _ws_lock:
+        _ws_connections.setdefault(agent_id, []).append(ws)
+
+    try:
+        # Deliver any unread messages immediately
+        inbox = load_inbox(agent_id)
+        unread = [m for m in inbox if not m.get("read")]
+        if unread:
+            unread_ids = {m.get("id") for m in unread}
+            for m in unread:
+                ws.send(json.dumps({
+                    "type": "message",
+                    "data": {
+                        "messageId": m.get("id", ""),
+                        "from": m.get("from", ""),
+                        "text": m.get("message", ""),
+                        "timestamp": m.get("timestamp", ""),
+                    }
+                }))
+            # Mark as read
+            for m in inbox:
+                if m.get("id") in unread_ids:
+                    m["read"] = True
+            save_inbox(agent_id, inbox)
+
+        # Keep connection alive, wait for close or ping
+        while True:
+            try:
+                data = ws.receive(timeout=30)
+                if data is None:
+                    break
+                # Client can send pings
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    ws.send(json.dumps({"type": "pong"}))
+            except Exception:
+                break
+    finally:
+        with _ws_lock:
+            conns = _ws_connections.get(agent_id, [])
+            if ws in conns:
+                conns.remove(ws)
+
+
+def _ws_push_message(agent_id: str, message: dict):
+    """Push a message to all active WebSocket connections for an agent."""
+    adapted = {
+        "type": "message",
+        "data": {
+            "messageId": message.get("id", ""),
+            "from": message.get("from", ""),
+            "text": message.get("message", ""),
+            "timestamp": message.get("timestamp", ""),
+        }
+    }
+    payload = json.dumps(adapted)
+    with _ws_lock:
+        conns = _ws_connections.get(agent_id, [])
+        dead = []
+        for ws_conn in conns:
+            try:
+                ws_conn.send(payload)
+            except Exception:
+                dead.append(ws_conn)
+        for d in dead:
+            conns.remove(d)
+
 
 @app.route("/agents/<agent_id>/messages", methods=["GET"])
 def get_messages(agent_id):
