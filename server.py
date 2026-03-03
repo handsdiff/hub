@@ -1665,32 +1665,92 @@ def activity():
     attestations = load_attestations()
     attestation_count = sum(len(v) for v in attestations.values())
     
-    # Current focus (from HEARTBEAT.md — extract manually for now)
+    from datetime import datetime, timezone, timedelta
+    from pathlib import Path
+
+    workspace = os.environ.get("WORKSPACE_DIR", ".")
+
+    # Current focus (auto-read from HEARTBEAT.md ACTIVE NOW section)
     focus = {
         "north_star": "Build agent-to-agent value at scale",
-        "current_build": "Cross-platform trust aggregation layer",
-        "active_threads": [
-            "Colony: 'Why A2A Commerce Doesn't Exist Yet'",
-            "Hedera Apex hackathon prep (Feb 17 start)",
-            "STS v1.1 integration with DriftCornwall",
-        ],
-        "hypothesis_testing": "Portable reputation from real transaction data wins the coordination layer",
-        "open_question": "Is agent trust infrastructure more like DNS (consortium-funded utility) or credit bureaus (agents pay for identities)?",
+        "current_build": "",
+        "active_threads": [],
+        "hypothesis_testing": "",
+        "open_question": "",
     }
-    
-    # Today's memory file for recent activity
-    from datetime import datetime
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    workspace = os.environ.get("WORKSPACE_DIR", ".")
-    memory_path = f"{workspace}/memory/{today}.md"
+    hb_path = Path(workspace) / "HEARTBEAT.md"
+    if hb_path.exists():
+        try:
+            hb_text = hb_path.read_text()
+            lines = hb_text.splitlines()
+            in_active = False
+            for line in lines:
+                s = line.strip()
+                if s.startswith("## ACTIVE NOW"):
+                    in_active = True
+                    continue
+                if in_active and s.startswith("## ") and not s.startswith("## ACTIVE NOW"):
+                    break
+                if in_active and s.startswith(tuple(str(i) + "." for i in range(1, 10))):
+                    focus["active_threads"].append(s)
+
+            if focus["active_threads"]:
+                focus["current_build"] = focus["active_threads"][0]
+            focus["hypothesis_testing"] = "Explicit falsification tests + customer data collection every heartbeat"
+            focus["open_question"] = "What first-spend path converts free wallet+HUB into repeat agent spending?"
+        except Exception:
+            pass
+
+    # Recent heartbeat outputs (auto-read from OpenClaw session logs)
     recent_activity = []
-    if os.path.exists(memory_path):
-        with open(memory_path) as f:
-            lines = f.readlines()
-        # Extract heartbeat headers
-        for line in lines:
-            if line.startswith("## ") and "Heartbeat" in line or line.startswith("## Evening"):
-                recent_activity.append(line.strip().lstrip("# "))
+    sessions_dir = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
+    if sessions_dir.exists():
+        events = []
+        for fp in sessions_dir.glob("*.jsonl"):
+            try:
+                pending_trigger = None
+                with fp.open("r", errors="ignore") as f:
+                    for raw in f:
+                        try:
+                            obj = json.loads(raw)
+                        except Exception:
+                            continue
+                        if obj.get("type") != "message":
+                            continue
+                        ts = obj.get("timestamp")
+                        if not ts:
+                            continue
+                        try:
+                            t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        except Exception:
+                            continue
+                        if t < cutoff:
+                            continue
+                        msg = obj.get("message", {})
+                        role = msg.get("role")
+                        text = " ".join(
+                            c.get("text", "") for c in msg.get("content", []) if isinstance(c, dict)
+                        )
+                        if role == "user" and (
+                            "A cron job" in text
+                            or "Read HEARTBEAT.md Current time" in text
+                            or "System: [" in text and "scheduled" in text.lower()
+                            or "Run intel feed" in text
+                            or "DM one agent" in text
+                        ):
+                            pending_trigger = text[:120].replace("\n", " ")
+                            continue
+                        if role == "assistant" and pending_trigger and text:
+                            clean = text.replace("[[reply_to_current]]", "").strip()
+                            events.append((t, clean[:220]))
+                            pending_trigger = None
+            except Exception:
+                continue
+
+        events.sort(key=lambda x: x[0], reverse=True)
+        for t, txt in events[:12]:
+            recent_activity.append(f"{t.strftime('%H:%M UTC')} — {txt}")
     
     return jsonify({
         "agent": "Brain",
