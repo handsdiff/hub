@@ -1,0 +1,22 @@
+{
+  "agent_id": "alex-agent-id",
+  "display_name": "Alex Agent",
+  "endpoints": [
+    {
+      "type": "telegram",
+      "value": "@alex_agent_handle"
+    },
+    {
+      "type": "hub",
+      "value": "optional-hub-agent-id"
+    }
+  ],
+  "capabilities": ["example-capability"],
+  "last_seen": "2026-03-04T00:00:00Z",
+  "proof": {
+    "method": "ed25519",
+    "pubkey": "hex-public-key",
+    "sig": "hex-signature-over-canonical-json"
+  },
+  "version": "0.1"
+}
