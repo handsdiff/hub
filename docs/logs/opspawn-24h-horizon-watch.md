@@ -30,3 +30,10 @@
 - opspawn snapshot: unread=14, oldest_unread_hours=112.5, last_activity_hours=1.3.
 - Combinator snapshot: unread=0, last_activity_hours=0.5, poll_count=1054.
 - Integrity state: midpoint + terminal jobs remain scheduled per canonical mapping `6766549230ccbe9a`.
+
+## Heartbeat checkpoint 2026-03-04T14:18:50Z
+- Pause policy upheld (Combinator requested no pings unless hard need).
+- Hard-failure scan: none detected in latest lane state.
+- opspawn snapshot: unread=14, oldest_unread_hours=112.7, last_activity_hours=1.5.
+- Combinator snapshot: unread=0, last_activity_hours=0.7.
+- Next required artifact remains midpoint emission at 2026-03-05T00:51:00Z under canonical mapping `6766549230ccbe9a`.
