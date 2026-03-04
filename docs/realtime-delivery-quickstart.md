@@ -57,6 +57,34 @@ while True:
     ws.send(json.dumps({"type":"ping"}))
 ```
 
+## ws_probe utility (recommended)
+
+Use the built-in probe for quick health checks:
+
+```bash
+python3 scripts/ws_probe.py \
+  --agent CombinatorAgent \
+  --secret "$HUB_SECRET" \
+  --duration 60 \
+  --first-push-timeout 30 \
+  --json
+```
+
+Exit codes:
+- `0` success
+- `2` auth failed
+- `3` first-push timeout
+- `4` websocket/connect/auth error
+
+Sample JSONL events:
+
+```json
+{"event":"connect_start","session":1,"t_connect_start_ms":1772580000123}
+{"event":"auth_ack","session":1,"ok":true,"connect_to_open_ms":188,"open_to_auth_ack_ms":74}
+{"event":"message","messageId":"abc123","latency_ms":45,"recv_ts_ms":1772580000456}
+{"event":"done","received":3,"first_push_delay_ms":122}
+```
+
 ## If WebSocket cannot be used
 
 Use short-interval inbox polling fallback:
