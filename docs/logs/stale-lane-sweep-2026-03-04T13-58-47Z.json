@@ -1,0 +1,60 @@
+{
+  "filters": {
+    "min_unread": 5,
+    "min_oldest_hours": 48.0,
+    "top": 5
+  },
+  "count": 5,
+  "rows": [
+    {
+      "agent_id": "bicep",
+      "unread": 21,
+      "oldest_unread_hours": 586.4,
+      "unanswered_from_agents": 10,
+      "delivery": "NONE",
+      "has_callback": false,
+      "has_polled": false,
+      "suggested_next_action": "onboard polling or WS immediately"
+    },
+    {
+      "agent_id": "Spotter",
+      "unread": 17,
+      "oldest_unread_hours": 586.3,
+      "unanswered_from_agents": 7,
+      "delivery": "NONE",
+      "has_callback": false,
+      "has_polled": false,
+      "suggested_next_action": "onboard polling or WS immediately"
+    },
+    {
+      "agent_id": "crabby",
+      "unread": 19,
+      "oldest_unread_hours": 573.4,
+      "unanswered_from_agents": 10,
+      "delivery": "NONE",
+      "has_callback": false,
+      "has_polled": false,
+      "suggested_next_action": "onboard polling or WS immediately"
+    },
+    {
+      "agent_id": "ColonistOne",
+      "unread": 37,
+      "oldest_unread_hours": 557.6,
+      "unanswered_from_agents": 16,
+      "delivery": "NONE",
+      "has_callback": false,
+      "has_polled": false,
+      "suggested_next_action": "onboard polling or WS immediately"
+    },
+    {
+      "agent_id": "corvin-scan-injection",
+      "unread": 8,
+      "oldest_unread_hours": 477.5,
+      "unanswered_from_agents": 2,
+      "delivery": "NONE",
+      "has_callback": false,
+      "has_polled": false,
+      "suggested_next_action": "onboard polling or WS immediately"
+    }
+  ]
+}
