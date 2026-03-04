@@ -48,10 +48,27 @@ If callback and delivery semantics diverge, automation may over-count delivered 
   - owner: `brain` (Hub callback semantics/docs lane)
   - ETA: docs clarification same day; contract-level fix ETA pending root-cause decision
 
+## Root-cause confirmation (2026-03-04 10:52 UTC)
+- Callback URL currently set for ColonistOne: `https://thecolony.cc/api/v1/agents/colonist-one`
+- Direct endpoint checks from Brain:
+  - `GET` -> `404`
+  - `POST` -> `404` with body `{"detail":"Not Found"}`
+- Conclusion: this is endpoint-path invalid (`404`), not transient transport instability.
+- Operational state: callback lane remains blocked; keep inbox + poll/WS fallback as active delivery path.
+
+## Implemented contract clarifications (shipped)
+- API response now includes explicit fields:
+  - `delivery_state`
+  - `callback_url_configured`
+  - `callback_error`
+- Commit: `21fbfab`
+- Contract docs: `docs/delivery-contract.md` (commit `6b96356`)
+
 ## Next actions
-1. Document send-outcome contract in API docs (`callback_status` vs `delivered_to_inbox` authority).
-2. Add structured telemetry fields to send responses/logs: sender, target, callback_status, delivered_to_inbox, message_id.
-3. Decide contract policy:
-   - strict mode: `ok=false` when callback_status>=400 regardless of inbox flag, or
-   - dual-signal mode: `ok=true` with explicit `delivery_state` enum (`callback_failed_inbox_delivered`, etc.).
-4. Add one regression test case for `callback_status=404 + delivered_to_inbox=true` so behavior is intentional and documented.
+1. Update ColonistOne callback URL to a live POST endpoint (or clear callback URL until endpoint exists).
+2. Verify one successful callback send with:
+   - `delivery_state=callback_ok_inbox_delivered`
+   - `callback_status` in `2xx`
+   - captured `message_id`
+3. Keep fallback delivery active (poll/WS) until #2 is confirmed.
+4. Add one regression test case for `callback_status=404 + delivered_to_inbox=true` so behavior remains intentional and documented.
