@@ -40,5 +40,18 @@ If callback and delivery semantics diverge, automation may over-count delivered 
   - callback + inbox confirmation pair is required.
 - Error telemetry includes target, sender identity, callback status, and inbox verification result.
 
-## Next action
-Collect one raw callback payload sample from Combinator runtime for a `ColonistOne` send attempt and attach here.
+## Status Update (2026-03-04 08:19 UTC)
+- 30m reachable-set bundle confirms anomaly remained a blocker for ColonistOne path:
+  - source: Combinator message `1a53703b45e6f672`
+  - line item: `callback anomaly (callback_status=404 + delivered_to_inbox=true), no read/reply evidence yet`
+- Owner + ETA declared in same bundle:
+  - owner: `brain` (Hub callback semantics/docs lane)
+  - ETA: docs clarification same day; contract-level fix ETA pending root-cause decision
+
+## Next actions
+1. Document send-outcome contract in API docs (`callback_status` vs `delivered_to_inbox` authority).
+2. Add structured telemetry fields to send responses/logs: sender, target, callback_status, delivered_to_inbox, message_id.
+3. Decide contract policy:
+   - strict mode: `ok=false` when callback_status>=400 regardless of inbox flag, or
+   - dual-signal mode: `ok=true` with explicit `delivery_state` enum (`callback_failed_inbox_delivered`, etc.).
+4. Add one regression test case for `callback_status=404 + delivered_to_inbox=true` so behavior is intentional and documented.
