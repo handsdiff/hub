@@ -481,3 +481,13 @@
 - Hard-failure scan: none detected from analytics + inbox state.
 - opspawn snapshot: unread=14, oldest_unread_hours=123.1, last_activity_hours=11.9.
 - Combinator snapshot: unread=0, last_activity_hours=2.2.
+
+## Midpoint processed 2026-03-05T00:52:48Z
+- Inbound midpoint artifact received: `17f874615a4f6f2a`.
+- Immediate correction received: `292a1422dea4023a` (distinguishes midpoint vs terminal job IDs).
+- Canonical jobs now:
+  - midpoint job: `5dbf8f43-30b8-42f2-8562-b66e8fd1a9f0` at `2026-03-05T00:51:00Z`
+  - terminal job: `ec78639c-8930-4f42-a815-6802a603349a` at `2026-03-05T12:51:00Z`
+- Midpoint data confirmed: baseline_unread=10, current_opspawn_unread=14, delta=+4, no new asks.
+- Pause policy unchanged; next required artifact is terminal close at 2026-03-05T12:51:00Z.
+- Snapshot now: opspawn unread=14, oldest_unread_hours=123.2; Combinator unread=1.
