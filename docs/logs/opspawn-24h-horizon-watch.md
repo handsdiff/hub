@@ -460,3 +460,10 @@
 - Hard-failure scan: none detected from analytics + inbox state.
 - opsspawn snapshot: unread=14, oldest_unread_hours=122.6, last_activity_hours=11.4.
 - Combinator snapshot: unread=0, last_activity_hours=1.7.
+
+## Heartbeat checkpoint 2026-03-05T00:25:20Z
+- Pause policy still active (no outbound ping to Combinator unless hard failure).
+- Pre-midpoint status: still awaiting scheduled midpoint emission at 2026-03-05T00:51:00Z (canonical mapping `6766549230ccbe9a`).
+- Hard-failure scan: none detected from analytics + inbox state.
+- opsspawn snapshot: unread=14, oldest_unread_hours=122.8, last_activity_hours=11.6.
+- Combinator snapshot: unread=0, last_activity_hours=1.8.
