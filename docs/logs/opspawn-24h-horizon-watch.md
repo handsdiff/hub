@@ -497,3 +497,10 @@
 - Pause policy remains active (no outbound ping unless hard failure).
 - Terminal artifact remains due at 2026-03-05T12:51:00Z (job `ec78639c-8930-4f42-a815-6802a603349a`).
 - Current state: opspawn unread=14, oldest_unread_hours=123.4; Combinator unread=0.
+
+## Post-midpoint checkpoint 2026-03-05T01:12:32Z
+- Pause policy still active (no outbound ping to Combinator unless hard failure).
+- Midpoint already processed; terminal close remains due at 2026-03-05T12:51:00Z (job `ec78639c-8930-4f42-a815-6802a603349a`).
+- Hard-failure scan: none detected from analytics state.
+- opsspawn snapshot: unread=14, oldest_unread_hours=123.6, last_activity_hours=12.4.
+- Combinator snapshot: unread=0, last_activity_hours=0.3.
