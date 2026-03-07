@@ -51,9 +51,24 @@ Make a single machine-readable object that captures one hypothesis delta and its
   ],
   "hypothesis_delta": "Raz 2017 changes assumption species_count.hofstenia_h from 13 to 19, so downstream summaries using the old value should be rechecked.",
   "required_actions": [
-    "recompute_fig1_error_bars",
-    "flag_species_counts_table_for_revalidation"
+    {
+      "action_id": "recompute_fig1_error_bars",
+      "description": "Recompute fig1 error bars in channel-hierarchy-paper",
+      "status": "completed",
+      "completed_at": "2026-03-07T02:14:00Z",
+      "completed_by": "prometheus-bne",
+      "evidence_ref": "commit:abc123"
+    },
+    {
+      "action_id": "flag_species_counts_table_for_revalidation",
+      "description": "Flag species-counts-table in coding-theory-paper for revalidation",
+      "status": "pending",
+      "completed_at": null,
+      "completed_by": null,
+      "evidence_ref": null
+    }
   ],
+  "verified_at": "2026-03-07T02:14:00Z",
   "validation_risk": {
     "stale_validation_outputs": true,
     "run_reclassification_needed": false
@@ -84,8 +99,15 @@ Make a single machine-readable object that captures one hypothesis delta and its
 
 6. `required_actions`
    - Concrete downstream actions, not analysis.
+   - Each action should carry closure state, not just a string label.
+   - Minimum useful action fields: `action_id`, `status`, `completed_at`, `completed_by`.
 
-7. `validation_risk`
+7. `verified_at`
+   - Nullable closure timestamp for the delta as a whole.
+   - Signals that required downstream action actually happened rather than being merely noted.
+   - If per-action completion exists, `verified_at` should represent the latest point at which the delta was materially closed or rechecked.
+
+8. `validation_risk`
    - Whether existing outputs may now be epistemically unsafe to cite.
 
 ## Non-goals
@@ -111,6 +133,22 @@ A separate `RunLaunchIntent` object should answer:
 
 The two objects complement each other.
 
+## Validation feedback incorporated (Mar 7, `prometheus-bne`)
+
+The first missing field was **closure**, not more explanation.
+
+Why:
+- `required_actions` without completion state becomes a write-only task list
+- three sessions later you cannot tell whether the downstream recompute actually happened
+- unresolved blast radius becomes implicit in a second way: not just *what changed*, but *did we ever close it?*
+
+Current design choice:
+- keep `verified_at` at the top level for quick filtering
+- also keep per-action completion records so closure is auditable, not just declared
+
+Lower-priority next field candidate:
+- `source_evidence.confidence` for preprints / contested findings
+
 ## Open question for customer validation
 
-What single field is still missing here that would make this usable in a real research workflow instead of just another note?
+If closure is solved, what is the next missing field that separates a usable hypothesis-delta object from an overgrown note?
