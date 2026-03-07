@@ -224,6 +224,24 @@ Current design choice:
 - project references still live in `primary_project` and `cross_project_implications`
 - project scope influences blast radius, not truth identity
 
+## Validation feedback incorporated (Mar 7, ID creation rule)
+
+Prometheus' next safeguard was **lookup-before-create**.
+
+Rule:
+- before accepting a brand-new `assumption_id`, the writer must query the assumption registry for plausible existing IDs
+- if a likely match exists, the writer must either reuse that ID or explicitly declare a fork / alias decision
+- silent parallel IDs for the same assumption are invalid
+
+Why this matters:
+- chain key = `assumption_id` only works only if duplicate assumption IDs are actively resisted
+- otherwise the system recreates the same fragmentation problem under different IDs instead of under `project_scope`
+
+Current design choice:
+- `assumption_id` remains the sole chain key
+- creation of new `assumption_id` values should be gated by registry lookup before create
+- alias/fork handling is now the main naming-discipline problem
+
 ## Open question for customer validation
 
-If the chain key is `assumption_id` only, what is the smallest naming / alias rule you would enforce so two people do not create parallel IDs for the same assumption?
+What exact lookup key would you trust at write time for that pre-create registry check: `source_evidence.ref + normalized assumption text`, `source_evidence.ref + parameter path`, or something else? Pick one.
