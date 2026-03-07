@@ -11,18 +11,36 @@ Golden scenarios: `docs/profiles/dacl-review-v1.golden-scenarios.md`
 Each evaluation reduces to this tuple:
 
 ```text
-(old_state, new_state, blocker_set_changed, action_line_changed, confidence_drop_bucket, mergeable_flip)
+(old_state, new_state, blocker_set_changed, action_key_changed, confidence_drop_bucket, mergeable_flip)
 ```
 
 Where:
 - `old_state`, `new_state` ∈ `mergeable | blocked | stale | needs-human`
 - `blocker_set_changed` ∈ `true | false`
-- `action_line_changed` ∈ `true | false`
+- `action_key_changed` ∈ `true | false`
 - `confidence_drop_bucket` ∈ `none | small | medium | large`
 - `mergeable_flip` ∈ `true | false`
 
 `mergeable_flip = true` iff `old_state == mergeable` XOR `new_state == mergeable`.
 Direction still matters, but it is derived from `(old_state, new_state)` rather than encoded separately.
+
+### `action_key` vs `action_line`
+- `action_key` is the machine-stable semantic instruction used for notify/dedupe decisions.
+- `action_line` is the human-readable sentence shown in the packet.
+- **Notify off `action_key`, not raw `action_line` prose.**
+
+Example namespace:
+- `wait.check.dashboard-verify`
+- `wait.check.solana-bootstrap-sdk`
+- `need.approval.alexjaniak`
+- `reconfirm.intent.current-head`
+- `policy.profile-changed`
+
+If `action_key` is absent during transition rollout, temporary fallback may be:
+```text
+{state}:{sorted_blocker_ids.join(',')}
+```
+But that fallback is transitional only.
 
 ## Required normalizations before matrix evaluation
 
@@ -43,14 +61,18 @@ Do **not** count as changed when only cosmetic metadata moved:
 - CI run id changed for the same required check name
 - same blocker restated in another bot comment
 
-### `action_line_changed`
+### `action_key_changed`
 `true` only when the human should do something materially different.
 
 Examples:
-- `wait for required checks to finish` -> `make dashboard-verify pass`
-- `reconfirm reviewer intent on current head` -> `merge current head now`
+- `wait.check.solana-bootstrap-sdk` -> `fix.check.dashboard-verify`
+- `reconfirm.intent.current-head` -> `merge.now`
+- `need.approval.alexjaniak` -> `policy.profile-changed`
 
-Do **not** mark true for punctuation-only or wording-only rewrites.
+Do **not** mark true for:
+- wording churn in `action_line`
+- bullet ordering differences
+- timestamp changes inside human-readable text
 
 ### `confidence_drop_bucket`
 Map raw score changes into four buckets before matrix evaluation:
@@ -64,6 +86,8 @@ Default band suggestion:
 - `medium 60..84`
 - `low < 60`
 
+**Hard rule:** `medium` or `large` must still emit even when state, blocker ids, and `action_key` are unchanged. This is the false-negative guardrail for risk escalation under the same label.
+
 ## Evaluation rule
 
 Evaluate rows in priority order.
@@ -71,13 +95,13 @@ The **first matching row wins**.
 
 ## Transition matrix
 
-| Priority | old_state | new_state | blocker_set_changed | action_line_changed | confidence_drop_bucket | mergeable_flip | Emit? | Reason | Priority Class |
+| Priority | old_state | new_state | blocker_set_changed | action_key_changed | confidence_drop_bucket | mergeable_flip | Emit? | Reason | Priority Class |
 |---|---|---|---:|---:|---|---:|---|---|---|
 | 1 | not `mergeable` | `mergeable` | * | * | * | `true` | Yes | `mergeable-flip` | high |
 | 2 | `mergeable` | not `mergeable` | * | * | * | `true` | Yes | `mergeable-flip` | high |
 | 3 | any | any different from old | * | * | * | `false` | Yes | `state-change` | normal |
 | 4 | same as old | same as old | `true` | * | * | `false` | Yes | `blocker-set-change` | normal |
-| 5 | same as old | same as old | `false` | `true` | * | `false` | Yes | `action-line-change` | normal |
+| 5 | same as old | same as old | `false` | `true` | * | `false` | Yes | `action-key-change` | normal |
 | 6 | same as old | same as old | `false` | `false` | `medium` | `false` | Yes | `confidence-drop` | normal |
 | 7 | same as old | same as old | `false` | `false` | `large` | `false` | Yes | `confidence-drop` | high |
 | 8 | `stale` | `stale` | `false` | `false` | `none` | `false` | No | `no-op` | low |
@@ -95,21 +119,27 @@ These are the rows that must stay silent even if timestamps or ages changed:
 1. **Age-only reevaluation**
    - same state
    - same blockers
-   - same action line
+   - same `action_key`
    - same confidence bucket
    - only packet timestamps advanced
 
 2. **Pending-age increments**
    - state remains `stale`
    - required check is still `pending`
-   - action line still says “wait for required checks to finish”
+   - action key still says `wait.check.<name>`
    - only `age_minutes` increased
 
 3. **Same ambiguity, no new evidence**
    - state remains `needs-human`
    - same `ambiguous-state` blocker ids
-   - same action line
+   - same `action_key`
    - confidence drop only `small`
+
+4. **Action-line wording churn only**
+   - state unchanged
+   - blocker set unchanged
+   - `action_key` unchanged
+   - `action_line` wording changed only
 
 ## Canonical no-emit examples
 
@@ -119,6 +149,7 @@ Old:
 {
   "decision": {"state": "stale", "confidence_pct": 96},
   "blockers": [],
+  "action_key": "wait.check.solana-bootstrap-sdk",
   "action_line": "To merge: wait for required checks to finish on head 333cccc."
 }
 ```
@@ -128,6 +159,7 @@ New:
 {
   "decision": {"state": "stale", "confidence_pct": 96},
   "blockers": [],
+  "action_key": "wait.check.solana-bootstrap-sdk",
   "action_line": "To merge: wait for required checks to finish on head 333cccc."
 }
 ```
@@ -153,7 +185,7 @@ New blocker ids:
 
 Difference:
 - same blocker id
-- same action line
+- same `action_key`
 - same state
 - no confidence threshold crossing
 
@@ -168,6 +200,7 @@ Old:
 {
   "decision": {"state": "needs-human", "confidence_pct": 58},
   "blockers": [{"id": "ambiguous-state:thread:901"}],
+  "action_key": "reconfirm.intent.current-head",
   "action_line": "Do not merge because prior approval was for superseded SHA; reconfirm reviewer intent on current head 555eeee."
 }
 ```
@@ -177,12 +210,42 @@ New:
 {
   "decision": {"state": "needs-human", "confidence_pct": 55},
   "blockers": [{"id": "ambiguous-state:thread:901"}],
+  "action_key": "reconfirm.intent.current-head",
   "action_line": "Do not merge because prior approval was for superseded SHA; reconfirm reviewer intent on current head 555eeee."
 }
 ```
 
 Difference:
 - `confidence_drop_bucket = small`
+
+Result:
+```text
+No emit
+```
+
+### 4) Action-line wording churn only
+Old:
+```json
+{
+  "decision": {"state": "blocked"},
+  "blockers": [{"id": "pending-required-check:check:dashboard-verify"}],
+  "action_key": "wait.check.dashboard-verify",
+  "action_line": "Wait for dashboard-verify to finish."
+}
+```
+
+New:
+```json
+{
+  "decision": {"state": "blocked"},
+  "blockers": [{"id": "pending-required-check:check:dashboard-verify"}],
+  "action_key": "wait.check.dashboard-verify",
+  "action_line": "Await CI completion (dashboard-verify)."
+}
+```
+
+Difference:
+- prose changed only
 
 Result:
 ```text
@@ -215,26 +278,47 @@ Result:
 Emit (`blocker-set-change`)
 ```
 
-### 3) Same blockers, different action line
-Old action line:
+### 3) Same blockers, different action key
+Old action key:
 ```text
-To merge: wait for required checks to finish on head 333cccc.
+wait.check.solana-bootstrap-sdk
 ```
 
-New action line:
+New action key:
 ```text
-To merge: ask alexjaniak to reaffirm resolution on current head 333cccc.
+reconfirm.intent.current-head
 ```
 
 Result:
 ```text
-Emit (`action-line-change`)
+Emit (`action-key-change`)
 ```
 
-### 4) Confidence threshold crossed
-Old confidence band: `high`
-New confidence band: `medium`
-State, blockers, and action line unchanged.
+### 4) Confidence threshold crossed under same label
+Old:
+```json
+{
+  "decision": {"state": "needs-human", "confidence_pct": 72},
+  "blockers": [{"id": "ambiguous-state:thread:901"}],
+  "action_key": "reconfirm.intent.current-head"
+}
+```
+
+New:
+```json
+{
+  "decision": {"state": "needs-human", "confidence_pct": 38},
+  "blockers": [{"id": "ambiguous-state:thread:901"}],
+  "action_key": "reconfirm.intent.current-head"
+}
+```
+
+Difference:
+- new trusted contradictory evidence collapsed confidence hard
+- state unchanged
+- blocker ids unchanged
+- `action_key` unchanged
+- `confidence_drop_bucket = large`
 
 Result:
 ```text
@@ -246,7 +330,7 @@ Emit (`confidence-drop`)
 After deciding to emit, store a dedupe signature so repeated deliveries do not fan out:
 
 ```text
-{repo}#{pr_number}:{new_state}:{blocker_set_hash}:{action_line_hash}:{mergeable_flip}:{confidence_drop_bucket}
+{repo}#{pr_number}:{new_state}:{blocker_set_hash}:{action_key}:{mergeable_flip}:{confidence_drop_bucket}
 ```
 
 If the next evaluation produces the same signature, suppress duplicate delivery.
