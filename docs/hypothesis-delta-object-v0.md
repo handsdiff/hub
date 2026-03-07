@@ -69,7 +69,16 @@ Make a single machine-readable object that captures one hypothesis delta and its
     }
   ],
   "verified_at": "2026-03-07T02:14:00Z",
+  "supersedes": null,
   "superseded_by": null,
+  "supersession_action_disposition": [
+    {
+      "action_id": "flag_species_counts_table_for_revalidation",
+      "disposition": "carried_forward",
+      "target_delta_id": "delta_raz2025_hofstenia_h_002",
+      "reason": "newer species count still requires downstream table revalidation"
+    }
+  ],
   "validation_risk": {
     "stale_validation_outputs": true,
     "run_reclassification_needed": false
@@ -108,12 +117,24 @@ Make a single machine-readable object that captures one hypothesis delta and its
    - Signals that required downstream action actually happened rather than being merely noted.
    - If per-action completion exists, `verified_at` should represent the latest point at which the delta was materially closed or rechecked.
 
-8. `superseded_by`
+8. `supersedes`
+   - Nullable `delta_id` reference to the immediately previous delta for the same assumption chain.
+   - Lets consumers traverse backward without scanning the whole corpus.
+
+9. `superseded_by`
    - Nullable `delta_id` reference to the newer delta that replaced this one.
    - Prevents contradictory deltas from accumulating as if all are still active.
    - Does **not** by itself prove closure; use together with `verified_at` / per-action completion.
 
-9. `validation_risk`
+10. `supersession_action_disposition`
+   - Required when pending `required_actions` still exist at supersession time.
+   - Prevents false safety on old deltas by forcing each open action into one explicit state.
+   - Minimum useful dispositions:
+     - `carried_forward`
+     - `invalidated`
+     - `completed`
+
+11. `validation_risk`
    - Whether existing outputs may now be epistemically unsafe to cite.
 
 ## Non-goals
@@ -154,12 +175,31 @@ Current design choice:
 
 Next field added after closure feedback:
 - `superseded_by` (nullable `delta_id`)
+- paired with `supersedes` so the chain has both backward and forward links
 - reason: new evidence can replace an older delta, and downstream consumers need to know which delta is still authoritative
 - important nuance: supersession must not masquerade as closure; unresolved required actions still need explicit completion state
+
+Break-test added after supersession feedback:
+- reject circular supersession at write time
+  - `delta_A -> delta_B -> delta_A` is invalid
+  - `delta_A -> delta_A` is invalid
+- if a delta is superseded while pending actions still exist, each action needs explicit disposition:
+  - `carried_forward`
+  - `invalidated`
+  - `completed`
+- silent abandonment is not allowed
+
+## Structural invariants
+
+1. `supersedes` / `superseded_by` must form a DAG over deltas for the same assumption chain.
+2. Self-supersession is invalid.
+3. Circular supersession is invalid.
+4. A superseded delta with pending actions is invalid unless each pending action has explicit disposition.
+5. `superseded_by` does not imply `verified_at`.
 
 Lower-priority next field candidate:
 - `source_evidence.confidence` for preprints / contested findings
 
 ## Open question for customer validation
 
-If closure and supersession are both solved, what is the next missing field that separates a usable hypothesis-delta object from an overgrown note?
+If closure and supersession are both solved, what is the smallest valid action-disposition enum you would enforce at write time?
