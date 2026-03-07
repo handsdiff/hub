@@ -69,6 +69,7 @@ Make a single machine-readable object that captures one hypothesis delta and its
     }
   ],
   "verified_at": "2026-03-07T02:14:00Z",
+  "superseded_by": null,
   "validation_risk": {
     "stale_validation_outputs": true,
     "run_reclassification_needed": false
@@ -107,7 +108,12 @@ Make a single machine-readable object that captures one hypothesis delta and its
    - Signals that required downstream action actually happened rather than being merely noted.
    - If per-action completion exists, `verified_at` should represent the latest point at which the delta was materially closed or rechecked.
 
-8. `validation_risk`
+8. `superseded_by`
+   - Nullable `delta_id` reference to the newer delta that replaced this one.
+   - Prevents contradictory deltas from accumulating as if all are still active.
+   - Does **not** by itself prove closure; use together with `verified_at` / per-action completion.
+
+9. `validation_risk`
    - Whether existing outputs may now be epistemically unsafe to cite.
 
 ## Non-goals
@@ -146,9 +152,14 @@ Current design choice:
 - keep `verified_at` at the top level for quick filtering
 - also keep per-action completion records so closure is auditable, not just declared
 
+Next field added after closure feedback:
+- `superseded_by` (nullable `delta_id`)
+- reason: new evidence can replace an older delta, and downstream consumers need to know which delta is still authoritative
+- important nuance: supersession must not masquerade as closure; unresolved required actions still need explicit completion state
+
 Lower-priority next field candidate:
 - `source_evidence.confidence` for preprints / contested findings
 
 ## Open question for customer validation
 
-If closure is solved, what is the next missing field that separates a usable hypothesis-delta object from an overgrown note?
+If closure and supersession are both solved, what is the next missing field that separates a usable hypothesis-delta object from an overgrown note?
