@@ -1,0 +1,18 @@
+{
+  "assumption_id": "species_count.hofstenia_h",
+  "canonical_text": "H. hongkongensis species count used by downstream analyses",
+  "assumption_kind": "parameter",
+  "parameter_path": "species_count.hofstenia_h",
+  "source_evidence_refs": [
+    "Raz 2017",
+    "Raz 2025"
+  ],
+  "aliases": [
+    "hofstenia_h_species_count",
+    "species-count-h-hongkongensis"
+  ],
+  "primary_domain": "species_counts",
+  "created_by": "brain",
+  "created_at": "2026-03-08T06:24:00Z",
+  "notes": "Worked example for prometheus-bne. Lookup-before-create should reuse this assumption_id instead of minting a project-scoped duplicate."
+}

@@ -1,0 +1,67 @@
+{
+  "delta_id": "delta_raz2025_hofstenia_h_002",
+  "created_at": "2026-03-08T06:25:00Z",
+  "author_agent": "brain",
+  "source_evidence": {
+    "kind": "paper",
+    "ref": "Raz 2025",
+    "locator": "Table 2"
+  },
+  "affected_assumption": {
+    "assumption_id": "species_count.hofstenia_h",
+    "old_value": 19,
+    "new_value": 21,
+    "change_type": "parameter_update"
+  },
+  "primary_project": {
+    "project_id": "channel-hierarchy-paper",
+    "artifact_ref": "fig1.error-bars"
+  },
+  "cross_project_implications": [
+    {
+      "project_id": "coding-theory-paper",
+      "artifact_ref": "species-counts-table",
+      "effect": "may_be_stale"
+    },
+    {
+      "project_id": "experiment-runlog-2026-03-06",
+      "artifact_ref": "validation-summary",
+      "effect": "run_reclassification_review"
+    }
+  ],
+  "hypothesis_delta": "Raz 2025 changes assumption species_count.hofstenia_h from 19 to 21, so downstream figures, tables, and any validation claims resting on the old value should be rechecked.",
+  "required_actions": [
+    {
+      "action_id": "recompute_fig1_error_bars",
+      "description": "Recompute fig1 error bars in channel-hierarchy-paper",
+      "status": "completed",
+      "completed_at": "2026-03-08T06:27:00Z",
+      "completed_by": "brain",
+      "evidence_ref": "file:hub/docs/examples/prometheus-worked-example-v0.md#closure-path"
+    },
+    {
+      "action_id": "flag_species_counts_table_for_revalidation",
+      "description": "Flag species-counts-table in coding-theory-paper for revalidation",
+      "status": "pending",
+      "completed_at": null,
+      "completed_by": null,
+      "evidence_ref": null
+    },
+    {
+      "action_id": "review_run_intent_for_experiment_runlog_2026_03_06",
+      "description": "Check whether experiment-runlog-2026-03-06 was exploratory or validation before reusing the updated value in any claim",
+      "status": "pending",
+      "completed_at": null,
+      "completed_by": null,
+      "evidence_ref": null
+    }
+  ],
+  "verified_at": null,
+  "supersedes": "delta_raz2017_hofstenia_h_001",
+  "superseded_by": null,
+  "supersession_action_disposition": [],
+  "validation_risk": {
+    "stale_validation_outputs": true,
+    "run_reclassification_needed": true
+  }
+}
