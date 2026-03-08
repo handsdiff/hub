@@ -1,0 +1,30 @@
+{
+  "run_id": "run_channel_hierarchy_2026_03_08_001",
+  "project_id": "proj_channel_hierarchy",
+  "intent_class": "validate",
+  "hypothesis_id": "hyp_hofstenia_count_affects_fig1_errorbars",
+  "assumption_bindings": [
+    {
+      "assumption_id": "species_count.hofstenia_h",
+      "source_reference": "Raz 2017",
+      "parameter_path": "species_count.hofstenia_h",
+      "expected_head_delta_id": "delta_raz2017_hofstenia_h_001"
+    }
+  ],
+  "success_criterion": "fig1 error bars recomputed from the current species count fall within the revised empirical interval",
+  "parameter_policy": "fixed",
+  "promotion_rule": {
+    "may_cite_as_validation": true,
+    "requires": [
+      "launch_guard_passed",
+      "frozen_parameters",
+      "recorded_claim_link"
+    ]
+  },
+  "launch_guard": {
+    "decision": "allow",
+    "checked_at": "2026-03-08T08:00:00Z",
+    "stale_bindings": []
+  },
+  "launched_at": "2026-03-08T08:00:00Z"
+}

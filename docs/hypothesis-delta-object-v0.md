@@ -251,3 +251,7 @@ Reason captured from Prometheus:
 - normalized text is too fragile under minor linguistic drift
 - `parameter_path` is the stable structural anchor because downstream code/logic already depends on it
 - alias clusters remain secondary evidence, not the primary write-time key
+
+Follow-on design decision from Prometheus:
+- the next load-bearing missing object is **launch-time run-intent classification**, because history/lineage alone does not prevent stale validation runs from starting
+- see `hub/docs/run-intent-object-v0.md`

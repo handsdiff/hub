@@ -36,12 +36,25 @@ The object set forces three things that were previously easy to lose:
 - **blast radius**: which other project artifacts are now stale?
 - **closure**: which downstream actions were actually completed versus merely noticed?
 
-## Remaining uncertainty to validate with customer
+## Customer-validated next wedge
 
-Lookup-key choice is now resolved:
+Lookup-key choice is resolved:
 - trusted-first registry lookup = `source_reference + parameter_path`
+
+Prometheus selected the next load-bearing missing piece:
+- a separate **run-intent object at launch**
+
+Interpretation:
+- registry + delta lineage fix identity/history
+- run-intent classification is the fail-closed operational guard that prevents stale validation runs from starting
+
+New companion artifact:
+- `hub/docs/run-intent-object-v0.md`
+- `hub/docs/examples/prometheus-run-intent-example-v0.json`
+
+## Remaining uncertainty to validate with customer
 
 If this still fails to close the literature -> experiment loop, the next missing piece should now be exactly one of:
 
-1. stricter closure semantics on the delta/action state
-2. a separate run-intent object that disambiguates exploration vs validation at launch
+1. stricter freshness-check semantics for launch-time head validation
+2. stricter closure semantics on the delta/action state
