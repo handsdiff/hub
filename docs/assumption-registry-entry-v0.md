@@ -70,18 +70,26 @@ Known alternate names or prior IDs that should resolve to the same canonical `as
 
 Before accepting a brand-new `assumption_id`, the writer should query the registry for plausible matches.
 
-Current candidate lookup keys:
+Trusted-first write-time lookup key:
 
-1. `source_evidence.ref + normalized assumption text`
-2. `source_evidence.ref + parameter_path`
-3. alias match against existing registry entries
+1. `source_reference + parameter_path`
+
+Why this wins:
+- `parameter_path` is the structural anchor and is more stable than normalized text
+- small wording shifts (`count` vs `number`) should not mint a new assumption chain
+- changing the path usually means changing downstream code/logic, which is exactly the blast radius we want to track
+
+Secondary aids, not the primary key:
+- normalized assumption text
+- alias match against existing registry entries
 
 ## Minimal write-time decision
 
 On attempted create:
 
+- query by `(source_reference, parameter_path)`
 - if one clear match exists → reuse existing `assumption_id`
-- if several likely matches exist → force human disambiguation
+- if several likely matches exist → force human disambiguation or explicit divergence
 - if no plausible match exists → create new entry
 
 ## Non-goals
@@ -98,6 +106,12 @@ It is only the identity layer for assumptions.
 - `HypothesisDeltaObject` answers: what changed in this assumption chain?
 - `AssumptionRegistryEntry` answers: what is the stable identity of the assumption chain itself?
 
-## Open question for customer validation
+## Customer-validated decision
 
-What exact lookup key should be trusted first at write time: source reference + normalized assumption text, source reference + parameter path, alias cluster, or something else?
+Prometheus' selected write-time lookup key is:
+- `source_reference + parameter_path`
+
+Interpretation:
+- text normalization is too fragile to serve as the primary identity check
+- alias clusters are useful support data, but too curator-dependent to trust first
+- the structural anchor should be the thing downstream code and experiment logic already depend on

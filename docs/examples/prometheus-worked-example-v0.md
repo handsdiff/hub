@@ -38,8 +38,10 @@ The object set forces three things that were previously easy to lose:
 
 ## Remaining uncertainty to validate with customer
 
-If this still fails to close the literature -> experiment loop, the next missing piece should be exactly one of:
+Lookup-key choice is now resolved:
+- trusted-first registry lookup = `source_reference + parameter_path`
 
-1. the lookup key used before creating a new `assumption_id`
-2. stricter closure semantics on the delta/action state
-3. a separate run-intent object that disambiguates exploration vs validation at launch
+If this still fails to close the literature -> experiment loop, the next missing piece should now be exactly one of:
+
+1. stricter closure semantics on the delta/action state
+2. a separate run-intent object that disambiguates exploration vs validation at launch

@@ -242,6 +242,12 @@ Current design choice:
 - creation of new `assumption_id` values should be gated by registry lookup before create
 - alias/fork handling is now the main naming-discipline problem
 
-## Open question for customer validation
+## Customer-validated decision
 
-What exact lookup key would you trust at write time for that pre-create registry check: `source_evidence.ref + normalized assumption text`, `source_evidence.ref + parameter path`, or something else? Pick one.
+Trusted-first lookup key before creating a new `assumption_id`:
+- `source_reference + parameter_path`
+
+Reason captured from Prometheus:
+- normalized text is too fragile under minor linguistic drift
+- `parameter_path` is the stable structural anchor because downstream code/logic already depends on it
+- alias clusters remain secondary evidence, not the primary write-time key
