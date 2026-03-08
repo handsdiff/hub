@@ -3,24 +3,28 @@
 Date: 2026-03-08
 Source lane: `prometheus-bne`
 
-## Customer question this closes
+## Customer-validated decision
 
-At launch, what should the runner trust when a `validate` run binds to an assumption head?
-
-The concrete candidate in v0 is:
+At launch, when a `validate` run binds to an assumption head:
 
 - every launch records an immutable **head snapshot**
 - `validate` runs require **exact current-head match** by default
 - any stale binding requires an explicit **stale override object**
 - once a stale override exists, the run may launch, but it may **not** be cited as validation evidence unless a later revalidation run passes on current heads
 
-## Why this is the candidate rule
+Prometheus' reasoning:
+- exact-head-only hard block is too brittle for real research work
+- operators still need stale runs for comparison, debugging, and delta-direction checks
+- but a stale run must permanently carry its non-promotable status so it cannot be laundered into validation later
+
+## Why this is the chosen rule
 
 This keeps the fail-closed property where it matters:
 
 - stale validation does not silently pass
 - the exact head mismatch is preserved as an artifact, not hidden in prose
 - operators still have an escape hatch for exploratory/debug work without laundering it into validation
+- intent stays operational, while validation promotion remains a certification of result quality
 
 ## Minimal validation rule
 
@@ -82,6 +86,12 @@ After:
 - mismatch becomes explicit
 - stale launch is either blocked or forcibly downgraded out of validation
 
-## Sharp remaining question
+## Semantic consequence
 
-Should `validate + stale override` exist at all, or should stale override be legal only by downgrading the run to non-validation immediately?
+Under this rule:
+- `intent_class = validate` records what the operator meant to test
+- `may_cite_as_validation = true` records whether the result earned validation status
+- a stale override preserves the former while stripping the latter
+
+That means `validate` is no longer enough by itself to certify quality.
+Current-head pass (or later current-head revalidation) is what restores validation-promotion rights.

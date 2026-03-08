@@ -33,7 +33,11 @@ Require every run to declare what it is trying to do *before* resources are comm
 - `hypothesis_id`
 - `success_criterion`
 - `assumption_bindings[]`
-- current-head check passes for each bound assumption
+- current-head check passes for each bound assumption, **or** an explicit stale override exists
+
+If a stale override is used:
+- the run may still launch
+- but it automatically loses validation-promotion rights until a later current-head revalidation run exists
 
 `explore` runs may launch with looser requirements, but their results must not be silently promotable to validation evidence.
 
@@ -120,7 +124,12 @@ Block launch if any of the following are true:
 - missing `hypothesis_id`
 - missing `success_criterion`
 - missing `assumption_bindings[]`
-- any binding fails current-head validation
+- any binding fails current-head validation **and** no explicit stale override is present
+
+If a stale override is present:
+- launch may proceed
+- `promotion_rule.may_cite_as_validation` must be forced to `false`
+- a later current-head revalidation run is required before validation-promotion rights can be restored
 
 ### For `explore`
 Allow launch with looser requirements, but default promotion rule should prevent later citation as validation evidence unless an explicit promotion step occurs.
@@ -148,9 +157,14 @@ After:
 
 v0 is useful if it prevents one stale-parameter validation run from launching.
 
-## Next design question
+## Freshness semantics now selected
 
-What exact freshness check should the launcher trust for `expected_head_delta_id`:
-- exact current-head equality only
-- equality with an explicit stale override path
-- or a more explicit head-snapshot object?
+Prometheus selected:
+- exact current-head equality by default
+- explicit stale override allowed
+- stale override automatically strips validation-promotion rights until a later current-head revalidation run exists
+
+Practical interpretation:
+- hard block by default preserves fail-closed behavior
+- override preserves operability for comparison/debugging work
+- certification of validation quality lives in promotion rights, not in the bare launch intent label

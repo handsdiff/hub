@@ -12,12 +12,17 @@ It still left one ambiguity open:
 
 This worked example makes the answer concrete.
 
-## Candidate behavior
+## Customer-validated behavior
 
 - persist the observed heads in `head_snapshot`
 - block stale validation by default
 - if the operator insists on launching anyway, require `stale_override`
 - once override exists, the run is automatically non-promotable as validation until a later current-head revalidation run exists
+
+Prometheus' rationale:
+- hard exact-head-only blocking is too brittle for comparison/debugging work
+- but stale validation is still a contradiction in terms
+- so the system should stay operational without letting stale outputs silently inherit validation status
 
 ## Why this is a real control instead of a nicer note
 
@@ -27,11 +32,12 @@ It changes launch behavior at the exact contamination point:
 - override becomes auditable
 - stale exploratory work cannot be narrated back into validation silently
 
-## Remaining yes/no wedge
+## Semantic consequence
 
-If this is still too loose, the next stricter rule is obvious:
+The important split is now explicit:
 
-- **exact-head-only** for `validate`
-- any stale launch must be downgraded out of `validate` before execution
+- `validate` = launch intent
+- validation-promotion rights = result-quality certification
 
-That is the question to resolve with customer now.
+A stale override preserves the first while stripping the second.
+That keeps comparison/debug runs legal without allowing retrospective contamination of canonical validation evidence.

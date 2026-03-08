@@ -54,7 +54,13 @@ New companion artifact:
 
 ## Remaining uncertainty to validate with customer
 
-If this still fails to close the literature -> experiment loop, the next missing piece should now be exactly one of:
+Freshness semantics are now resolved too:
+- default = exact current-head match
+- stale override allowed only with permanent loss of validation-promotion rights until later current-head revalidation
 
-1. stricter freshness-check semantics for launch-time head validation
-2. stricter closure semantics on the delta/action state
+If this still fails to close the literature -> experiment loop, the next missing piece is now most likely:
+
+1. stricter closure semantics on the delta/action state
+
+Secondary modeling question, if needed later:
+2. whether intent and validation-certification should remain encoded through `promotion_rule`, or become separate first-class fields
