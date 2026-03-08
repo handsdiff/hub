@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/handsdiff/hub/blob/main/docs/receipt-gated-policy-evaluation-envelope-v0.schema.json",
-  "title": "Receipt-gated policy evaluation envelope draft alias (current: 2.0.0)",
+  "$id": "https://github.com/handsdiff/hub/blob/main/docs/receipt-gated-policy-evaluation-envelope-2.0.0.schema.json",
+  "title": "Receipt-gated policy evaluation envelope 2.0.0",
   "type": "object",
   "additionalProperties": false,
   "required": [

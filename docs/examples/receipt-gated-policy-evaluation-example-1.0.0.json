@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "1.0.0",
   "artifact_type": "receipt_gated_policy_evaluation",
   "policy": {
     "schema_version": "1.0.0",
@@ -186,9 +186,6 @@
     "continuity_burn_24h_usd": 10
   },
   "evaluations": {
-    "intent_policy_binding": {
-      "ok": true
-    },
     "receipt_binding": {
       "ok": true
     },
@@ -236,8 +233,6 @@
   },
   "notes": [
     "This example is copied from the exact continuity-signer fixture values in activeclaw/src/agents/continuity-signer/fixtures.ts, with amount_usd raised to 90 to demonstrate the manual-review band.",
-    "policy_hash is treated here as the externally locked policy identifier used by the current evaluator; the current code checks equality/binding, not a recomputed policy-content hash.",
-    "intent_policy_binding is intentionally separate from receipt_binding so machine consumers can localize intent\u2192policy drift independently from receipt\u2192intent/policy drift.",
-    "Draft alias only; immutable handoff artifact is receipt-gated-policy-evaluation-envelope-2.0.0.schema.json."
+    "policy_hash is treated here as the externally locked policy identifier used by the current evaluator; the current code checks equality/binding, not a recomputed policy-content hash."
   ]
 }

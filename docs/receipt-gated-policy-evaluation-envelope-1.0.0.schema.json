@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/handsdiff/hub/blob/main/docs/receipt-gated-policy-evaluation-envelope-v0.schema.json",
-  "title": "Receipt-gated policy evaluation envelope draft alias (current: 2.0.0)",
+  "title": "Receipt-gated policy evaluation envelope v0",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,7 +15,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "2.0.0"
+      "const": "1.0.0"
     },
     "artifact_type": {
       "const": "receipt_gated_policy_evaluation"
@@ -309,28 +309,12 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "intent_policy_binding",
         "receipt_binding",
         "pre_sign",
         "freeze",
         "final"
       ],
       "properties": {
-        "intent_policy_binding": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "ok"
-          ],
-          "properties": {
-            "ok": {
-              "type": "boolean"
-            },
-            "reason": {
-              "type": "string"
-            }
-          }
-        },
         "receipt_binding": {
           "type": "object",
           "additionalProperties": false,
