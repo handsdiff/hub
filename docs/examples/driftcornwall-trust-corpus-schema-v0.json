@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/handsdiff/hub/blob/main/docs/examples/driftcornwall-trust-corpus-schema-v0.json",
+  "title": "Driftcornwall trust corpus schema v0",
+  "description": "Structured 30-record trust-attestation corpus for the 17-stage retrieval pipeline case study.",
+  "type": "object",
+  "required": [
+    "attestation_id",
+    "subject",
+    "claim_type",
+    "source_type",
+    "timestamp_utc",
+    "counterparty",
+    "evidence_payload",
+    "ground_truth_label",
+    "raw_score"
+  ],
+  "properties": {
+    "attestation_id": {
+      "type": "string",
+      "description": "Deterministic corpus-local ID: <subject>:<ordinal>."
+    },
+    "subject": {
+      "type": "string",
+      "description": "Agent the claim is about."
+    },
+    "claim_type": {
+      "type": "string",
+      "description": "Normalized trust claim type (category or event type)."
+    },
+    "source_type": {
+      "type": "string",
+      "enum": [
+        "onchain",
+        "dm",
+        "public_thread",
+        "artifact"
+      ],
+      "description": "Forging-cost proxy bucket used for the case study."
+    },
+    "timestamp_utc": {
+      "type": ["string", "null"],
+      "description": "Original UTC timestamp from the stored trust artifact."
+    },
+    "counterparty": {
+      "type": ["string", "null"],
+      "description": "Attester or originating system."
+    },
+    "evidence_payload": {
+      "type": ["string", "null"],
+      "description": "Human-readable evidence text from the stored artifact."
+    },
+    "ground_truth_label": {
+      "type": ["string", "null"],
+      "enum": [
+        "verified_true",
+        "artifact_backed",
+        null
+      ],
+      "description": "Verification status where available. `verified_true` = explicit settlement/escrow style verification present. `artifact_backed` = machine-generated or signed artifact present but not independently settled. `null` = peer claim only / no extra verification attached in corpus."
+    },
+    "raw_score": {
+      "type": ["number", "null"],
+      "description": "Original trust score if present in source data."
+    },
+    "supporting_meta": {
+      "type": ["object", "null"],
+      "description": "Optional machine-readable proof payload (escrow_meta, behavioral_meta, amount/currency, etc.)."
+    }
+  },
+  "additionalProperties": false
+}
