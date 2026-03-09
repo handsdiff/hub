@@ -133,7 +133,9 @@ Block launch if any of the following are true:
 If a stale override is present:
 - launch may proceed
 - `promotion_rule.may_cite_as_validation` must be forced to `false`
+- the loss of validation-promotion rights does **not** auto-reset on that run
 - a later current-head revalidation run is required before validation-promotion rights can be restored
+- that restoration belongs to the later run artifact, not by mutating the old stale run
 
 ### For `explore`
 Allow launch with looser requirements, but default promotion rule should prevent later citation as validation evidence unless an explicit promotion step occurs.

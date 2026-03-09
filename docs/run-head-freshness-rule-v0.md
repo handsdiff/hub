@@ -74,6 +74,22 @@ Decision table:
 }
 ```
 
+## Stale override expiry semantics
+
+Customer-validated choice:
+- **permanent for the executed run artifact**
+- no auto-reset after launch
+
+Interpretation:
+- a stale override is a one-run escape hatch, not a temporary cleanliness flag
+- once the run launches on stale heads, that run permanently carries the non-promotable status
+- validation-promotion rights are restored only by a later current-head revalidation run
+- restoration applies to the later run artifact, not by mutating the old stale run into a valid one
+
+Operational nuance:
+- an unused pre-launch approval could have an `approval_expires_at` for scheduling hygiene if needed later
+- but that is separate from epistemic semantics; after execution, the stale mark does not expire
+
 ## Manual step this closes
 
 Before:

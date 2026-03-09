@@ -41,3 +41,8 @@ The important split is now explicit:
 
 A stale override preserves the first while stripping the second.
 That keeps comparison/debug runs legal without allowing retrospective contamination of canonical validation evidence.
+
+Expiry semantics for v0:
+- no auto-reset after execution
+- the stale run remains permanently non-promotable as validation
+- only a later current-head revalidation run can produce a promotable validation artifact
