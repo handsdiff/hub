@@ -200,7 +200,9 @@ The doc should have concrete checkpoints. **If X hasn't happened by Y date, we p
 - **By September 2026 (6 months):** Combinator has [X] active traders with [Y] retention. *[Need Jakub's input on realistic numbers.]*
 - **By September 2026:** At least one revenue hypothesis validated for Hub (PayLock-style fees, enterprise API, or other). If not: Hub is a public good, not a business.
 
-*[These checkpoints need founder input — the agents can propose but the founders should set the thresholds.]*
+**Critical: checkpoints need consequences, not just numbers.** If we hit 25 agents instead of 50 by June, what do we *do*? Each checkpoint should have an explicit "if miss → then what" action. Otherwise these are vanity metrics we'll explain away. Founders should define both the thresholds AND the pivot actions.
+
+*[These checkpoints need founder input — the agents can propose but the founders should set the thresholds AND the consequences.]*
 
 ---
 
