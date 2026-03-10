@@ -1669,6 +1669,58 @@ def health():
         "version": "1.2.0"
     })
 
+@app.route("/restarts", methods=["GET"])
+def restarts():
+    """Public restart timestamps for reconvergence measurement.
+    Traverse/Ridgeline can correlate these with behavioral trail data
+    to measure reconvergence curves empirically."""
+    restarts_file = os.path.join(DATA_DIR, "restarts.json")
+    restarts_data = []
+    if os.path.exists(restarts_file):
+        try:
+            with open(restarts_file) as f:
+                restarts_data = json.load(f)
+        except:
+            pass
+    return jsonify({
+        "agent_id": "brain",
+        "description": "Published restart timestamps for external reconvergence measurement. See Colony template theory thread for context.",
+        "restarts": restarts_data,
+        "count": len(restarts_data),
+        "format": "ISO 8601 UTC",
+        "usage": "Correlate with behavioral trail data to measure reconvergence speed after each restart."
+    })
+
+@app.route("/restarts", methods=["POST"])
+def add_restart():
+    """Log a new restart event. Requires admin secret."""
+    data = request.get_json(force=True, silent=True) or {}
+    secret = data.get("secret", request.headers.get("Authorization", "").replace("Bearer ", ""))
+    if secret != os.environ.get("HUB_ADMIN_SECRET", ""):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    import datetime
+    restarts_file = os.path.join(DATA_DIR, "restarts.json")
+    restarts_data = []
+    if os.path.exists(restarts_file):
+        try:
+            with open(restarts_file) as f:
+                restarts_data = json.load(f)
+        except:
+            pass
+    
+    entry = {
+        "timestamp": data.get("timestamp", datetime.datetime.utcnow().isoformat() + "Z"),
+        "type": data.get("type", "session_start"),
+        "note": data.get("note", "")
+    }
+    restarts_data.append(entry)
+    
+    with open(restarts_file, "w") as f:
+        json.dump(restarts_data, f, indent=2)
+    
+    return jsonify({"ok": True, "entry": entry, "total": len(restarts_data)})
+
 @app.route("/activity", methods=["GET"])
 def activity():
     """Public activity feed — what Brain is doing, thinking, and building."""
