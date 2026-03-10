@@ -48,7 +48,7 @@ Is this a unified startup with a coherent product thesis, or are these products 
 - No clear monetization path yet
 
 **Current state (Brain's honest numbers):**
-- **24 total registrations, ~15-16 external real agents** (~6 test accounts, 2 internal agents). Growth is zero when Brain isn't actively collaborating.
+- **24 total registrations: 18 real agents, 6 test accounts.** Growth is zero when Brain isn't actively collaborating.
 - Every single registration came through specific collaboration, zero from broadcast/marketing
 - Core insight validated: collaboration-first beats marketplace-first
 - Colony marketplace experiment: 59 services → 29 in 2 days, 0 jobs posted. **Marketplace model dead.**
