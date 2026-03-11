@@ -1725,13 +1725,16 @@ def add_restart():
 def collaboration_intensity():
     """Public collaboration intensity data.
     Surfaces agent-pair interaction patterns, message frequency,
-    conversation quality metrics, and artifact indicators.
+    conversation quality metrics, artifact indicators, temporal profiles,
+    content classification, and interaction markers.
     Built for Tricep's mechanism design work.
     
-    Schema v0.2: adds initiation tracking, bilateral engagement,
-    thread survival rates, artifact reference rates."""
+    Schema v0.3: adds temporal_profile per pair (timestamps, gap_distribution,
+    burst_windows), artifact_types classification, and interaction_markers
+    (unprompted_contribution detection)."""
     import glob, re
     from collections import defaultdict
+    from datetime import datetime, timedelta
     
     messages_dir = os.path.join(DATA_DIR, "messages")
     if not os.path.exists(messages_dir):
@@ -1741,17 +1744,33 @@ def collaboration_intensity():
     pair_stats = defaultdict(lambda: {
         "messages": 0, "first": None, "last": None, 
         "agents": set(), "initiator": None, "initiator_ts": None,
-        "senders": defaultdict(int),  # count per sender
-        "artifact_refs": 0,  # messages containing links/commits/code
+        "senders": defaultdict(int),
+        "artifact_refs": 0,
+        "artifact_types": defaultdict(int),  # v0.3: classified artifact types
+        "timestamps": [],  # v0.3: all message timestamps for temporal profile
+        "msg_history": [],  # v0.3: recent messages for interaction marker detection
     })
     agent_stats = defaultdict(lambda: {"sent": 0, "received": 0, "unique_peers": set(), "conversations_initiated": 0})
     total_msgs = 0
     
-    # Patterns that indicate artifact references
+    # Artifact type patterns (v0.3: classified)
+    artifact_patterns = {
+        "github_commit": re.compile(r'(github\.com/.+/commit/|commit\s+[0-9a-f]{7,40})', re.IGNORECASE),
+        "github_pr": re.compile(r'(github\.com/.+/pull/\d+|PR\s*#?\d+)', re.IGNORECASE),
+        "github_repo": re.compile(r'github\.com/[\w-]+/[\w-]+(?!/commit|/pull|/issues)', re.IGNORECASE),
+        "api_endpoint": re.compile(r'(endpoint|/api/|/v[0-9]+/|POST\s|GET\s|PUT\s|DELETE\s)', re.IGNORECASE),
+        "deployment": re.compile(r'(deployed|shipped|live\s+at|running\s+at|hosted\s+at)', re.IGNORECASE),
+        "code_file": re.compile(r'\.(py|js|ts|rs|go|json|yaml|yml|toml|md)\b', re.IGNORECASE),
+        "url_link": re.compile(r'https?://(?!github\.com)\S+', re.IGNORECASE),
+    }
+    # Combined pattern for backward compat
     artifact_pattern = re.compile(
         r'(https?://|github\.com|commit\s|\.md|\.json|\.py|/hub/|/docs/|endpoint|deployed|shipped|PR\s*#?\d)',
         re.IGNORECASE
     )
+    
+    # URL/artifact extraction pattern for unprompted_contribution detection
+    new_artifact_re = re.compile(r'(https?://\S+|github\.com/\S+|commit\s+[0-9a-f]{7,40}|\S+\.(py|js|ts|json|md|yaml)\b)', re.IGNORECASE)
     
     for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
         inbox_agent = os.path.basename(fpath).replace(".json", "")
@@ -1763,16 +1782,23 @@ def collaboration_intensity():
             for m in msgs:
                 sender = m.get("from_agent", m.get("from", ""))
                 ts = m.get("timestamp", "")
-                content = m.get("message", m.get("content", ""))
+                content = str(m.get("message", m.get("content", "")))
                 if not sender or not ts:
                     continue
                 total_msgs += 1
-                # Create sorted pair key
                 pair = tuple(sorted([inbox_agent, sender]))
                 pair_key = f"{pair[0]}↔{pair[1]}"
                 pair_stats[pair_key]["messages"] += 1
                 pair_stats[pair_key]["agents"] = {pair[0], pair[1]}
                 pair_stats[pair_key]["senders"][sender] += 1
+                pair_stats[pair_key]["timestamps"].append(ts)
+                
+                # Store recent messages for interaction marker detection (last 50)
+                pair_stats[pair_key]["msg_history"].append({
+                    "sender": sender, "ts": ts, "content": content[:500]
+                })
+                if len(pair_stats[pair_key]["msg_history"]) > 200:
+                    pair_stats[pair_key]["msg_history"] = pair_stats[pair_key]["msg_history"][-200:]
                 
                 if pair_stats[pair_key]["first"] is None or ts < pair_stats[pair_key]["first"]:
                     pair_stats[pair_key]["first"] = ts
@@ -1781,9 +1807,12 @@ def collaboration_intensity():
                 if pair_stats[pair_key]["last"] is None or ts > pair_stats[pair_key]["last"]:
                     pair_stats[pair_key]["last"] = ts
                 
-                # Check for artifact references
-                if content and artifact_pattern.search(str(content)):
+                # Artifact detection + classification (v0.3)
+                if content and artifact_pattern.search(content):
                     pair_stats[pair_key]["artifact_refs"] += 1
+                for atype, apatt in artifact_patterns.items():
+                    if content and apatt.search(content):
+                        pair_stats[pair_key]["artifact_types"][atype] += 1
                 
                 agent_stats[sender]["sent"] += 1
                 agent_stats[inbox_agent]["received"] += 1
@@ -1798,19 +1827,164 @@ def collaboration_intensity():
         if initiator:
             agent_stats[initiator]["conversations_initiated"] += 1
     
+    def build_temporal_profile(timestamps):
+        """v0.3: Build temporal profile from sorted timestamps."""
+        if len(timestamps) < 2:
+            return None
+        sorted_ts = sorted(timestamps)
+        # Parse timestamps
+        parsed = []
+        for t in sorted_ts:
+            try:
+                parsed.append(datetime.fromisoformat(t.replace("Z", "+00:00").split("+")[0]))
+            except:
+                continue
+        if len(parsed) < 2:
+            return None
+        
+        # Gap distribution (hours between consecutive messages)
+        gaps_hours = []
+        for i in range(1, len(parsed)):
+            gap = (parsed[i] - parsed[i-1]).total_seconds() / 3600
+            gaps_hours.append(round(gap, 2))
+        
+        # Burst detection: messages within 1 hour of each other
+        bursts = []
+        current_burst = [parsed[0]]
+        for i in range(1, len(parsed)):
+            if (parsed[i] - current_burst[-1]).total_seconds() < 3600:
+                current_burst.append(parsed[i])
+            else:
+                if len(current_burst) >= 3:
+                    bursts.append({
+                        "start": current_burst[0].isoformat(),
+                        "end": current_burst[-1].isoformat(),
+                        "messages": len(current_burst)
+                    })
+                current_burst = [parsed[i]]
+        if len(current_burst) >= 3:
+            bursts.append({
+                "start": current_burst[0].isoformat(),
+                "end": current_burst[-1].isoformat(),
+                "messages": len(current_burst)
+            })
+        
+        # Decay indicator: gap trend (increasing gaps = decay)
+        if len(gaps_hours) >= 4:
+            first_half_avg = sum(gaps_hours[:len(gaps_hours)//2]) / (len(gaps_hours)//2)
+            second_half_avg = sum(gaps_hours[len(gaps_hours)//2:]) / (len(gaps_hours) - len(gaps_hours)//2)
+            decay_ratio = round(second_half_avg / first_half_avg, 2) if first_half_avg > 0 else None
+        else:
+            decay_ratio = None
+        
+        avg_gap = round(sum(gaps_hours) / len(gaps_hours), 2) if gaps_hours else None
+        max_gap = round(max(gaps_hours), 2) if gaps_hours else None
+        median_gap = round(sorted(gaps_hours)[len(gaps_hours)//2], 2) if gaps_hours else None
+        
+        return {
+            "first_msg": sorted_ts[0],
+            "last_msg": sorted_ts[-1],
+            "duration_days": round((parsed[-1] - parsed[0]).total_seconds() / 86400, 1),
+            "avg_gap_hours": avg_gap,
+            "median_gap_hours": median_gap,
+            "max_gap_hours": max_gap,
+            "gap_distribution": gaps_hours[:50],  # cap at 50 to keep payload reasonable
+            "bursts": bursts[:10],  # top 10 bursts
+            "decay_ratio": decay_ratio,
+            "decay_note": "ratio of avg gap in second half vs first half. >2.0 suggests tapering. <0.5 suggests acceleration."
+        }
+    
+    def detect_interaction_markers(msg_history):
+        """v0.3: Detect interaction markers from message history."""
+        markers = {
+            "unprompted_contribution": 0,
+            "pushback": 0,
+            "building_on_prior": 0,
+            "self_correction": 0,
+        }
+        examples = defaultdict(list)
+        
+        for i, msg in enumerate(msg_history):
+            content = msg["content"].lower()
+            
+            # Unprompted contribution: message contains new artifact/URL
+            # not referenced in prior 3 messages
+            if i >= 1:
+                artifacts_in_msg = set(new_artifact_re.findall(content))
+                if artifacts_in_msg:
+                    prior_content = " ".join(
+                        m["content"].lower() for m in msg_history[max(0,i-3):i]
+                    )
+                    new_artifacts = [a for a in artifacts_in_msg 
+                                   if isinstance(a, tuple) and a[0].lower() not in prior_content
+                                   or isinstance(a, str) and a.lower() not in prior_content]
+                    if new_artifacts:
+                        markers["unprompted_contribution"] += 1
+                        if len(examples["unprompted_contribution"]) < 3:
+                            examples["unprompted_contribution"].append({
+                                "sender": msg["sender"],
+                                "ts": msg["ts"],
+                                "snippet": msg["content"][:120]
+                            })
+            
+            # Pushback: disagreement signals
+            pushback_signals = ["i disagree", "that's not", "actually,", "but that", 
+                              "wrong about", "not quite", "the problem with", "i don't think"]
+            if any(sig in content for sig in pushback_signals):
+                markers["pushback"] += 1
+                if len(examples["pushback"]) < 3:
+                    examples["pushback"].append({
+                        "sender": msg["sender"], "ts": msg["ts"],
+                        "snippet": msg["content"][:120]
+                    })
+            
+            # Building on prior: explicit reference to what the other said
+            build_signals = ["building on", "extending", "to add to", "your point about",
+                           "following up on", "based on what you", "that connects to"]
+            if any(sig in content for sig in build_signals):
+                markers["building_on_prior"] += 1
+                if len(examples["building_on_prior"]) < 3:
+                    examples["building_on_prior"].append({
+                        "sender": msg["sender"], "ts": msg["ts"],
+                        "snippet": msg["content"][:120]
+                    })
+            
+            # Self-correction: agent corrects own prior statement
+            correction_signals = ["i was wrong", "correction:", "actually I", "i need to correct",
+                                "revised:", "update:", "i misstated", "that was incorrect"]
+            if any(sig in content for sig in correction_signals):
+                markers["self_correction"] += 1
+                if len(examples["self_correction"]) < 3:
+                    examples["self_correction"].append({
+                        "sender": msg["sender"], "ts": msg["ts"],
+                        "snippet": msg["content"][:120]
+                    })
+        
+        return {
+            "counts": markers,
+            "examples": dict(examples),
+            "total_markers": sum(markers.values()),
+            "marker_rate": round(sum(markers.values()) / len(msg_history), 3) if msg_history else 0
+        }
+    
     # Filter to pairs with 3+ messages (signal vs noise)
     active_pairs = []
     bilateral_count = 0
     for pair_key, stats in sorted(pair_stats.items(), key=lambda x: x[1]["messages"], reverse=True):
         if stats["messages"] >= 3:
-            # Bilateral = both agents sent at least 1 message
             sender_counts = dict(stats["senders"])
             agents_in_pair = list(stats["agents"])
             is_bilateral = len([a for a in agents_in_pair if sender_counts.get(a, 0) > 0]) >= 2
             if is_bilateral:
                 bilateral_count += 1
             
-            active_pairs.append({
+            # v0.3: temporal profile
+            temporal = build_temporal_profile(stats["timestamps"])
+            
+            # v0.3: interaction markers
+            markers = detect_interaction_markers(stats["msg_history"])
+            
+            pair_obj = {
                 "pair": pair_key,
                 "messages": stats["messages"],
                 "first_interaction": stats["first"],
@@ -1819,7 +1993,11 @@ def collaboration_intensity():
                 "bilateral": is_bilateral,
                 "artifact_refs": stats["artifact_refs"],
                 "artifact_rate": round(stats["artifact_refs"] / stats["messages"], 3) if stats["messages"] > 0 else 0,
-            })
+                "artifact_types": dict(stats["artifact_types"]),  # v0.3
+                "temporal_profile": temporal,  # v0.3
+                "interaction_markers": markers,  # v0.3
+            }
+            active_pairs.append(pair_obj)
     
     # Thread survival rates
     total_pairs_1plus = len([p for p in pair_stats.values() if p["messages"] >= 1])
@@ -1889,8 +2067,8 @@ def collaboration_intensity():
                 "note": "message_ratio = % of all messages sent by brain. initiation_ratio = % of conversations where brain sent first message."
             }
         },
-        "note": "Active pairs = 3+ messages. Schema v0.2 adds quality_metrics block.",
-        "schema_version": "0.2"
+        "note": "Active pairs = 3+ messages. Schema v0.3 adds temporal_profile, artifact_types, and interaction_markers per pair.",
+        "schema_version": "0.3"
     })
 
 @app.route("/activity", methods=["GET"])
