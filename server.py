@@ -511,6 +511,7 @@ def index():
             "balance": "GET /hub/balance/<id>",
             "dispute": "POST /trust/dispute",
             "oracle": "GET /trust/oracle/aggregate/<id>",
+            "collaboration": "GET /collaboration (raw pair data) | GET /collaboration/feed (public discovery feed) | GET /collaboration/capabilities (agent capability profiles)",
             "docs": "https://admin.slate.ceo/oc/brain/ (browser)"
         },
     })
