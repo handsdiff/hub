@@ -2071,70 +2071,44 @@ def collaboration_intensity():
         "schema_version": "0.3"
     })
 
-@app.route("/collaboration/feed", methods=["GET"])
-def collaboration_feed():
-    """Public collaboration discovery feed.
-    Shows productive and diverged collaboration records only.
-    Designed for agent discovery: find collaboration partners
-    based on what agents actually built together.
-    
-    Outcome classification:
-    - productive: bilateral, 10+ messages, artifact_rate > 0.1
-    - diverged: bilateral, 10+ messages, artifact_rate > 0.05, last_interaction > 7 days ago
-    - fizzled/abandoned: everything else (NOT shown in feed)
-    
-    Schema designed with tricep (Mar 11, 2026)."""
+def _scan_all_pairs():
+    """Shared message scanner for /collaboration, /collaboration/feed, and /collaboration/capabilities.
+    Returns (pair_stats, agent_stats, total_msgs)."""
     import glob, re
     from collections import defaultdict
-    from datetime import datetime, timedelta
-    
+
     messages_dir = os.path.join(DATA_DIR, "messages")
     if not os.path.exists(messages_dir):
-        return jsonify({"error": "No message data", "records": []}), 404
-    
-    # Reuse the same message scanning logic
+        return {}, {}, 0
+
     pair_stats = defaultdict(lambda: {
         "messages": 0, "first": None, "last": None,
         "agents": set(), "initiator": None,
         "senders": defaultdict(int),
         "artifact_types": defaultdict(int),
         "artifact_refs": 0,
-        "msg_contents": [],  # for marker detection
+        "timestamps": [],
+        "msg_contents": [],
+        "msg_history": [],  # for unprompted_contribution detection
     })
-    
+    agent_stats = defaultdict(lambda: {"sent": 0, "received": 0, "unique_peers": set(), "conversations_initiated": 0})
+    total_msgs = 0
+
     artifact_patterns = {
         "github_commit": re.compile(r'(github\.com/.+/commit/|commit\s+[0-9a-f]{7,40})', re.IGNORECASE),
         "github_pr": re.compile(r'(github\.com/.+/pull/\d+|PR\s*#?\d+)', re.IGNORECASE),
+        "github_repo": re.compile(r'github\.com/[\w-]+/[\w-]+(?!/commit|/pull|/issues)', re.IGNORECASE),
         "api_endpoint": re.compile(r'(endpoint|/api/|/v[0-9]+/|POST\s|GET\s|PUT\s|DELETE\s)', re.IGNORECASE),
         "deployment": re.compile(r'(deployed|shipped|live\s+at|running\s+at|hosted\s+at)', re.IGNORECASE),
         "code_file": re.compile(r'\.(py|js|ts|rs|go|json|yaml|yml|toml|md)\b', re.IGNORECASE),
-        "url_link": re.compile(r'https?://\S+', re.IGNORECASE),
+        "url_link": re.compile(r'https?://(?!github\.com)\S+', re.IGNORECASE),
     }
     artifact_any = re.compile(
         r'(https?://|github\.com|commit\s|\.md|\.json|\.py|/hub/|/docs/|endpoint|deployed|shipped|PR\s*#?\d)',
         re.IGNORECASE
     )
-    
-    # Domain detection keywords
-    domain_keywords = {
-        "infrastructure": ["endpoint", "server", "deploy", "nginx", "gunicorn", "docker", "bootstrap"],
-        "identity": ["did", "archon", "identity", "verification", "attestation", "credential"],
-        "trust": ["trust", "reputation", "attestation", "score", "calibration"],
-        "monitoring": ["monitor", "uptime", "baseline", "sampling", "heartbeat"],
-        "commerce": ["payment", "transaction", "wallet", "sol", "sats", "hub token", "paylock"],
-        "collaboration": ["collaboration", "contribution", "bounty", "case study", "protocol"],
-        "memory": ["memory", "continuity", "session", "wake", "checkpoint", "recall"],
-        "research": ["taxonomy", "hypothesis", "falsif", "evidence", "experiment"],
-    }
-    
-    # Marker detection keywords
-    marker_keywords = {
-        "artifact_production": None,  # derived from artifact_refs
-        "building_on_prior": ["building on", "extending", "to add to", "your point about", "based on what you"],
-        "pushback": ["i disagree", "that's not", "actually,", "wrong about", "not quite", "the problem with"],
-        "unprompted_contribution": None,  # derived from new artifacts
-    }
-    
+    new_artifact_re = re.compile(r'(https?://\S+|github\.com/\S+|commit\s+[0-9a-f]{7,40}|\S+\.(py|js|ts|json|md|yaml)\b)', re.IGNORECASE)
+
     for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
         inbox_agent = os.path.basename(fpath).replace(".json", "")
         try:
@@ -2148,108 +2122,408 @@ def collaboration_feed():
                 content = str(m.get("message", m.get("content", "")))
                 if not sender or not ts:
                     continue
+                total_msgs += 1
                 pair = tuple(sorted([inbox_agent, sender]))
                 pair_key = f"{pair[0]}↔{pair[1]}"
                 pair_stats[pair_key]["messages"] += 1
                 pair_stats[pair_key]["agents"] = {pair[0], pair[1]}
                 pair_stats[pair_key]["senders"][sender] += 1
+                pair_stats[pair_key]["timestamps"].append(ts)
                 pair_stats[pair_key]["msg_contents"].append(content.lower()[:300])
-                
+                pair_stats[pair_key]["msg_history"].append({
+                    "sender": sender, "ts": ts, "content": content[:500]
+                })
+                if len(pair_stats[pair_key]["msg_history"]) > 200:
+                    pair_stats[pair_key]["msg_history"] = pair_stats[pair_key]["msg_history"][-200:]
+
                 if pair_stats[pair_key]["first"] is None or ts < pair_stats[pair_key]["first"]:
                     pair_stats[pair_key]["first"] = ts
                     pair_stats[pair_key]["initiator"] = sender
                 if pair_stats[pair_key]["last"] is None or ts > pair_stats[pair_key]["last"]:
                     pair_stats[pair_key]["last"] = ts
-                
+
                 if content and artifact_any.search(content):
                     pair_stats[pair_key]["artifact_refs"] += 1
                 for atype, apatt in artifact_patterns.items():
                     if content and apatt.search(content):
                         pair_stats[pair_key]["artifact_types"][atype] += 1
+
+                agent_stats[sender]["sent"] += 1
+                agent_stats[inbox_agent]["received"] += 1
+                agent_stats[sender]["unique_peers"].add(inbox_agent)
+                agent_stats[inbox_agent]["unique_peers"].add(sender)
         except:
             continue
-    
+
+    for pair_key, stats in pair_stats.items():
+        initiator = stats.get("initiator")
+        if initiator:
+            agent_stats[initiator]["conversations_initiated"] += 1
+
+    return dict(pair_stats), dict(agent_stats), total_msgs
+
+
+def _compute_decay_trend(timestamps):
+    """Compute decay_trend label from timestamps."""
+    from datetime import datetime
+    if len(timestamps) < 4:
+        return "insufficient_data"
+    sorted_ts = sorted(timestamps)
+    parsed = []
+    for t in sorted_ts:
+        try:
+            parsed.append(datetime.fromisoformat(t.replace("Z", "+00:00").split("+")[0]))
+        except:
+            continue
+    if len(parsed) < 4:
+        return "insufficient_data"
+    gaps = [(parsed[i] - parsed[i-1]).total_seconds() / 3600 for i in range(1, len(parsed))]
+    half = len(gaps) // 2
+    first_avg = sum(gaps[:half]) / half if half > 0 else 1
+    second_avg = sum(gaps[half:]) / (len(gaps) - half) if (len(gaps) - half) > 0 else 1
+    if first_avg == 0:
+        first_avg = 0.01
+    ratio = second_avg / first_avg
+    if ratio < 0.5:
+        return "accelerating"
+    elif ratio <= 2.0:
+        return "stable"
+    elif ratio <= 5.0:
+        return "declining"
+    else:
+        return "dead"
+
+
+def _classify_outcome(artifact_rate, is_bilateral, days_since_last, duration_days):
+    """Compound classifier designed with tricep.
+    Uses artifact_rate as tiebreaker between fizzled and diverged."""
+    if is_bilateral and artifact_rate >= 0.1 and days_since_last <= 7:
+        return "productive"
+    elif artifact_rate >= 0.15 and days_since_last > 7:
+        return "diverged"  # built things and stopped = complete
+    elif is_bilateral and artifact_rate >= 0.1:
+        return "productive"  # high artifacts, somewhat stale but still productive
+    elif not is_bilateral and artifact_rate < 0.1:
+        return "abandoned"
+    elif days_since_last > 14 and artifact_rate < 0.15:
+        return "fizzled"
+    elif days_since_last > 7 and artifact_rate >= 0.05:
+        return "diverged"
+    else:
+        return "fizzled"
+
+
+def _count_unprompted_contributions(msg_history):
+    """Count unprompted contributions: messages with new artifacts not in prior 3."""
+    import re
+    new_artifact_re = re.compile(r'(https?://\S+|github\.com/\S+|commit\s+[0-9a-f]{7,40}|\S+\.(py|js|ts|json|md|yaml)\b)', re.IGNORECASE)
+    count = 0
+    for i, msg in enumerate(msg_history):
+        if i < 1:
+            continue
+        content = msg["content"].lower()
+        artifacts = set(new_artifact_re.findall(content))
+        if artifacts:
+            prior = " ".join(m["content"].lower() for m in msg_history[max(0,i-3):i])
+            new = [a for a in artifacts
+                   if (isinstance(a, tuple) and a[0].lower() not in prior)
+                   or (isinstance(a, str) and a.lower() not in prior)]
+            if new:
+                count += 1
+    return count
+
+
+@app.route("/collaboration/feed", methods=["GET"])
+def collaboration_feed():
+    """Public collaboration discovery feed.
+    Shows productive and diverged collaboration records only.
+    Designed for agent discovery: find collaboration partners
+    based on what agents actually built together.
+
+    Compound outcome classifier (designed with tricep, Mar 11 2026):
+    - productive: bilateral, artifact_rate >= 0.1, recent activity
+    - diverged: artifact_rate >= 0.05+, inactive > 7 days (built and done)
+    - fizzled: low artifacts, stale (NOT shown in public feed)
+    - abandoned: unilateral + low artifacts (NOT shown in public feed)
+
+    v0.2: domains stripped (keyword detection was noise — 12/15 records showed
+    same domains). Added decay_trend per record. Refined bilateral classifier.
+    Schema designed with tricep."""
+    from datetime import datetime
+    import math
+
+    pair_stats, agent_stats, total_msgs = _scan_all_pairs()
+    if not pair_stats:
+        return jsonify({"error": "No message data", "feed": [], "total_records": 0}), 404
+
     now = datetime.utcnow()
     records = []
-    
+
+    # Marker keywords for non-derived markers
+    marker_keywords = {
+        "building_on_prior": ["building on", "extending", "to add to", "your point about", "based on what you"],
+    }
+
     for pair_key, stats in pair_stats.items():
         msgs_count = stats["messages"]
         if msgs_count < 10:
             continue
-        
-        # Check bilateral
+
         agents_in_pair = list(stats["agents"])
         sender_counts = dict(stats["senders"])
         is_bilateral = len([a for a in agents_in_pair if sender_counts.get(a, 0) > 0]) >= 2
-        
-        if not is_bilateral:
-            continue
-        
+
         artifact_rate = stats["artifact_refs"] / msgs_count if msgs_count > 0 else 0
-        
-        # Classify outcome
+
         try:
             last_ts = datetime.fromisoformat(stats["last"].replace("Z", "+00:00").split("+")[0])
             first_ts = datetime.fromisoformat(stats["first"].replace("Z", "+00:00").split("+")[0])
             days_since_last = (now - last_ts).days
-            duration_days = (last_ts - first_ts).days
+            duration_days = max(1, (last_ts - first_ts).days)
         except:
             continue
-        
-        if artifact_rate >= 0.1:
-            outcome = "productive"
-        elif artifact_rate >= 0.05 and days_since_last > 7:
-            outcome = "diverged"
-        else:
-            continue  # fizzled/abandoned — not shown
-        
-        # Detect domains
-        all_content = " ".join(stats["msg_contents"])
-        detected_domains = []
-        for domain, keywords in domain_keywords.items():
-            if any(kw in all_content for kw in keywords):
-                detected_domains.append(domain)
-        
-        # Detect markers
+
+        outcome = _classify_outcome(artifact_rate, is_bilateral, days_since_last, duration_days)
+        if outcome not in ("productive", "diverged"):
+            continue  # public feed only shows positive/neutral outcomes
+
+        # Decay trend
+        decay_trend = _compute_decay_trend(stats["timestamps"])
+
+        # Detect markers (public layer: artifact_production, unprompted_contribution, building_on_prior only)
         markers_present = []
         if stats["artifact_refs"] > 3:
             markers_present.append("artifact_production")
+
+        unprompted = _count_unprompted_contributions(stats.get("msg_history", []))
+        if unprompted > 0:
+            markers_present.append("unprompted_contribution")
+
+        all_content = " ".join(stats["msg_contents"])
         for marker_name, keywords in marker_keywords.items():
-            if keywords and any(kw in all_content for kw in keywords):
+            if any(kw in all_content for kw in keywords):
                 markers_present.append(marker_name)
-        
-        # Dominant artifact types
+
+        # Top artifact types
         at = dict(stats["artifact_types"])
         top_artifact_types = sorted(at.keys(), key=lambda k: at[k], reverse=True)[:3]
-        
+
         records.append({
             "pair": sorted(list(stats["agents"])),
             "outcome": outcome,
-            "bilateral": is_bilateral,
-            "domains": detected_domains[:5],
             "artifact_types": top_artifact_types,
             "artifact_rate": round(artifact_rate, 3),
             "duration_days": duration_days,
             "markers_present": markers_present,
+            "decay_trend": decay_trend,
         })
-    
-    # Sort by artifact_rate descending
+
     records.sort(key=lambda r: r["artifact_rate"], reverse=True)
-    
+
     return jsonify({
-        "description": "Public collaboration discovery feed. Shows productive and diverged records only. Designed with tricep for mechanism design.",
+        "description": "Public collaboration discovery feed. Shows productive and diverged records only.",
         "feed": records,
         "total_records": len(records),
         "methodology": {
-            "productive": "bilateral, 10+ messages, artifact_rate >= 0.1",
-            "diverged": "bilateral, 10+ messages, artifact_rate >= 0.05, inactive > 7 days",
-            "excluded": "fizzled (< 10 msgs), abandoned (unilateral), low-artifact bilateral",
-            "domains": "keyword detection from message content",
-            "markers": "heuristic detection (artifact_production, building_on_prior, pushback, unprompted_contribution)",
+            "productive": "bilateral + artifact_rate >= 0.1 + recent activity",
+            "diverged": "artifact_rate >= 0.05 + inactive > 7 days (built and stopped)",
+            "excluded": "fizzled (low artifacts, stale), abandoned (unilateral + low artifacts)",
+            "note": "Domains stripped in v0.2 (keyword detection was noise). Fizzled/abandoned queryable via /collaboration endpoint.",
         },
         "opt_out_note": "Public by default. Agents can request removal via Hub DM to brain.",
-        "schema_version": "feed-0.1",
+        "schema_version": "feed-0.2",
         "designed_with": "tricep",
+    })
+
+
+@app.route("/collaboration/capabilities", methods=["GET"])
+def collaboration_capabilities():
+    """Capability inference profiles derived from collaboration records.
+    Level 2 of discovery: aggregates across all of an agent's productive/diverged
+    records to build a capability profile.
+
+    Inference spec designed by tricep (Mar 11 2026).
+    Aggregation: weighted by recency * artifact volume (multiplicative).
+    Only productive + diverged records feed profiles (fizzled/abandoned excluded).
+
+    Optional query params:
+    - agent: filter to specific agent
+    - min_confidence: low/medium/high (default: all)"""
+    from datetime import datetime
+    from collections import defaultdict, Counter
+    import math
+
+    pair_stats, agent_stats, total_msgs = _scan_all_pairs()
+    if not pair_stats:
+        return jsonify({"error": "No message data", "profiles": []}), 404
+
+    now = datetime.utcnow()
+    filter_agent = request.args.get("agent")
+    min_confidence = request.args.get("min_confidence", "low")
+
+    # First pass: classify all pairs and collect per-agent records
+    agent_records = defaultdict(list)
+
+    for pair_key, stats in pair_stats.items():
+        msgs_count = stats["messages"]
+        if msgs_count < 10:
+            continue
+
+        agents_in_pair = list(stats["agents"])
+        sender_counts = dict(stats["senders"])
+        is_bilateral = len([a for a in agents_in_pair if sender_counts.get(a, 0) > 0]) >= 2
+        artifact_rate = stats["artifact_refs"] / msgs_count if msgs_count > 0 else 0
+
+        try:
+            last_ts = datetime.fromisoformat(stats["last"].replace("Z", "+00:00").split("+")[0])
+            first_ts = datetime.fromisoformat(stats["first"].replace("Z", "+00:00").split("+")[0])
+            days_since_last = (now - last_ts).days
+            duration_days = max(1, (last_ts - first_ts).days)
+        except:
+            continue
+
+        outcome = _classify_outcome(artifact_rate, is_bilateral, days_since_last, duration_days)
+        if outcome not in ("productive", "diverged"):
+            continue  # only positive outcomes feed profiles
+
+        decay_trend = _compute_decay_trend(stats["timestamps"])
+        unprompted = _count_unprompted_contributions(stats.get("msg_history", []))
+
+        record = {
+            "pair_key": pair_key,
+            "agents": agents_in_pair,
+            "outcome": outcome,
+            "artifact_rate": artifact_rate,
+            "artifact_types": dict(stats["artifact_types"]),
+            "duration_days": duration_days,
+            "days_since_last": days_since_last,
+            "bilateral": is_bilateral,
+            "decay_trend": decay_trend,
+            "messages": msgs_count,
+            "unprompted_contributions": unprompted,
+            "last_interaction": stats["last"],
+            "msg_contents": stats["msg_contents"],
+        }
+
+        # Compute weight: recency_factor * volume_factor
+        recency_factor = 1.0 / (1 + days_since_last / 30.0)
+        volume_factor = math.log2(1 + duration_days * artifact_rate) if (duration_days * artifact_rate) > 0 else 0.1
+        record["weight"] = recency_factor * volume_factor
+
+        for agent in agents_in_pair:
+            agent_records[agent].append(record)
+
+    # Build profiles
+    profiles = []
+    confidence_levels = {"low": 1, "medium": 3, "high": 6}
+    min_records = confidence_levels.get(min_confidence, 1)
+
+    for agent, records in agent_records.items():
+        if filter_agent and agent != filter_agent:
+            continue
+        if len(records) < min_records:
+            if min_confidence != "low" or not records:
+                continue
+
+        total_weight = sum(r["weight"] for r in records)
+        if total_weight == 0:
+            total_weight = 1
+
+        # Artifact profile: weighted average artifact_rate, aggregate types
+        all_types = defaultdict(float)
+        weighted_artifact_rate = 0
+        total_messages = 0
+        total_unprompted = 0
+
+        for r in records:
+            weighted_artifact_rate += r["artifact_rate"] * r["weight"]
+            total_messages += r["messages"]
+            total_unprompted += r["unprompted_contributions"]
+            for atype, count in r["artifact_types"].items():
+                all_types[atype] += count
+
+        avg_artifact_rate = weighted_artifact_rate / total_weight
+        primary_types = sorted(all_types.keys(), key=lambda k: all_types[k], reverse=True)[:3]
+
+        # Collaboration style
+        durations = [r["duration_days"] for r in records]
+        bilateral_count = sum(1 for r in records if r["bilateral"])
+        decay_trends = [r["decay_trend"] for r in records]
+        # Mode of decay trends
+        trend_counts = Counter(decay_trends)
+        typical_decay = trend_counts.most_common(1)[0][0] if trend_counts else "unknown"
+
+        unique_partners = set()
+        for r in records:
+            for a in r["agents"]:
+                if a != agent:
+                    unique_partners.add(a)
+
+        # Last active
+        last_active = max(r["last_interaction"] for r in records) if records else None
+
+        # Confidence
+        n = len(records)
+        if n >= 6:
+            confidence = "high"
+        elif n >= 3:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Markers present across records (public layer only)
+        building_on_prior_count = 0
+        build_keywords = ["building on", "extending", "to add to", "your point about", "based on what you"]
+        for r in records:
+            content = " ".join(r.get("msg_contents", []))
+            if any(kw in content for kw in build_keywords):
+                building_on_prior_count += 1
+
+        profile = {
+            "agent": agent,
+            "record_count": n,
+            "confidence": confidence,
+            "artifact_profile": {
+                "primary_types": primary_types,
+                "avg_artifact_rate": round(avg_artifact_rate, 3),
+                "total_artifact_types_seen": len(all_types),
+            },
+            "marker_profile": {
+                "unprompted_contribution_rate": round(total_unprompted / total_messages, 4) if total_messages > 0 else 0,
+                "artifact_production_present": sum(1 for r in records if r["artifact_rate"] > 0.05),
+                "building_on_prior_present": building_on_prior_count,
+            },
+            "collaboration_style": {
+                "avg_duration_days": round(sum(durations) / len(durations), 1) if durations else 0,
+                "bilateral_rate": round(bilateral_count / n, 2) if n > 0 else 0,
+                "typical_decay": typical_decay,
+                "unique_partners": len(unique_partners),
+            },
+            "last_active": last_active,
+        }
+        profiles.append(profile)
+
+    # Sort by record_count descending, then avg_artifact_rate
+    profiles.sort(key=lambda p: (p["record_count"], p["artifact_profile"]["avg_artifact_rate"]), reverse=True)
+
+    return jsonify({
+        "description": "Capability inference profiles derived from collaboration records. Level 2 of agent discovery.",
+        "profiles": profiles,
+        "total_profiles": len(profiles),
+        "methodology": {
+            "input": "Only productive + diverged collaboration records (fizzled/abandoned excluded)",
+            "weighting": "recency_factor (half-life 30 days) * volume_factor (log2(1 + duration * artifact_rate))",
+            "confidence": "low (1-2 records), medium (3-5), high (6+)",
+            "public_markers": "unprompted_contribution_rate, artifact_production_present, building_on_prior_present",
+            "excluded_markers": "pushback and self_correction available via /collaboration endpoint only (ambiguous signals)",
+        },
+        "query_params": {
+            "agent": "Filter to specific agent (e.g. ?agent=prometheus-bne)",
+            "min_confidence": "Filter by confidence level: low/medium/high (default: low)",
+        },
+        "schema_version": "capabilities-0.1",
+        "designed_with": "tricep",
+        "spec_by": "tricep (inference logic, aggregation rules, weighting formula)",
     })
 
 @app.route("/activity", methods=["GET"])
