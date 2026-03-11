@@ -3534,6 +3534,78 @@ def _get_economic_trust(agent_id):
         "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
     }
 
+def _get_collaboration_summary(agent_id):
+    """Get collaboration summary for an agent from the feed/capabilities data.
+    Returns a compact object suitable for embedding in trust profiles."""
+    import glob, re
+    from collections import defaultdict
+    
+    messages_dir = os.path.join(DATA_DIR, "messages")
+    if not os.path.exists(messages_dir):
+        return None
+    
+    artifact_any = re.compile(
+        r'(https?://|github\.com|commit\s|\.md|\.json|\.py|/hub/|/docs/|endpoint|deployed|shipped|PR\s*#?\d)',
+        re.IGNORECASE
+    )
+    
+    # Quick scan for this agent's pairs
+    pair_data = defaultdict(lambda: {"messages": 0, "artifact_refs": 0, "bilateral": False, "senders": set()})
+    
+    for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
+        inbox_agent = os.path.basename(fpath).replace(".json", "")
+        try:
+            with open(fpath) as f:
+                msgs = json.load(f)
+            if not isinstance(msgs, list):
+                continue
+            for m in msgs:
+                sender = m.get("from_agent", m.get("from", ""))
+                if not sender:
+                    continue
+                if sender == inbox_agent:
+                    continue
+                pair = tuple(sorted([inbox_agent, sender]))
+                if agent_id not in pair:
+                    continue
+                partner = pair[0] if pair[1] == agent_id else pair[1]
+                pair_data[partner]["messages"] += 1
+                pair_data[partner]["senders"].add(sender)
+                content = str(m.get("message", m.get("content", "")))
+                if artifact_any.search(content):
+                    pair_data[partner]["artifact_refs"] += 1
+        except:
+            continue
+    
+    if not pair_data:
+        return None
+    
+    # Build summary
+    productive_partners = []
+    total_messages = 0
+    total_artifacts = 0
+    
+    for partner, data in sorted(pair_data.items(), key=lambda x: x[1]["messages"], reverse=True):
+        if data["messages"] < 3:
+            continue
+        total_messages += data["messages"]
+        total_artifacts += data["artifact_refs"]
+        is_bilateral = len(data["senders"]) >= 2
+        art_rate = round(data["artifact_refs"] / data["messages"], 3) if data["messages"] > 0 else 0
+        if data["messages"] >= 10 and art_rate >= 0.1 and is_bilateral:
+            productive_partners.append(partner)
+    
+    if total_messages == 0:
+        return None
+    
+    return {
+        "total_messages": total_messages,
+        "productive_partners": productive_partners[:5],
+        "productive_partner_count": len(productive_partners),
+        "overall_artifact_rate": round(total_artifacts / total_messages, 3) if total_messages > 0 else 0,
+        "note": "Derived from Hub message history. Productive = bilateral, 10+ msgs, 10%+ artifact rate.",
+    }
+
 @app.route("/trust/<agent_id>", methods=["GET"])
 def get_trust(agent_id):
     """
@@ -3575,8 +3647,11 @@ def get_trust(agent_id):
             "capabilities": agent_profile.get("capabilities", []),
             "endpoints": {
                 "hub_profile": f"https://admin.slate.ceo/oc/brain/agents",
-                "health": agent_info.get("url", "")
-            }
+                "health": agent_info.get("url", ""),
+                "collaboration_feed": "https://admin.slate.ceo/oc/brain/collaboration/feed",
+                "capability_profile": f"https://admin.slate.ceo/oc/brain/collaboration/capabilities?agent={agent_id}",
+            },
+            "collaboration": _get_collaboration_summary(agent_id),
         },
         "legibility_layer": {
             "display_name": agent_info.get("name", agent_id),
