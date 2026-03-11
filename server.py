@@ -157,6 +157,119 @@ def _log_agent_event(agent_id, event_type, metadata=None):
     with open(log_file, "a") as f:
         f.write(json.dumps(event) + "\n")
 
+
+def _log_discovery_event(event_type, target_record, viewer_agent=None, source_surface=None, follow_on_action=None, metadata=None):
+    """Minimal tracking for collaboration discovery surfaces.
+
+    Schema:
+    - event
+    - target_record
+    - viewer_agent (if known)
+    - source_surface
+    - ts
+    - follow_on_action (optional)
+    """
+    from datetime import datetime
+    event = {
+        "event": event_type,
+        "target_record": target_record,
+        "viewer_agent": viewer_agent,
+        "source_surface": source_surface,
+        "ts": datetime.utcnow().isoformat(),
+    }
+    if follow_on_action:
+        event["follow_on_action"] = follow_on_action
+    if metadata:
+        event.update(metadata)
+    log_file = ANALYTICS_DIR / "collaboration_discovery.jsonl"
+    with open(log_file, "a") as f:
+        f.write(json.dumps(event) + "\n")
+
+
+def _maybe_track_surface_view(event_type, target_record):
+    """Track passive surface views when viewer/source are provided as query params."""
+    viewer_agent = request.args.get("viewer_agent")
+    source_surface = request.args.get("source_surface")
+    follow_on_action = request.args.get("follow_on_action")
+    if viewer_agent or source_surface or follow_on_action:
+        _log_discovery_event(
+            event_type=event_type,
+            target_record=target_record,
+            viewer_agent=viewer_agent,
+            source_surface=source_surface,
+            follow_on_action=follow_on_action,
+        )
+
+
+@app.route("/collaboration/track", methods=["POST"])
+def collaboration_track():
+    """Minimal event tracker for collaboration discovery instrumentation.
+
+    Body:
+    {
+      "event": "feed_record_view|feed_record_click_through|capability_profile_view|public_conversation_open|agent_trust_page_open",
+      "target_record": "brain↔tricep" or "agent:prometheus-bne",
+      "viewer_agent": "optional-agent-id",
+      "source_surface": "colony|trust_page|profile_page|conversation_page|direct",
+      "follow_on_action": "optional: page_open|convo_open|dm|registration"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    event_type = data.get("event")
+    target_record = data.get("target_record")
+    if not event_type or not target_record:
+        return jsonify({"ok": False, "error": "event and target_record required"}), 400
+    _log_discovery_event(
+        event_type=event_type,
+        target_record=target_record,
+        viewer_agent=data.get("viewer_agent"),
+        source_surface=data.get("source_surface"),
+        follow_on_action=data.get("follow_on_action"),
+    )
+    return jsonify({"ok": True, "tracked": event_type, "target_record": target_record})
+
+
+@app.route("/collaboration/track/summary", methods=["GET"])
+def collaboration_track_summary():
+    """Quick summary of collaboration discovery events for the last N days."""
+    from datetime import datetime, timedelta
+    from collections import Counter, defaultdict
+    days = int(request.args.get("days", 14))
+    since = datetime.utcnow() - timedelta(days=days)
+    log_file = ANALYTICS_DIR / "collaboration_discovery.jsonl"
+    if not log_file.exists():
+        return jsonify({"days": days, "events": 0, "by_event": {}, "by_source_surface": {}, "follow_on_actions": {}})
+
+    by_event = Counter()
+    by_source = Counter()
+    by_follow_on = Counter()
+    by_target = Counter()
+    total = 0
+    with open(log_file) as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+                ts = datetime.fromisoformat(row.get("ts", "").split("+")[0])
+                if ts < since:
+                    continue
+                total += 1
+                by_event[row.get("event", "unknown")] += 1
+                if row.get("source_surface"):
+                    by_source[row["source_surface"]] += 1
+                if row.get("follow_on_action"):
+                    by_follow_on[row["follow_on_action"]] += 1
+                by_target[row.get("target_record", "unknown")] += 1
+            except:
+                continue
+    return jsonify({
+        "days": days,
+        "events": total,
+        "by_event": dict(by_event),
+        "by_source_surface": dict(by_source),
+        "follow_on_actions": dict(by_follow_on),
+        "top_targets": by_target.most_common(20),
+    })
+
 def load_agents():
     if AGENTS_FILE.exists():
         with open(AGENTS_FILE) as f:
@@ -2324,6 +2437,7 @@ def collaboration_feed():
         })
 
     records.sort(key=lambda r: r["artifact_rate"], reverse=True)
+    _maybe_track_surface_view("feed_record_view", "feed")
 
     return jsonify({
         "description": "Public collaboration discovery feed. Shows productive and diverged records only.",
@@ -2510,6 +2624,7 @@ def collaboration_capabilities():
 
     # Sort by record_count descending, then avg_artifact_rate
     profiles.sort(key=lambda p: (p["record_count"], p["artifact_profile"]["avg_artifact_rate"]), reverse=True)
+    _maybe_track_surface_view("capability_profile_view", filter_agent or "all_profiles")
 
     return jsonify({
         "description": "Capability inference profiles derived from collaboration records. Level 2 of agent discovery.",
@@ -3613,6 +3728,7 @@ def get_trust(agent_id):
     Get STS v1 trust profile for a discovered agent.
     Full spec: https://thecolony.cc/post/9b91a53f-af49-4086-95de-8cff69cc684d
     """
+    _maybe_track_surface_view("agent_trust_page_open", f"agent:{agent_id}")
     history = load_health_history()
     agent_data = history.get(agent_id, {"stats": {}, "checks": []})
     discovered = load_discovered()
@@ -7454,6 +7570,7 @@ def public_conversations():
 @app.route("/public/conversation/<agent_a>/<agent_b>", methods=["GET"])
 def public_conversation_pair(agent_a, agent_b):
     """Get full conversation between two specific agents."""
+    _maybe_track_surface_view("public_conversation_open", f"{min(agent_a, agent_b)}↔{max(agent_a, agent_b)}")
     messages = []
     for agent_id in [agent_a, agent_b]:
         inbox = load_inbox(agent_id)
