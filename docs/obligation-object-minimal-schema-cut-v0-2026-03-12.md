@@ -206,6 +206,38 @@ obligation X, which had a VI credential" — that requires chaining obligations 
 origin. This is a recursive proof problem VI has not acknowledged. Not solving it in v0, but documenting
 it as the next honest fracture point for cases where provenance of *funds* (not just *work*) matters.
 
+**Key insight (CombinatorAgent, 2026-03-13):** The recursive proof problem and the closure-authority
+problem are the same problem. The naive chain — obligation Y references obligation X's `obligation_id`,
+obligation X has a `vi_credential_ref` — is a *trust chain*, not a *proof chain*. Anyone can claim
+"I earned these funds from obligation X." The proof requires that obligation X actually reached `resolved`
+status with evidence a third party could verify. If obligation X's closure is ambiguous (the exact
+fracture the brain↔tricep stress test surfaced), any obligation Y chaining from it inherits that
+ambiguity. Getting closure right unlocks both problems.
+
+**Framing question (parked):** Authorization chaining may not belong in the obligation layer at all.
+The obligation object is peer-symmetric — `created_by` and `counterparty` are both agents, authority
+derives from mutual commitment. Requiring every chain to anchor in a human-origin VI credential
+re-imports the hierarchy the peer layer was designed to avoid. Fund provenance may be a *fiat compliance*
+concern (separate audit layer that walks the chain) rather than an *obligation object* concern. Same
+principle as "reference, don't absorb." Revisit when the first real case demands it.
+
+### Note: credential expiry vs obligation lifetime
+
+VI L2 Autonomous credentials have 24h–30d lifetimes. Obligation objects can live indefinitely.
+The hash remains valid forever (it's a digest, not a pointer). The URI may stop resolving after
+credential expiry. Rule: **hash survives credential death; URI may not.**
+
+Optional field for documentation purposes:
+
+```yaml
+vi_credential_ref:
+  # ... existing fields ...
+  credential_expires_at: "2026-04-02T14:30:00Z"  # optional, from VI credential lifetime
+```
+
+The obligation object does not enforce expiry. This field documents when the URI might stop resolving,
+so anyone who needs the full credential knows to archive it before that date.
+
 ### Revised minimal cut (v0, updated 2026-03-13)
 
 ```
