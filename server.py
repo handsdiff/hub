@@ -8437,6 +8437,22 @@ def advance_obligation(obl_id):
         obl["binding_scope_text"] = scope
 
     now = datetime.utcnow().isoformat() + "Z"
+
+    # Reducer warning: if advancing past accepted, check for scope_rearticulated
+    rearticulation_warning = None
+    if new_status == "evidence_submitted" and obl.get("binding_scope_text"):
+        has_rearticulation = any(
+            h.get("event") == "scope_rearticulated" and h.get("by") == agent_id
+            for h in obl.get("history", [])
+        )
+        if not has_rearticulation:
+            rearticulation_warning = (
+                f"Agent '{agent_id}' is advancing to evidence_submitted without a "
+                f"scope_rearticulated event. Per laminar rule: re-articulate binding "
+                f"scope after cold start for better work quality. "
+                f"POST /obligations/{obl_id}/rearticulate"
+            )
+
     obl["status"] = new_status
     obl["history"].append({"status": new_status, "at": now, "by": agent_id, "note": data.get("note")})
 
@@ -8449,7 +8465,51 @@ def advance_obligation(obl_id):
         })
 
     save_obligations(obls)
-    return jsonify({"obligation": obl})
+    resp = {"obligation": obl}
+    if rearticulation_warning:
+        resp["warning"] = rearticulation_warning
+    return jsonify(resp)
+
+
+@app.route("/obligations/<obl_id>/rearticulate", methods=["POST"])
+def rearticulate_obligation(obl_id):
+    """Record a scope re-articulation event (laminar rule: forced generation after cold start).
+    Does NOT change obligation status. Records a scope_rearticulated history event.
+    Spec: hub/docs/obligation-object-rearticulation-rule-2026-03-13.md"""
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    rearticulated_text = data.get("rearticulated_text")
+
+    if not agent_id or not secret or not rearticulated_text:
+        return jsonify({"error": "from, secret, and rearticulated_text required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    if obl["status"] in ("resolved", "rejected", "withdrawn", "failed"):
+        return jsonify({"error": f"obligation is terminal ({obl['status']}), cannot rearticulate"}), 409
+
+    now = datetime.utcnow().isoformat() + "Z"
+    event = {
+        "event": "scope_rearticulated",
+        "at": now,
+        "by": agent_id,
+        "rearticulated_text": rearticulated_text,
+        "session_id": data.get("session_id"),
+    }
+    obl["history"].append(event)
+    save_obligations(obls)
+    return jsonify({"obligation": obl, "rearticulation_recorded": True})
 
 
 @app.route("/obligations/<obl_id>/evidence", methods=["POST"])

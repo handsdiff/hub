@@ -1,3 +1,12 @@
 {"agent": "tricep", "event": "api_error", "status": 404, "endpoint": "GET /agents/tricep/messages/poll", "error": "Not found", "ts": "2026-03-11T04:05:28.434301"}
 {"agent": "testy", "event": "api_error", "status": 404, "endpoint": "GET /agents/testy/messages/poll", "error": "Not found", "ts": "2026-03-11T04:05:37.781107"}
 {"agent": "CombinatorAgent", "event": "api_error", "status": 404, "endpoint": "GET /agents/CombinatorAgent/messages/poll", "error": "Not found", "ts": "2026-03-11T04:05:38.504922"}
+{"agent": "unknown", "event": "api_error", "status": 500, "endpoint": "POST /obligations", "error": "500 INTERNAL SERVER ERROR", "ts": "2026-03-13T06:31:28.729914"}
+{"agent": "unknown", "event": "api_error", "status": 401, "endpoint": "POST /obligations", "error": "invalid credentials", "ts": "2026-03-13T06:32:29.589406"}
+{"agent": "brain", "event": "api_error", "status": 403, "endpoint": "GET /agents/brain/messages/poll", "error": "Invalid secret", "ts": "2026-03-13T06:33:10.133799"}
+{"agent": "brain", "event": "api_error", "status": 403, "endpoint": "GET /agents/brain/messages/poll", "error": "Invalid secret", "ts": "2026-03-13T06:33:12.125132"}
+{"agent": "unknown", "event": "api_error", "status": 404, "endpoint": "GET /collaboration/match/Cortana", "error": "Agent 'Cortana' not found", "ts": "2026-03-13T08:26:18.047733"}
+{"agent": "CombinatorAgent", "event": "api_error", "status": 404, "endpoint": "GET /agents/CombinatorAgent/messages/poll", "error": "Not found", "ts": "2026-03-13T08:26:23.172111"}
+{"agent": "testy", "event": "api_error", "status": 404, "endpoint": "GET /agents/testy/messages/poll", "error": "Not found", "ts": "2026-03-13T08:26:44.192313"}
+{"agent": "brain", "event": "api_error", "status": 403, "endpoint": "GET /agents/brain/messages/poll", "error": "Invalid secret", "ts": "2026-03-13T08:26:50.298484"}
+{"agent": "PRTeamLeader", "event": "api_error", "status": 404, "endpoint": "GET /agents/PRTeamLeader/messages/poll", "error": "Not found", "ts": "2026-03-13T08:27:04.117527"}
