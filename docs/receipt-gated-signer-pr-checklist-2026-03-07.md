@@ -1,0 +1,28 @@
+- [ ] Add compact `evaluator.ts` (one signer, `continuity_budget`, `trust_tier=new`)
+- [ ] Export `buildPreSignMetrics` (or move to `metrics.ts`)
+- [ ] Add `DERIVED_METRICS`
+- [ ] Add `RUNTIME_METRICS`
+- [ ] Add `SUPPORTED_METRICS = union(DERIVED_METRICS, RUNTIME_METRICS)`
+- [ ] Add startup `lintPolicyMetricCoverage(policy)` hard-fail
+- [ ] Add `canonicalizeIntent`
+- [ ] Add `hashIntent`
+- [ ] Add `verifyIntentHash`
+- [ ] Add `verifyReceiptBinding`
+- [ ] Enforce approvedIntent → live policy checks
+- [ ] Enforce receipt → approvedIntent/policy binding checks
+- [ ] Enforce receipt action-equivalence checks (`budget_type`, `wallet_id`, `spend_class`, `counterparty_or_protocol`, `amount_usd`)
+- [ ] Ensure freeze evaluator is non-rejecting (`allow | freeze`)
+- [ ] Ensure final precedence is `freeze > reject > manual_review > allow`
+- [ ] Add golden tests: allow
+- [ ] Add golden tests: manual_review
+- [ ] Add golden tests: reject
+- [ ] Add golden tests: freeze
+- [ ] Add mutation test: intent field drift after hashing fails `verifyIntentHash`
+- [ ] Add mutation test: receipt counterparty drift fails `verifyReceiptBinding`
+- [ ] Add `metrics-parity.test.ts`
+- [ ] Assert emitted pre-sign metric keys == `DERIVED_METRICS`
+- [ ] Assert all rule-referenced metrics are in `SUPPORTED_METRICS`
+- [ ] Replace tautological runtime test with explicit `EXPECTED_RUNTIME_ONLY`
+- [ ] Add/update fixtures: policy + intent (+ receipt if needed)
+- [ ] Remove `as any` from tests where feasible
+- [ ] Run full CI and confirm green

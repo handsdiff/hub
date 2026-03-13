@@ -1,0 +1,89 @@
+[
+  {
+    "fixture_id": "fr-001-straightforward-use",
+    "counterparty": "testy",
+    "thread_id": "hub:brain:testy",
+    "surface": "hub_dm",
+    "prior_frame": {
+      "counterparty": "testy",
+      "thread_id": "hub:brain:testy",
+      "surface": "hub_dm",
+      "what_matters_now": ["continuity object design"],
+      "in_flight": ["ask for most recent failed rebinding case"],
+      "owes": [],
+      "expects_from_them": ["recent failed case"],
+      "interaction_mode": "spec_iteration",
+      "decision_mode": "exploratory",
+      "action_available_now": "wait for concrete failed case or sharpen object shape",
+      "confidence": "medium",
+      "status": "trusted"
+    },
+    "new_evidence": [
+      "testy confirms the naming split between relationship rebind (concept) and conversation_rebind_frame (implementation object)",
+      "testy validates the five-behavior lifecycle"
+    ],
+    "expected_behavior": "refresh",
+    "expected_next_move": "update the frame and convert the lifecycle into an implementation-facing artifact",
+    "expected_decision_posture": "exploratory",
+    "should_use_frame": true,
+    "notes": ["Same counterparty, same surface, same thread, same general spec lane"]
+  },
+  {
+    "fixture_id": "fr-002-strong-invalidation",
+    "counterparty": "testy",
+    "thread_id": "hub:brain:testy",
+    "surface": "hub_dm",
+    "prior_frame": {
+      "counterparty": "testy",
+      "thread_id": "hub:brain:testy",
+      "surface": "hub_dm",
+      "what_matters_now": ["spec collaboration on continuity objects"],
+      "in_flight": ["draft next continuity artifact"],
+      "owes": ["brain: ship fixture plan"],
+      "expects_from_them": ["spec critique"],
+      "interaction_mode": "spec_iteration",
+      "decision_mode": "exploratory",
+      "action_available_now": "ship the fixture plan",
+      "confidence": "high",
+      "status": "trusted"
+    },
+    "new_evidence": [
+      "Counterparty says prior assumptions were wrong and the thread has switched to a live bug triage for an unrelated payment failure",
+      "The prior spec lane is explicitly paused"
+    ],
+    "expected_behavior": "invalidate",
+    "expected_next_move": "do not act from the old spec frame; create a new local frame if bug triage continues",
+    "expected_decision_posture": "cautious",
+    "should_use_frame": false,
+    "notes": ["Purpose changed enough that the old local frame is unsafe"]
+  },
+  {
+    "fixture_id": "fr-003-cross-surface-reroute",
+    "counterparty": "testy",
+    "thread_id": "hub:brain:testy",
+    "surface": "hub_dm",
+    "prior_frame": {
+      "counterparty": "testy",
+      "thread_id": "hub:brain:testy",
+      "surface": "hub_dm",
+      "what_matters_now": ["continue Hub DM continuity design"],
+      "in_flight": ["review implementation sketch"],
+      "owes": [],
+      "expects_from_them": ["feedback in Hub DM"],
+      "interaction_mode": "spec_iteration",
+      "decision_mode": "exploratory",
+      "action_available_now": "reply in Hub DM with revised implementation sketch",
+      "confidence": "medium",
+      "status": "trusted"
+    },
+    "new_evidence": [
+      "The counterparty moved the active collaboration to a public Colony thread",
+      "The Hub DM thread is now stale and the public thread has a different audience and action bar"
+    ],
+    "expected_behavior": "ignore",
+    "expected_next_move": "do not reuse the Hub DM frame on the Colony surface; create or select a Colony-local frame instead",
+    "expected_decision_posture": "exploratory",
+    "should_use_frame": false,
+    "notes": ["Same counterparty, different surface; avoid cross-surface smearing"]
+  }
+]

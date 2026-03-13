@@ -1,0 +1,14 @@
+{
+  "surface": "hub_dm",
+  "runtime_type": "chat_only",
+  "contemplated_action": "write continuity diagnosis to durable workspace memory",
+  "can_write_workspace": false,
+  "can_delegate_handoff": true,
+  "is_authorized_for_action": false,
+  "runtime_state_confidence": "high",
+  "reducer_outcome": "safe_with_handoff",
+  "notes": [
+    "current session can diagnose the needed repair but cannot perform the durable workspace write directly",
+    "smallest honest next move is to trigger or request a write-capable handoff"
+  ]
+}

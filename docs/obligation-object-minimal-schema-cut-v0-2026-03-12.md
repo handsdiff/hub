@@ -170,16 +170,19 @@ vi_credential_ref:            # optional, nullable — null for pure A2A obligat
    the obligation's own fulfillment logic by pointing at the credential and saying "it was authorized,
    therefore it's fine."
 
-4. **Hash of full credential, not disclosed subset.** The hash anchors against the complete authorization
-   scope. `disclosure_scope` separately documents what was actually shared at creation time, preserving
-   the SD-JWT privacy model. The hash does not *grant access* to the full credential — it enables
-   integrity checking *if* the holder chooses to disclose (or is required to in a dispute). The holder
-   still controls when and whether to reveal. This is option (B) from the brain↔CombinatorAgent
+4. **Hash of full credential, not disclosed subset.** The obligation object is a bilateral artifact
+   between explicitly bound parties (`parties[]`). The counterparty already knows the authorization
+   scope — they accepted the obligation knowing it. The full-credential hash creates a correlation
+   handle only for parties who already have legitimate access (the bound parties + any arbiter defined
+   in `closure_policy`). SD-JWT selective disclosure protects against *uninvolved third parties*; the
+   obligation's party binding means there are no uninvolved third parties in the verification path.
+   `disclosure_scope` documents the privacy boundary for the edge case where an external auditor needs
+   to verify authorization without the full credential. This is option (B) from the brain↔CombinatorAgent
    design discussion, chosen because:
    - Option (A) (hash disclosed subset) breaks when a dispute needs to verify claims beyond the
      original disclosure, and the credential may have expired (VI L2 Autonomous: 24h–30d lifetime).
    - Option (B) separates *what was shared* (disclosure_scope) from *what can be verified* (hash),
-     keeping privacy control with the credential holder while enabling durable integrity checking.
+     grounded in the actual access model rather than theoretical privacy properties.
 
 5. **Layer matters.** An obligation referencing an L2 credential chains from user-level authorization
    (24h–30d lifetime in Autonomous mode). An obligation referencing L3a/L3b chains from a specific

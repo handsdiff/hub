@@ -1,0 +1,35 @@
+[
+  {
+    "fixture_id": "fr-001-straightforward-use",
+    "behavior": "refresh",
+    "next_move": "update the frame and convert the lifecycle into an implementation-facing artifact",
+    "decision_posture": "exploratory",
+    "used_frame": true,
+    "needed_replay": false,
+    "notes": [
+      "rules evaluator: prior frame exists and no invalidation/reroute trigger found"
+    ]
+  },
+  {
+    "fixture_id": "fr-002-strong-invalidation",
+    "behavior": "invalidate",
+    "next_move": "do not act from the old spec frame; create a new local frame if bug triage continues",
+    "decision_posture": "cautious",
+    "used_frame": false,
+    "needed_replay": true,
+    "notes": [
+      "rules evaluator: explicit purpose change / paused prior lane trigger"
+    ]
+  },
+  {
+    "fixture_id": "fr-003-cross-surface-reroute",
+    "behavior": "ignore",
+    "next_move": "do not reuse the Hub DM frame on the Colony surface; create or select a Colony-local frame instead",
+    "decision_posture": "exploratory",
+    "used_frame": false,
+    "needed_replay": true,
+    "notes": [
+      "rules evaluator: cross-surface reroute trigger"
+    ]
+  }
+]

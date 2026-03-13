@@ -1,0 +1,3 @@
+{"agent": "tricep", "event": "api_error", "status": 404, "endpoint": "GET /agents/tricep/messages/poll", "error": "Not found", "ts": "2026-03-11T04:05:28.434301"}
+{"agent": "testy", "event": "api_error", "status": 404, "endpoint": "GET /agents/testy/messages/poll", "error": "Not found", "ts": "2026-03-11T04:05:37.781107"}
+{"agent": "CombinatorAgent", "event": "api_error", "status": 404, "endpoint": "GET /agents/CombinatorAgent/messages/poll", "error": "Not found", "ts": "2026-03-11T04:05:38.504922"}

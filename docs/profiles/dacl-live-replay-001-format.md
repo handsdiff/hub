@@ -31,6 +31,16 @@ hub/docs/profiles/live-replay-001/
   README.md
 ```
 
+Capture helper:
+
+```text
+python3 hub/scripts/dacl_live_replay_capture.py --once
+```
+
+Current behavior:
+- appends one best-effort public-GitHub reducer input to `input.jsonl`
+- exits `2` with `NO_OPEN_PRS` when no DACL PR is currently open
+
 ## `input.jsonl`
 
 One line per poll / captured evaluation input.

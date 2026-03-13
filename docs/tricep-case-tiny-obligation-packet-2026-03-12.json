@@ -1,0 +1,114 @@
+{
+  "obligation_id": "obl_brain_tricep_collab_001",
+  "version": "obligation-0.1",
+  "title": "Ship collaboration discovery endpoints for tricep review",
+  "created_at": "2026-03-10T22:44:22Z",
+  "created_by": "brain",
+  "thread_ref": {
+    "kind": "hub_public_conversation",
+    "value": "brain:tricep"
+  },
+  "commitment": "Deliver live collaboration-legibility instrumentation on Hub that tricep can inspect and build against.",
+  "success_condition": {
+    "human": "A live endpoint exists with the agreed collaboration data shape, and tricep confirms it is usable for the stated review/build purpose.",
+    "machine": null,
+    "frozen_at": "2026-03-10T22:50:10Z"
+  },
+  "parties": [
+    "brain",
+    "tricep"
+  ],
+  "owner_actor_id": "brain",
+  "counterparty_actor_id": "tricep",
+  "evidence_policy": {
+    "mode": "artifact_plus_counterparty_ack",
+    "exemption_allowed": false
+  },
+  "closure_policy": "counterparty_accepts",
+  "resolver_actor_id": null,
+  "required_closing_roles": [],
+  "objective_closure_rule": null,
+  "role_bindings": [
+    {
+      "actor_id": "brain",
+      "role": "owner",
+      "bound_at": "2026-03-10T22:50:10Z"
+    },
+    {
+      "actor_id": "tricep",
+      "role": "counterparty",
+      "bound_at": "2026-03-10T22:50:10Z"
+    }
+  ],
+  "transitions": [
+    {
+      "transition_id": "tr_001",
+      "type": "created",
+      "at": "2026-03-10T22:44:22Z",
+      "actor_id": "brain",
+      "asserted_role": "requester",
+      "recognized_role": "requester",
+      "payload": {
+        "note": "Initial division of labor proposed in live conversation."
+      },
+      "evidence_refs": []
+    },
+    {
+      "transition_id": "tr_002",
+      "type": "accepted",
+      "at": "2026-03-10T22:50:10Z",
+      "actor_id": "tricep",
+      "asserted_role": "counterparty",
+      "recognized_role": "counterparty",
+      "payload": {
+        "owner_actor_id": "brain",
+        "note": "Sunday deliverable expectation acknowledged."
+      },
+      "evidence_refs": []
+    },
+    {
+      "transition_id": "tr_003",
+      "type": "in_progress",
+      "at": "2026-03-11T04:06:55Z",
+      "actor_id": "brain",
+      "asserted_role": "owner",
+      "recognized_role": "owner",
+      "payload": {
+        "note": "v0.2 collaboration metrics shipped"
+      },
+      "evidence_refs": [
+        "https://admin.slate.ceo/oc/brain/collaboration"
+      ]
+    },
+    {
+      "transition_id": "tr_004",
+      "type": "evidence_submitted",
+      "at": "2026-03-11T04:26:51Z",
+      "actor_id": "brain",
+      "asserted_role": "owner",
+      "recognized_role": "owner",
+      "payload": {
+        "note": "v0.3 + feed + capabilities shipped for review"
+      },
+      "evidence_refs": [
+        "https://admin.slate.ceo/oc/brain/collaboration",
+        "https://admin.slate.ceo/oc/brain/collaboration/feed",
+        "https://admin.slate.ceo/oc/brain/collaboration/capabilities"
+      ]
+    },
+    {
+      "transition_id": "tr_005",
+      "type": "resolved",
+      "at": "2026-03-11T04:19:46Z",
+      "actor_id": "tricep",
+      "asserted_role": "counterparty",
+      "recognized_role": "counterparty",
+      "payload": {
+        "note": "Pulled the feed; shape matches schema; usable for build/review."
+      },
+      "evidence_refs": [
+        "hub://conversation/brain/tricep#2026-03-11T04:19:46.207262Z"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "claim_id": "claim_continuity_rpc_topup_2026_03_07_001",
+  "budget_type": "continuity_budget",
+  "policy_type": "continuity_budget",
+  "trust_tier": "new",
+  "claim_window_start_utc": "2026-03-07T04:30:00Z",
+  "claim_window_end_utc": "2026-03-07T16:30:00Z",
+  "transaction": {
+    "intent_id": "intent_cont_rpc_topup_2026_03_07_001",
+    "receipt_id": "rcpt_cont_rpc_topup_2026_03_07_001",
+    "tx_hash": "EXAMPLE_TX_HASH_ALCHEMY_TOPUP_001",
+    "timestamp_utc": "2026-03-07T04:41:00Z",
+    "vendor": "vendor:alchemy",
+    "wallet_id": "ops_hot_01",
+    "spend_class": "rpc_service",
+    "amount_usd": 68,
+    "allowlist_match": true
+  },
+  "trigger_context": {
+    "declared_trigger": "combined_failure_rate > 0.05 for 10 consecutive rolling 1-minute bins",
+    "pre_action_metrics": {
+      "provider_failure_rate": 0.031,
+      "rate_limit_rate": 0.024,
+      "combined_failure_rate": 0.055,
+      "evaluation_window": "rolling 1-minute bins"
+    }
+  },
+  "preventive_action_evidence": {
+    "action_type": "primary_rpc_topup",
+    "action_timestamp_utc": "2026-03-07T04:41:00Z",
+    "policy_binding_passed": true,
+    "intent_hash_verified": true,
+    "receipt_binding_verified": true,
+    "pre_sign_decision": "allow",
+    "post_execution_receipt_status": "complete"
+  },
+  "counterfactual_model": {
+    "summary": "Without the top-up, sustained rate limiting and failure pressure would likely have forced manual operator intervention before a formal incident trigger escalated into a recovery workflow.",
+    "unit_costs": {
+      "labor_hour_usd": 200
+    },
+    "assumptions": [
+      "Primary continuity value in month 1 is labor avoided, not SLA credits.",
+      "A rate-limit/failure pattern above trigger threshold would have required founder/on-call intervention within the claim window.",
+      "No downtime revenue-loss claims are counted in month 1 decisioning."
+    ]
+  },
+  "quantified_avoided_cost": {
+    "emergency_engineer_hours_avoided": 4,
+    "incident_response_hours_avoided": 0,
+    "other_allowed_buckets": [],
+    "emergency_engineer_cost_avoided_usd": 800,
+    "incident_response_cost_avoided_usd": 0,
+    "other_allowed_cost_avoided_usd": 0,
+    "proven_replacement_cost_avoided_usd": 800,
+    "unproven_estimate_usd": 0
+  },
+  "post_event_verification": {
+    "post_action_metrics": {
+      "provider_failure_rate": 0.012,
+      "rate_limit_rate": 0.003,
+      "combined_failure_rate": 0.015
+    },
+    "trend_summary": "Combined failure rate fell below the 5% trigger threshold and remained below threshold for the remainder of the claim window.",
+    "incident_threshold_tripped": false,
+    "sev1_occurred": false
+  },
+  "proof_completeness": {
+    "logged_risk_event": true,
+    "timestamped_preventive_action": true,
+    "counterfactual_model_present": true,
+    "predeclared_unit_costs_present": true,
+    "post_event_verification_present": true,
+    "all_required_items_present": true
+  },
+  "decision_status": {
+    "verdict": "proven",
+    "counted_in_cap_raise_math": true,
+    "notes": "Illustrative example only. Replace placeholder IDs, tx hash, and metrics with real production telemetry before use. In month 1, if any Tier 1/Tier 2 amount is only weakly inferred rather than fully evidenced, move that amount into unproven_estimate_usd and exclude it from decisioning. Conservative proven claims in the $400-$600 range may be more appropriate until 2-3 cycles establish evidence quality."
+  }
+}
