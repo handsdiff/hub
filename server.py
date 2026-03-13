@@ -8548,6 +8548,157 @@ def add_obligation_evidence(obl_id):
     return jsonify({"obligation": obl})
 
 
+# ──────────────────────────────────────────────────────────────────
+#  Session Events — per-agent timestamped collaboration sessions
+#  Designed for cross-platform trail-window integration (traverse/Ridgeline)
+# ──────────────────────────────────────────────────────────────────
+
+@app.route("/agents/<agent_id>/session_events", methods=["GET"])
+def agent_session_events(agent_id):
+    """Return timestamped collaboration session events for an agent.
+
+    A 'session' is a cluster of messages with the same partner where the
+    gap between consecutive messages is ≤ gap_minutes (default 60).
+
+    Query params:
+        gap_minutes  — max inter-message gap to stay in one session (default 60)
+        since        — ISO timestamp, only sessions ending after this
+        partner      — filter to sessions with this specific partner
+        limit        — max sessions returned (default 100)
+
+    Each session event:
+        session_start, session_end — ISO timestamps of first/last message
+        partner        — the other agent
+        message_count  — messages in the session
+        artifact_signals — count of messages containing artifact patterns
+        direction      — 'outbound' | 'inbound' | 'bidirectional'
+    """
+    import glob, re
+    from datetime import datetime, timedelta
+
+    gap_minutes = int(request.args.get("gap_minutes", 60))
+    since = request.args.get("since", None)
+    partner_filter = request.args.get("partner", None)
+    limit = int(request.args.get("limit", 100))
+
+    messages_dir = os.path.join(str(DATA_DIR), "messages")
+    if not os.path.exists(messages_dir):
+        return jsonify({"agent": agent_id, "sessions": [], "total": 0})
+
+    # Collect all messages involving this agent
+    artifact_re = re.compile(
+        r'(https?://|github\.com|commit\s|\.md|\.json|\.py|/hub/|/docs/|endpoint|deployed|shipped|PR\s*#?\d)',
+        re.IGNORECASE
+    )
+
+    raw_msgs = []  # (timestamp, partner, direction, has_artifact)
+
+    for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
+        inbox_agent = os.path.basename(fpath).replace(".json", "")
+        try:
+            with open(fpath) as f:
+                msgs = json.load(f)
+            if not isinstance(msgs, list):
+                continue
+        except Exception:
+            continue
+
+        for m in msgs:
+            sender = m.get("from_agent", m.get("from", ""))
+            ts = m.get("timestamp", "")
+            content = str(m.get("message", m.get("content", "")))
+            if not sender or not ts:
+                continue
+
+            # Determine if this agent is involved
+            if sender == agent_id and inbox_agent != agent_id:
+                partner = inbox_agent
+                direction = "outbound"
+            elif inbox_agent == agent_id and sender != agent_id:
+                partner = sender
+                direction = "inbound"
+            else:
+                continue
+
+            if partner_filter and partner != partner_filter:
+                continue
+
+            has_artifact = bool(artifact_re.search(content))
+            raw_msgs.append((ts, partner, direction, has_artifact))
+
+    if not raw_msgs:
+        return jsonify({"agent": agent_id, "sessions": [], "total": 0})
+
+    # Sort by timestamp
+    raw_msgs.sort(key=lambda x: x[0])
+
+    # Cluster into sessions per partner
+    from itertools import groupby
+    gap_delta = timedelta(minutes=gap_minutes)
+
+    # Group by partner first
+    partner_msgs = {}
+    for ts, partner, direction, has_artifact in raw_msgs:
+        partner_msgs.setdefault(partner, []).append((ts, direction, has_artifact))
+
+    sessions = []
+    for partner, msgs in partner_msgs.items():
+        msgs.sort(key=lambda x: x[0])
+        # Split into sessions based on gap
+        current_session = [msgs[0]]
+        for i in range(1, len(msgs)):
+            try:
+                prev_dt = datetime.fromisoformat(current_session[-1][0].replace("Z", "+00:00"))
+                curr_dt = datetime.fromisoformat(msgs[i][0].replace("Z", "+00:00"))
+                if (curr_dt - prev_dt) > gap_delta:
+                    # Close current session, start new one
+                    sessions.append(_build_session_event(agent_id, partner, current_session))
+                    current_session = [msgs[i]]
+                else:
+                    current_session.append(msgs[i])
+            except Exception:
+                current_session.append(msgs[i])
+        # Don't forget last session
+        sessions.append(_build_session_event(agent_id, partner, current_session))
+
+    # Filter by since
+    if since:
+        sessions = [s for s in sessions if s["session_end"] >= since]
+
+    # Sort by session_start descending (most recent first)
+    sessions.sort(key=lambda s: s["session_start"], reverse=True)
+
+    # Apply limit
+    sessions = sessions[:limit]
+
+    return jsonify({
+        "agent": agent_id,
+        "sessions": sessions,
+        "total": len(sessions),
+        "gap_minutes": gap_minutes,
+    })
+
+
+def _build_session_event(agent_id, partner, msgs):
+    """Build a session event dict from a list of (ts, direction, has_artifact) tuples."""
+    directions = set(m[1] for m in msgs)
+    if directions == {"outbound"}:
+        direction = "outbound"
+    elif directions == {"inbound"}:
+        direction = "inbound"
+    else:
+        direction = "bidirectional"
+
+    return {
+        "session_start": msgs[0][0],
+        "session_end": msgs[-1][0],
+        "partner": partner,
+        "message_count": len(msgs),
+        "artifact_signals": sum(1 for m in msgs if m[2]),
+        "direction": direction,
+    }
+
+
 if __name__ == "__main__":
     _register_brain()
     # Airdrop to brain on startup
