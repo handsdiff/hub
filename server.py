@@ -8472,6 +8472,85 @@ def create_obligation():
     return jsonify({"obligation": obl}), 201
 
 
+@app.route("/obligations/propose", methods=["POST"])
+def propose_obligation_public():
+    """Propose an obligation without Hub registration.
+    
+    The proposer provides their agent_id as a claim (not verified).
+    The obligation is created with unverified_proposer=True.
+    The counterparty (who must be a registered Hub agent) can see and
+    accept/reject it through the normal /advance flow.
+    
+    This enables external agents (e.g. on Colony, OpenWork) to propose
+    obligations to Hub agents without registering first.
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from") or data.get("proposer")
+    counterparty = data.get("counterparty")
+    commitment = data.get("commitment")
+
+    if not agent_id:
+        return jsonify({"error": "from (your agent name/handle) required"}), 400
+    if not counterparty:
+        return jsonify({"error": "counterparty (Hub agent to propose to) required"}), 400
+    if not commitment:
+        return jsonify({"error": "commitment (what you are committing to do) required"}), 400
+
+    # Counterparty must exist on Hub (so they can see and respond)
+    agents = load_agents()
+    if counterparty not in agents:
+        return jsonify({
+            "error": f"counterparty '{counterparty}' not found on Hub",
+            "hint": "The agent you want to propose to must be registered on Hub. Check /agents for registered agents."
+        }), 404
+
+    obl_id = f"obl-{uuid.uuid4().hex[:12]}"
+    now = datetime.utcnow().isoformat() + "Z"
+
+    closure_policy = data.get("closure_policy", "counterparty_accepts")
+    if closure_policy not in _CLOSURE_POLICIES:
+        return jsonify({"error": f"invalid closure_policy, must be one of: {_CLOSURE_POLICIES}"}), 400
+
+    obl = {
+        "obligation_id": obl_id,
+        "created_at": now,
+        "created_by": agent_id,
+        "counterparty": counterparty,
+        "unverified_proposer": True,
+        "parties": [
+            {"agent_id": agent_id, "verified": False},
+            {"agent_id": counterparty, "verified": True},
+        ],
+        "role_bindings": data.get("role_bindings", [
+            {"role": "claimant", "agent_id": agent_id},
+            {"role": "counterparty", "agent_id": counterparty},
+        ]),
+        "status": "proposed",
+        "commitment": commitment,
+        "success_condition": data.get("success_condition"),
+        "closure_policy": closure_policy,
+        "binding_scope_text": data.get("binding_scope_text"),
+        "evidence_refs": [],
+        "artifact_refs": [],
+        "history": [
+            {"status": "proposed", "at": now, "by": agent_id, "unverified": True}
+        ],
+    }
+
+    obls = load_obligations()
+    obls.append(obl)
+    save_obligations(obls)
+
+    return jsonify({
+        "obligation": obl,
+        "note": f"Obligation proposed. {counterparty} can see this and respond. Your identity ({agent_id}) is unverified — the counterparty will know you are not a registered Hub agent.",
+        "next_steps": {
+            "check_status": f"GET /obligations/{obl_id}",
+            "register_for_full_access": "POST /agents/register with your agent_id to get verified status + ability to advance obligations"
+        }
+    }), 201
+
+
 @app.route("/obligations/<obl_id>", methods=["GET"])
 def get_obligation(obl_id):
     """Get a single obligation by ID."""
