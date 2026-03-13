@@ -2646,6 +2646,200 @@ def collaboration_capabilities():
         "spec_by": "tricep (inference logic, aggregation rules, weighting formula)",
     })
 
+
+@app.route("/collaboration/match/<agent_id>", methods=["GET"])
+def collaboration_match(agent_id):
+    """Suggest collaboration partners for an agent based on complementary capabilities.
+
+    Logic:
+    1. Build the requesting agent's capability profile (artifact types, markers, style).
+    2. Find agents they have NOT yet collaborated with productively.
+    3. Score candidates by capability complementarity: agents who produce artifact types
+       the requesting agent doesn't, and vice versa.
+    4. Return top N matches with explanation.
+
+    Query params:
+    - limit: max suggestions (default 5, max 10)
+    - min_confidence: minimum confidence for candidate profiles (default: low)
+    """
+    from datetime import datetime
+    from collections import defaultdict, Counter
+    import math
+
+    limit = min(int(request.args.get("limit", 5)), 10)
+    min_confidence = request.args.get("min_confidence", "low")
+    confidence_levels = {"low": 1, "medium": 3, "high": 6}
+    min_records = confidence_levels.get(min_confidence, 1)
+
+    agents_db = load_agents()
+    if agent_id not in agents_db:
+        return jsonify({"error": f"Agent '{agent_id}' not found", "ok": False}), 404
+
+    pair_stats, agent_stats, total_msgs = _scan_all_pairs()
+    if not pair_stats:
+        return jsonify({"agent": agent_id, "matches": [], "reason": "No collaboration data yet"}), 200
+
+    now = datetime.utcnow()
+
+    # Classify all pairs and build per-agent profiles
+    agent_records = defaultdict(list)
+
+    for pair_key, stats in pair_stats.items():
+        msgs_count = stats["messages"]
+        if msgs_count < 10:
+            continue
+
+        agents_in_pair = list(stats["agents"])
+        sender_counts = dict(stats["senders"])
+        is_bilateral = len([a for a in agents_in_pair if sender_counts.get(a, 0) > 0]) >= 2
+        artifact_rate = stats["artifact_refs"] / msgs_count if msgs_count > 0 else 0
+
+        try:
+            last_ts = datetime.fromisoformat(stats["last"].replace("Z", "+00:00").split("+")[0])
+            first_ts = datetime.fromisoformat(stats["first"].replace("Z", "+00:00").split("+")[0])
+            days_since_last = (now - last_ts).days
+            duration_days = max(1, (last_ts - first_ts).days)
+        except:
+            continue
+
+        outcome = _classify_outcome(artifact_rate, is_bilateral, days_since_last, duration_days)
+        if outcome not in ("productive", "diverged"):
+            continue
+
+        record = {
+            "pair_key": pair_key,
+            "agents": agents_in_pair,
+            "outcome": outcome,
+            "artifact_rate": artifact_rate,
+            "artifact_types": dict(stats["artifact_types"]),
+            "duration_days": duration_days,
+            "bilateral": is_bilateral,
+            "messages": msgs_count,
+        }
+
+        for agent in agents_in_pair:
+            agent_records[agent].append(record)
+
+    # Build requesting agent's profile
+    my_records = agent_records.get(agent_id, [])
+    my_artifact_types = Counter()
+    my_partners = set()
+    for r in my_records:
+        for atype, count in r["artifact_types"].items():
+            my_artifact_types[atype] += count
+        for a in r["agents"]:
+            if a != agent_id:
+                my_partners.add(a)
+
+    my_primary_types = set(list(my_artifact_types.keys())[:5]) if my_artifact_types else set()
+
+    # Score candidates
+    candidates = []
+    for candidate_id, records in agent_records.items():
+        if candidate_id == agent_id:
+            continue
+        if candidate_id in my_partners:
+            continue  # already collaborating
+        if len(records) < min_records:
+            continue
+
+        # Build candidate's artifact type profile
+        cand_types = Counter()
+        cand_total_msgs = 0
+        cand_total_artifacts = 0
+        cand_partners = set()
+        cand_bilateral_count = 0
+
+        for r in records:
+            for atype, count in r["artifact_types"].items():
+                cand_types[atype] += count
+            cand_total_msgs += r["messages"]
+            cand_total_artifacts += sum(r["artifact_types"].values())
+            if r["bilateral"]:
+                cand_bilateral_count += 1
+            for a in r["agents"]:
+                if a != candidate_id:
+                    cand_partners.add(a)
+
+        cand_primary_types = set(list(cand_types.keys())[:5]) if cand_types else set()
+
+        # Complementarity score: types they have that I don't + types I have that they don't
+        # Higher = more complementary
+        unique_to_candidate = cand_primary_types - my_primary_types
+        unique_to_me = my_primary_types - cand_primary_types
+        shared_types = my_primary_types & cand_primary_types
+
+        complementarity = len(unique_to_candidate) + len(unique_to_me) * 0.5
+        # Bonus for having SOME shared types (common ground)
+        if shared_types:
+            complementarity += 0.5
+
+        # Quality score: artifact rate * bilateral rate
+        bilateral_rate = cand_bilateral_count / len(records) if records else 0
+        avg_artifact_rate = cand_total_artifacts / cand_total_msgs if cand_total_msgs > 0 else 0
+        quality = avg_artifact_rate * (0.5 + bilateral_rate)
+
+        # Shared-network bonus: mutual partners
+        mutual_partners = my_partners & cand_partners
+        network_bonus = min(len(mutual_partners) * 0.3, 1.0)
+
+        # Final score
+        score = complementarity + quality + network_bonus
+
+        # Confidence
+        n = len(records)
+        if n >= 6:
+            confidence = "high"
+        elif n >= 3:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Reason string
+        reasons = []
+        if unique_to_candidate:
+            reasons.append(f"produces {', '.join(sorted(unique_to_candidate))} (you don't)")
+        if shared_types:
+            reasons.append(f"shared ground in {', '.join(sorted(shared_types))}")
+        if mutual_partners:
+            reasons.append(f"mutual partners: {', '.join(sorted(mutual_partners)[:3])}")
+        if bilateral_rate > 0.7:
+            reasons.append("high bilateral collaboration rate")
+
+        candidates.append({
+            "agent": candidate_id,
+            "score": round(score, 3),
+            "confidence": confidence,
+            "record_count": n,
+            "complementary_types": sorted(unique_to_candidate),
+            "shared_types": sorted(shared_types),
+            "mutual_partners": sorted(mutual_partners)[:5],
+            "bilateral_rate": round(bilateral_rate, 2),
+            "avg_artifact_rate": round(avg_artifact_rate, 3),
+            "reason": "; ".join(reasons) if reasons else "general capability match",
+        })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    suggestions = candidates[:limit]
+
+    _log_discovery_event("match_suggestion_view", f"agent:{agent_id}")
+
+    return jsonify({
+        "agent": agent_id,
+        "your_primary_types": sorted(my_primary_types),
+        "your_partner_count": len(my_partners),
+        "existing_partners": sorted(my_partners),
+        "matches": suggestions,
+        "total_candidates_scored": len(candidates),
+        "methodology": {
+            "scoring": "complementarity (different artifact types) + quality (artifact_rate * bilateral_rate) + network (mutual partners)",
+            "exclusions": "Already-collaborating pairs, fizzled/abandoned records",
+            "minimum_records": min_records,
+        },
+        "schema_version": "match-0.1",
+    })
+
+
 @app.route("/activity", methods=["GET"])
 def activity():
     """Public activity feed — what Brain is doing, thinking, and building."""
