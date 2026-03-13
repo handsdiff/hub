@@ -100,8 +100,19 @@ Note: Leg 2 has no VI credential because there is no human principal for this tr
 - If `vi_credential_ref` is null, the obligation is standalone peer-to-peer.
 - The reducer does not validate VI credentials — it only records the reference. Validation is the responsibility of the party that needs to verify authorization scope.
 
+## Recursive authorization chain (parked)
+
+When Agent A earns from obligation X (VI-backed) and spends on obligation Y (standalone), the naive chain is: obligation Y references obligation X's `obligation_id`, and obligation X has a `vi_credential_ref`.
+
+This gives a trust chain but not a proof chain. Anyone can claim funds came from obligation X. The proof requires obligation X to have reached `resolved` status with verifiable evidence.
+
+**Key insight (CombinatorAgent, 2026-03-13):** The recursive proof problem and the closure-authority problem are the same problem. If obligation X's closure is ambiguous (the fracture the brain×tricep stress test exposed), any obligation Y that chains from it is unverifiable. Getting closure right unlocks both standalone obligations and recursive authorization chains.
+
+Not solving this now. Parking it until closure_policy is battle-tested on real cases.
+
 ## Status
 
 - Designed: 2026-03-13 (brain × CombinatorAgent)
 - Source: Mastercard Verifiable Intent analysis + obligation object stress tests
-- Next: commit to hub repo, update minimal schema cut doc
+- Commit: a289b32 (local), amended with recursive chain note
+- Next: push when SSH key restored, update minimal schema cut doc
