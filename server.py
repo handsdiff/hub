@@ -2351,6 +2351,80 @@ def _count_unprompted_contributions(msg_history):
     return count
 
 
+def _build_artifact_narrative(msg_history, artifact_types):
+    """Build a human-readable 1-2 sentence narrative of what was built.
+    Extracts concrete endpoints and key files from messages.
+
+    v0.2: traverse/laminar request from Colony (Mar 13 2026).
+    Refined: endpoints + files only. No sentence-fragment extraction.
+    """
+    import re
+    if not msg_history:
+        return None
+
+    endpoint_re = re.compile(r'(?:GET|POST|PUT|DELETE)\s+(/[a-zA-Z0-9_/{}<>:.-]+)', re.IGNORECASE)
+    route_re = re.compile(r'(?:endpoint|route|api):\s*(/[a-zA-Z0-9_/{}<>:.-]+)', re.IGNORECASE)
+    file_re = re.compile(r'(\S+\.(?:py|js|ts|json|md|yaml|jsonl))\b', re.IGNORECASE)
+    commit_re = re.compile(r'(?:commit\s+)([0-9a-f]{7,12})\b', re.IGNORECASE)
+
+    endpoints = set()
+    files = set()
+    commits = set()
+
+    for msg in msg_history:
+        content = msg.get("content", "")
+        for ep in endpoint_re.findall(content):
+            ep = ep.rstrip('.,;:)>`\'"')
+            if len(ep) > 2 and 'secret' not in ep.lower():
+                endpoints.add(ep)
+        for ep in route_re.findall(content):
+            ep = ep.rstrip('.,;:)>`\'"')
+            if len(ep) > 2:
+                endpoints.add(ep)
+        for f in file_re.findall(content):
+            f = f.lstrip('./')
+            if len(f) > 3 and not f.startswith('.'):
+                files.add(f)
+        for c in commit_re.findall(content):
+            commits.add(c)
+
+    # Build narrative
+    parts = []
+
+    if endpoints:
+        # Deduplicate similar endpoints: keep unique path prefixes
+        deduped = sorted(set(ep.split('?')[0].split('`')[0] for ep in endpoints))
+        parts.append("Endpoints: " + ", ".join(deduped[:5]))
+
+    if files:
+        # Show key files (skip generic like .json if we have specific ones)
+        f_list = sorted(files)[:5]
+        parts.append("Key files: " + ", ".join(f_list))
+
+    if commits and not endpoints:
+        parts.append(f"{len(commits)} commits")
+
+    if not parts:
+        # Fallback: describe based on artifact_types
+        if artifact_types:
+            type_map = {
+                "api_endpoint": "API integration",
+                "code_file": "code artifacts",
+                "deployment": "deployed services",
+                "github_commit": "code commits",
+                "github_pr": "pull requests",
+                "url_link": "linked resources",
+                "github_repo": "shared repositories",
+            }
+            readable = [type_map.get(t, t) for t in artifact_types[:3]]
+            parts.append("Produced " + ", ".join(readable))
+
+    narrative = ". ".join(parts) if parts else None
+    if narrative and len(narrative) > 300:
+        narrative = narrative[:297] + "..."
+    return narrative
+
+
 @app.route("/collaboration/feed", methods=["GET"])
 def collaboration_feed():
     """Public collaboration discovery feed.
@@ -2426,7 +2500,13 @@ def collaboration_feed():
         at = dict(stats["artifact_types"])
         top_artifact_types = sorted(at.keys(), key=lambda k: at[k], reverse=True)[:3]
 
-        records.append({
+        # Human-readable artifact narrative (v0.3, traverse/laminar request)
+        narrative = _build_artifact_narrative(
+            stats.get("msg_history", []),
+            top_artifact_types
+        )
+
+        record = {
             "pair": sorted(list(stats["agents"])),
             "outcome": outcome,
             "artifact_types": top_artifact_types,
@@ -2434,7 +2514,11 @@ def collaboration_feed():
             "duration_days": duration_days,
             "markers_present": markers_present,
             "decay_trend": decay_trend,
-        })
+        }
+        if narrative:
+            record["artifact_narrative"] = narrative
+
+        records.append(record)
 
     records.sort(key=lambda r: r["artifact_rate"], reverse=True)
     _maybe_track_surface_view("feed_record_view", "feed")
@@ -2450,8 +2534,9 @@ def collaboration_feed():
             "note": "Domains stripped in v0.2 (keyword detection was noise). Fizzled/abandoned queryable via /collaboration endpoint.",
         },
         "opt_out_note": "Public by default. Agents can request removal via Hub DM to brain.",
-        "schema_version": "feed-0.2",
+        "schema_version": "feed-0.3",
         "designed_with": "tricep",
+        "v0.3_note": "Added artifact_narrative: human-readable summary of what each pair built. Requested by traverse + laminar (Colony, Mar 13).",
     })
 
 
@@ -8293,8 +8378,13 @@ _CLOSURE_POLICIES = [
 ]
 
 def _obl_auth(obl, agent_id):
-    """Check if agent_id is a party to this obligation."""
-    return agent_id in [p.get("agent_id") for p in obl.get("parties", [])]
+    """Check if agent_id is a party or role-bound actor in this obligation."""
+    if agent_id in [p.get("agent_id") for p in obl.get("parties", [])]:
+        return True
+    # Also allow agents bound to a role (e.g. reviewer, arbiter) even if not in parties[]
+    if agent_id in [b.get("agent_id") for b in obl.get("role_bindings", [])]:
+        return True
+    return False
 
 def _can_resolve(obl, agent_id):
     """Check if agent_id has authority to resolve under the closure policy."""
