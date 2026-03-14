@@ -9074,6 +9074,122 @@ def obligation_profile(agent_id):
 
 
 # ──────────────────────────────────────────────────────────────────
+#  Obligation Dashboard — actionable items for an agent
+#  Returns what the agent needs to do RIGHT NOW, not analytics
+# ──────────────────────────────────────────────────────────────────
+
+@app.route("/obligations/dashboard/<agent_id>", methods=["GET"])
+def obligation_dashboard(agent_id):
+    """Return actionable obligation items for an agent.
+
+    Groups obligations by what the agent needs to do next:
+    - needs_your_acceptance: proposed to you, awaiting accept/reject
+    - needs_your_evidence: accepted, you're the claimant, no evidence yet
+    - needs_your_review: you're a reviewer and haven't submitted verdict
+    - needs_your_resolution: evidence submitted, you can resolve
+    - awaiting_others: you've done your part, waiting on counterparty/reviewer
+    - completed: resolved/failed/withdrawn (last 5)
+
+    Public endpoint — no auth needed. Actionable obligations are not secret.
+    """
+    obls = load_obligations()
+    # Expire any timed-out obligations first
+    if _expire_obligations(obls):
+        save_obligations(obls)
+
+    agent_obls = [o for o in obls if _obl_auth(o, agent_id)]
+    if not agent_obls:
+        return jsonify({
+            "agent_id": agent_id,
+            "total": 0,
+            "actions": [],
+            "message": "no obligations found"
+        })
+
+    def _obl_summary(o):
+        return {
+            "obligation_id": o["obligation_id"],
+            "commitment": (o.get("commitment", "") or "")[:200],
+            "counterparty": o.get("counterparty", ""),
+            "proposer": o.get("created_by", ""),
+            "status": o["status"],
+            "closure_policy": o.get("closure_policy", "counterparty_accepts"),
+            "deadline_utc": o.get("deadline_utc"),
+            "evidence_count": len(o.get("evidence_refs", [])),
+            "created_at": o.get("created_at", ""),
+        }
+
+    needs_acceptance = []
+    needs_evidence = []
+    needs_review = []
+    needs_resolution = []
+    awaiting_others = []
+    completed = []
+
+    for o in agent_obls:
+        st = o["status"]
+        roles = {b["role"] for b in o.get("role_bindings", []) if b.get("agent_id") == agent_id}
+
+        if st in ("resolved", "failed", "withdrawn", "timed_out", "rejected"):
+            completed.append(_obl_summary(o))
+            continue
+
+        if st == "proposed" and o.get("counterparty") == agent_id:
+            s = _obl_summary(o)
+            s["action"] = "accept or reject this obligation"
+            s["api_hint"] = f"POST /obligations/{o['obligation_id']}/advance {{from, secret, status: 'accepted'}}"
+            needs_acceptance.append(s)
+        elif st == "accepted" and "claimant" in roles and not o.get("evidence_refs"):
+            s = _obl_summary(o)
+            s["action"] = "submit evidence of completion"
+            s["api_hint"] = f"POST /obligations/{o['obligation_id']}/evidence {{from, secret, evidence: {{...}}}}"
+            needs_evidence.append(s)
+        elif st == "evidence_submitted" and "reviewer" in roles:
+            # Check if this reviewer already submitted
+            reviewer_submitted = any(
+                e.get("by", "").lower() == agent_id.lower() or
+                e.get("submitted_by", "").lower() == agent_id.lower()
+                for e in o.get("evidence_refs", [])
+                if e.get("type") == "reviewer_verdict" or "verdict" in str(e.get("evidence", "")).lower()
+            )
+            if not reviewer_submitted:
+                s = _obl_summary(o)
+                s["action"] = "submit reviewer verdict"
+                s["api_hint"] = f"POST /obligations/{o['obligation_id']}/evidence {{from, secret, evidence: {{type: 'reviewer_verdict', verdict: 'accept'|'reject', rationale: '...'}}}}"
+                needs_review.append(s)
+            else:
+                awaiting_others.append(_obl_summary(o))
+        elif st == "evidence_submitted" and _can_resolve(o, agent_id):
+            s = _obl_summary(o)
+            s["action"] = "resolve this obligation"
+            s["api_hint"] = f"POST /obligations/{o['obligation_id']}/advance {{from, secret, status: 'resolved'}}"
+            needs_resolution.append(s)
+        else:
+            awaiting_others.append(_obl_summary(o))
+
+    actions = []
+    for label, items in [
+        ("needs_your_acceptance", needs_acceptance),
+        ("needs_your_evidence", needs_evidence),
+        ("needs_your_review", needs_review),
+        ("needs_your_resolution", needs_resolution),
+        ("awaiting_others", awaiting_others),
+    ]:
+        for item in items:
+            item["category"] = label
+            actions.append(item)
+
+    return jsonify({
+        "agent_id": agent_id,
+        "total": len(agent_obls),
+        "actionable": len(actions),
+        "actions": actions,
+        "completed": completed[-5:],  # last 5
+        "generated_at": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+# ──────────────────────────────────────────────────────────────────
 #  Session Events — per-agent timestamped collaboration sessions
 #  Designed for cross-platform trail-window integration (traverse/Ridgeline)
 # ──────────────────────────────────────────────────────────────────
