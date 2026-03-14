@@ -8510,11 +8510,13 @@ _CLOSURE_POLICIES = [
 _DEADLINE_REQUIRED_POLICIES = ["reviewer_required", "claimant_plus_reviewer"]
 
 def _obl_auth(obl, agent_id):
-    """Check if agent_id is a party or role-bound actor in this obligation."""
-    if agent_id in [p.get("agent_id") for p in obl.get("parties", [])]:
+    """Check if agent_id is a party or role-bound actor in this obligation.
+    Uses case-insensitive matching to prevent silent auth failures from
+    case mismatches (e.g. cortana vs Cortana in role_bindings)."""
+    aid_lower = agent_id.lower()
+    if aid_lower in [p.get("agent_id", "").lower() for p in obl.get("parties", [])]:
         return True
-    # Also allow agents bound to a role (e.g. reviewer, arbiter) even if not in parties[]
-    if agent_id in [b.get("agent_id") for b in obl.get("role_bindings", [])]:
+    if aid_lower in [b.get("agent_id", "").lower() for b in obl.get("role_bindings", [])]:
         return True
     return False
 
@@ -8527,27 +8529,30 @@ def _can_resolve(obl, agent_id):
     """
     bindings = {b["role"]: b["agent_id"] for b in obl.get("role_bindings", [])}
 
+    def _match(role_key, fallback_key=None):
+        """Case-insensitive agent_id match against role binding or fallback field."""
+        bound = bindings.get(role_key) or (obl.get(fallback_key) if fallback_key else None)
+        return bound and agent_id.lower() == bound.lower()
+
     # After deadline elapsed, claimant gets self-resolve authority
     if obl.get("status") == "deadline_elapsed" and obl.get("timeout_elapsed"):
-        claimant = bindings.get("claimant", obl.get("created_by"))
-        if agent_id == claimant:
+        if _match("claimant", "created_by"):
             return True
         # Reviewer can still resolve too (advisory becomes authoritative if they show up)
-        reviewer = bindings.get("reviewer")
-        if reviewer and agent_id == reviewer:
+        if _match("reviewer"):
             return True
 
     policy = obl.get("closure_policy", "counterparty_accepts")
     if policy == "claimant_self_attests":
-        return agent_id == bindings.get("claimant", obl.get("created_by"))
+        return _match("claimant", "created_by")
     elif policy == "counterparty_accepts":
-        return agent_id == bindings.get("counterparty", obl.get("counterparty"))
+        return _match("counterparty", "counterparty")
     elif policy == "claimant_plus_reviewer":
-        return agent_id == bindings.get("reviewer")
+        return _match("reviewer")
     elif policy == "reviewer_required":
-        return agent_id == bindings.get("reviewer")
+        return _match("reviewer")
     elif policy == "arbiter_rules":
-        return agent_id == bindings.get("arbiter")
+        return _match("arbiter")
     return False
 
 
@@ -8819,9 +8824,11 @@ def advance_obligation(obl_id):
     if new_status == "resolved" and obl.get("closure_policy") == "reviewer_required":
         is_deadline_elapsed = obl.get("status") == "deadline_elapsed" and obl.get("timeout_elapsed")
         if not is_deadline_elapsed:
-            reviewer = {b["agent_id"] for b in obl.get("role_bindings", []) if b.get("role") == "reviewer"}
+            reviewer = {b["agent_id"].lower() for b in obl.get("role_bindings", []) if b.get("role") == "reviewer"}
             has_reviewer_verdict = any(
-                e.get("submitted_by") in reviewer or e.get("by") in reviewer or e.get("type") == "reviewer_verdict"
+                (e.get("submitted_by", "").lower() in reviewer) or
+                (e.get("by", "").lower() in reviewer) or
+                e.get("type") == "reviewer_verdict"
                 for e in obl.get("evidence_refs", [])
             )
             if not has_reviewer_verdict:
