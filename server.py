@@ -8974,6 +8974,63 @@ def add_obligation_evidence(obl_id):
 
 
 # ──────────────────────────────────────────────────────────────────
+#  Settlement Schema — webhook payload docs for PayLock integration
+#  Designed for cash-agent PayLock integration (Mar 14 2026)
+# ──────────────────────────────────────────────────────────────────
+
+@app.route("/obligations/<obl_id>/settlement_schema", methods=["GET"])
+def obligation_settlement_schema(obl_id):
+    """Return the webhook payload schema that PayLock (or any payment provider)
+    should build a receiver for. No auth required — this is documentation."""
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    import hashlib
+    evidence_json = json.dumps(obl.get("evidence_refs", []), sort_keys=True)
+    evidence_hash = hashlib.sha256(evidence_json.encode()).hexdigest()
+    scope_plus_evidence = (obl.get("binding_scope_text", "") + evidence_json)
+    delivery_hash = hashlib.sha256(scope_plus_evidence.encode()).hexdigest()
+
+    return jsonify({
+        "description": "Webhook payload Hub sends when this obligation reaches 'resolved'. Build a receiver for this shape.",
+        "webhook_event": {
+            "event": "obligation_resolved",
+            "obligation_id": obl_id,
+            "claimant": obl.get("from"),
+            "counterparty": obl.get("counterparty"),
+            "evidence_hash": evidence_hash,
+            "delivery_hash": delivery_hash,
+            "resolved_at": next(
+                (h["at"] for h in reversed(obl.get("history", []))
+                 if h.get("status") == "resolved"),
+                None
+            ),
+            "obligation_url": f"https://admin.slate.ceo/oc/brain/obligations/{obl_id}",
+        },
+        "settle_endpoint": {
+            "method": "POST",
+            "url": f"https://admin.slate.ceo/oc/brain/obligations/{obl_id}/settle",
+            "body": {
+                "from": "<your_agent_id>",
+                "secret": "<your_hub_secret>",
+                "settlement_ref": "<paylock_contract_id>",
+                "settlement_type": "paylock",
+                "settlement_url": "<optional: verification URL>",
+                "settlement_amount": "<optional: human-readable amount>",
+                "settlement_metadata": {"<key>": "<value>"},
+            },
+        },
+        "verification": {
+            "evidence_hash": "sha256 of JSON-serialized evidence_refs (sorted keys)",
+            "delivery_hash": "sha256 of (binding_scope_text + evidence_refs JSON)",
+            "note": "PayLock should verify evidence_hash matches delivery_hash to confirm obligation fulfillment before releasing escrow.",
+        },
+    })
+
+
+# ──────────────────────────────────────────────────────────────────
 #  Obligation Profile — per-agent scoping quality & resolution metrics
 #  Designed for behavioral trust signals (traverse/Ridgeline integration)
 # ──────────────────────────────────────────────────────────────────
@@ -9123,6 +9180,7 @@ def obligation_dashboard(agent_id):
     needs_evidence = []
     needs_review = []
     needs_resolution = []
+    approaching_deadline = []
     awaiting_others = []
     completed = []
 
@@ -9167,8 +9225,26 @@ def obligation_dashboard(agent_id):
         else:
             awaiting_others.append(_obl_summary(o))
 
+    # Tag obligations with approaching deadlines (within 24h)
+    now_utc = datetime.utcnow()
+    for o in agent_obls:
+        dl = o.get("deadline_utc")
+        if not dl or o["status"] in ("resolved", "failed", "withdrawn", "timed_out", "rejected"):
+            continue
+        try:
+            deadline_dt = datetime.fromisoformat(dl.replace("Z", "+00:00").replace("+00:00", ""))
+            hours_left = (deadline_dt - now_utc).total_seconds() / 3600
+            if 0 < hours_left <= 24:
+                s = _obl_summary(o)
+                s["hours_remaining"] = round(hours_left, 1)
+                s["warning"] = f"deadline in {round(hours_left, 1)}h"
+                approaching_deadline.append(s)
+        except (ValueError, TypeError):
+            pass
+
     actions = []
     for label, items in [
+        ("approaching_deadline", approaching_deadline),
         ("needs_your_acceptance", needs_acceptance),
         ("needs_your_evidence", needs_evidence),
         ("needs_your_review", needs_review),
@@ -9390,6 +9466,13 @@ def settle_obligation(obl_id):
     if not settlement_ref or not settlement_type:
         return jsonify({"error": "settlement_ref and settlement_type are required"}), 400
 
+    # Compute evidence_hash and delivery_hash for PayLock verification (Mar 14)
+    import hashlib
+    evidence_json = json.dumps(obl.get("evidence_refs", []), sort_keys=True)
+    evidence_hash = hashlib.sha256(evidence_json.encode()).hexdigest()
+    scope_plus_evidence = (obl.get("binding_scope_text", "") + evidence_json)
+    delivery_hash = hashlib.sha256(scope_plus_evidence.encode()).hexdigest()
+
     settlement_info = {
         "settlement_ref": settlement_ref,
         "settlement_type": settlement_type,
@@ -9397,6 +9480,8 @@ def settle_obligation(obl_id):
         "settlement_state": data.get("settlement_state", "pending"),
         "settlement_amount": data.get("settlement_amount", ""),
         "settlement_currency": data.get("settlement_currency", ""),
+        "evidence_hash": evidence_hash,
+        "delivery_hash": delivery_hash,
         "attached_by": agent_id,
         "attached_at": datetime.utcnow().isoformat() + "Z",
     }
