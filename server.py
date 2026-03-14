@@ -9028,6 +9028,161 @@ def _build_session_event(agent_id, partner, msgs):
     }
 
 
+# ──────────────────────────────────────────────────────────────────
+#  Settlement — link obligations to external financial enforcement
+#  Designed for PayLock / escrow integration (cash-agent proposal)
+# ──────────────────────────────────────────────────────────────────
+
+@app.route("/obligations/<obl_id>/settle", methods=["POST"])
+def settle_obligation(obl_id):
+    """Attach or update settlement information on an obligation.
+
+    Accepts:
+        from          — agent_id of the caller
+        secret        — caller's Hub secret (or admin secret)
+        settlement_ref — external settlement/escrow ID (e.g., PayLock escrow ID)
+        settlement_type — type of settlement system (e.g., "paylock", "lightning", "manual")
+        settlement_url  — (optional) URL to view/verify the settlement
+        settlement_state — (optional) state of settlement: "pending", "escrowed", "released", "disputed", "refunded"
+        settlement_amount — (optional) amount in the settlement
+        settlement_currency — (optional) currency/token (e.g., "SOL", "sats")
+
+    The caller must be a party to the obligation.
+    Settlement info is stored on the obligation and recorded in history.
+    """
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
+    if not obl:
+        return jsonify({"error": "obligation not found"}), 404
+
+    data = request.get_json(force=True, silent=True) or {}
+    agent_id = data.get("from", "")
+    secret = data.get("secret", "")
+
+    # Auth: must be party to the obligation
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    # Verify identity
+    agents = load_agents()
+    agent = agents.get(agent_id) if isinstance(agents, dict) else next((a for a in agents if a.get("agent_id") == agent_id), None)
+    admin_secret = os.environ.get("HUB_ADMIN_SECRET", "")
+    if agent:
+        if secret != agent.get("secret") and secret != admin_secret:
+            return jsonify({"error": "invalid secret"}), 403
+    elif secret != admin_secret:
+        return jsonify({"error": "agent not found and not admin"}), 403
+
+    settlement_ref = data.get("settlement_ref", "")
+    settlement_type = data.get("settlement_type", "")
+    if not settlement_ref or not settlement_type:
+        return jsonify({"error": "settlement_ref and settlement_type are required"}), 400
+
+    settlement_info = {
+        "settlement_ref": settlement_ref,
+        "settlement_type": settlement_type,
+        "settlement_url": data.get("settlement_url", ""),
+        "settlement_state": data.get("settlement_state", "pending"),
+        "settlement_amount": data.get("settlement_amount", ""),
+        "settlement_currency": data.get("settlement_currency", ""),
+        "attached_by": agent_id,
+        "attached_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    # Store on the obligation
+    obl["settlement"] = settlement_info
+
+    # Record in history
+    obl.setdefault("history", []).append({
+        "action": "settlement_attached",
+        "by": agent_id,
+        "timestamp": settlement_info["attached_at"],
+        "settlement_ref": settlement_ref,
+        "settlement_type": settlement_type,
+        "settlement_state": data.get("settlement_state", "pending"),
+    })
+
+    save_obligations(obls)
+
+    return jsonify({
+        "obligation_id": obl_id,
+        "settlement": settlement_info,
+        "status": obl.get("status"),
+        "message": f"settlement attached via {settlement_type}"
+    })
+
+
+@app.route("/obligations/<obl_id>/settlement-update", methods=["POST"])
+def update_obligation_settlement(obl_id):
+    """Update settlement state on an obligation (e.g., escrowed → released).
+
+    Accepts:
+        from          — agent_id
+        secret        — caller's secret
+        settlement_state — new state: "escrowed", "released", "disputed", "refunded"
+        settlement_receipt — (optional) receipt/proof hash
+        note          — (optional) human-readable note
+
+    Only callable by a party to the obligation.
+    """
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
+    if not obl:
+        return jsonify({"error": "obligation not found"}), 404
+
+    if not obl.get("settlement"):
+        return jsonify({"error": "no settlement attached to this obligation"}), 400
+
+    data = request.get_json(force=True, silent=True) or {}
+    agent_id = data.get("from", "")
+    secret = data.get("secret", "")
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    agents = load_agents()
+    agent = agents.get(agent_id) if isinstance(agents, dict) else next((a for a in agents if a.get("agent_id") == agent_id), None)
+    admin_secret = os.environ.get("HUB_ADMIN_SECRET", "")
+    if agent:
+        if secret != agent.get("secret") and secret != admin_secret:
+            return jsonify({"error": "invalid secret"}), 403
+    elif secret != admin_secret:
+        return jsonify({"error": "agent not found and not admin"}), 403
+
+    new_state = data.get("settlement_state", "")
+    valid_states = ["pending", "escrowed", "released", "disputed", "refunded"]
+    if new_state and new_state not in valid_states:
+        return jsonify({"error": f"settlement_state must be one of: {valid_states}"}), 400
+
+    prev_state = obl["settlement"].get("settlement_state", "")
+
+    if new_state:
+        obl["settlement"]["settlement_state"] = new_state
+    if data.get("settlement_receipt"):
+        obl["settlement"]["settlement_receipt"] = data["settlement_receipt"]
+    obl["settlement"]["last_updated_at"] = datetime.utcnow().isoformat() + "Z"
+    obl["settlement"]["last_updated_by"] = agent_id
+
+    obl.setdefault("history", []).append({
+        "action": "settlement_updated",
+        "by": agent_id,
+        "timestamp": obl["settlement"]["last_updated_at"],
+        "previous_state": prev_state,
+        "new_state": new_state or prev_state,
+        "settlement_receipt": data.get("settlement_receipt", ""),
+        "note": data.get("note", ""),
+    })
+
+    save_obligations(obls)
+
+    return jsonify({
+        "obligation_id": obl_id,
+        "settlement": obl["settlement"],
+        "status": obl.get("status"),
+        "message": f"settlement state updated: {prev_state} → {new_state or prev_state}"
+    })
+
+
 if __name__ == "__main__":
     _register_brain()
     # Airdrop to brain on startup
