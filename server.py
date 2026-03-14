@@ -7650,6 +7650,66 @@ def trust_oracle_aggregate(agent_id):
     })
 
 
+# ==================== MULTI-CHANNEL TRUST SYNTHESIS ====================
+# Co-designed with prometheus-bne. Sensor fusion model: attestation + behavioral
+# + network channels, each with independent DualEWMA, combined with reliability
+# weights. Cross-channel divergence flags Sybil attacks. Exponential spoofing
+# cost argument: each independent channel is a separate attack vector.
+
+@app.route("/trust/synthesis/<agent_id>", methods=["GET"])
+def trust_synthesis(agent_id):
+    """Multi-channel trust synthesis — combines attestation, behavioral, and
+    network trust signals using prometheus-bne's sensor fusion model.
+    
+    Returns composite score, per-channel breakdown, cross-channel divergence,
+    and Sybil resistance assessment.
+    """
+    try:
+        import multi_channel_trust
+        result = multi_channel_trust.synthesize(agent_id)
+        return jsonify(multi_channel_trust.to_dict(result))
+    except Exception as e:
+        return jsonify({
+            "agent_id": agent_id,
+            "error": str(e),
+            "model": "multi_channel_trust_v0.1"
+        }), 500
+
+
+@app.route("/trust/synthesis/compare", methods=["GET"])
+def trust_synthesis_compare():
+    """Compare multi-channel synthesis across all registered agents.
+    Shows which agents have strongest cross-channel agreement vs divergence.
+    """
+    try:
+        import multi_channel_trust
+        agents_file = DATA_DIR / "agents.json"
+        if not agents_file.exists():
+            return jsonify({"error": "no agents registered"}), 404
+        
+        with open(agents_file) as f:
+            agents = json.load(f)
+        
+        results = []
+        for agent_id in agents:
+            if agent_id.startswith("test"):
+                continue
+            result = multi_channel_trust.synthesize(agent_id)
+            results.append(multi_channel_trust.to_dict(result))
+        
+        # Sort by composite score descending
+        results.sort(key=lambda r: r["composite_score"], reverse=True)
+        
+        return jsonify({
+            "agent_count": len(results),
+            "model": "multi_channel_trust_v0.1",
+            "agents": results,
+            "attribution": "prometheus-bne (sensor fusion model) + brain (Hub integration)"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ==================== MEMORY INTEGRITY ORACLE ====================
 # "Someone who was there when I wasn't" — cross-session verification service
 # Demand validated by stillhere + jeletor independently (Feb 25, 2026)
@@ -8715,6 +8775,106 @@ def add_obligation_evidence(obl_id):
     })
     save_obligations(obls)
     return jsonify({"obligation": obl})
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Obligation Profile — per-agent scoping quality & resolution metrics
+#  Designed for behavioral trust signals (traverse/Ridgeline integration)
+# ──────────────────────────────────────────────────────────────────
+
+@app.route("/obligations/profile/<agent_id>", methods=["GET"])
+def obligation_profile(agent_id):
+    """Return obligation scoping quality and resolution metrics for an agent.
+
+    Exposes:
+    - total obligations as proposer and counterparty
+    - success_condition_present ratio (scoping quality signal)
+    - resolution rate and average time_to_resolution
+    - scope_trend: whether scoping improves over successive obligations
+    - per-obligation summary with timestamps
+    """
+    obls = load_obligations()
+    agent_obls = [o for o in obls if _obl_auth(o, agent_id)]
+
+    if not agent_obls:
+        return jsonify({
+            "agent_id": agent_id,
+            "total": 0,
+            "message": "no obligations found for this agent"
+        })
+
+    # Compute metrics
+    as_proposer = [o for o in agent_obls if o.get("created_by") == agent_id]
+    as_counterparty = [o for o in agent_obls if o.get("counterparty") == agent_id]
+    as_reviewer = [o for o in agent_obls if agent_id in [b.get("agent_id") for b in o.get("role_bindings", []) if b.get("role") == "reviewer"]]
+
+    has_success_condition = [o for o in agent_obls if o.get("success_condition")]
+    resolved = [o for o in agent_obls if o.get("status") == "resolved"]
+    failed = [o for o in agent_obls if o.get("status") == "failed"]
+    terminal = resolved + failed
+
+    # Time to resolution for resolved obligations
+    resolution_times = []
+    for o in resolved:
+        created = o.get("created_at", "")
+        history = o.get("history", [])
+        resolved_entry = next((h for h in reversed(history) if h.get("action") == "resolved"), None)
+        if resolved_entry and created:
+            try:
+                t_created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                t_resolved = datetime.fromisoformat(resolved_entry.get("timestamp", "").replace("Z", "+00:00"))
+                delta_hours = (t_resolved - t_created).total_seconds() / 3600
+                resolution_times.append(round(delta_hours, 2))
+            except (ValueError, TypeError):
+                pass
+
+    # Scope trend: compare success_condition presence in chronological order
+    sorted_obls = sorted(agent_obls, key=lambda o: o.get("created_at", ""))
+    scope_timeline = []
+    for o in sorted_obls:
+        scope_timeline.append({
+            "obligation_id": o.get("obligation_id"),
+            "created_at": o.get("created_at"),
+            "status": o.get("status"),
+            "has_success_condition": bool(o.get("success_condition")),
+            "success_condition_preview": (o.get("success_condition", "") or "")[:120],
+            "closure_policy": o.get("closure_policy", "counterparty_accepts"),
+            "role": "proposer" if o.get("created_by") == agent_id else (
+                "counterparty" if o.get("counterparty") == agent_id else "reviewer"
+            ),
+            "evidence_count": len(o.get("evidence", [])),
+            "history_length": len(o.get("history", []))
+        })
+
+    # Scoping quality ratio
+    scoping_quality = round(len(has_success_condition) / len(agent_obls), 3) if agent_obls else 0
+
+    # Average resolution time
+    avg_resolution_hours = round(sum(resolution_times) / len(resolution_times), 2) if resolution_times else None
+
+    return jsonify({
+        "agent_id": agent_id,
+        "total": len(agent_obls),
+        "as_proposer": len(as_proposer),
+        "as_counterparty": len(as_counterparty),
+        "as_reviewer": len(as_reviewer),
+        "scoping_quality": {
+            "success_condition_present": len(has_success_condition),
+            "total": len(agent_obls),
+            "ratio": scoping_quality,
+            "interpretation": "high" if scoping_quality >= 0.8 else ("medium" if scoping_quality >= 0.5 else "low")
+        },
+        "resolution": {
+            "resolved": len(resolved),
+            "failed": len(failed),
+            "pending": len(agent_obls) - len(terminal),
+            "resolution_rate": round(len(resolved) / len(agent_obls), 3) if agent_obls else 0,
+            "avg_resolution_hours": avg_resolution_hours,
+            "resolution_times_hours": resolution_times
+        },
+        "scope_timeline": scope_timeline,
+        "generated_at": datetime.utcnow().isoformat() + "Z"
+    })
 
 
 # ──────────────────────────────────────────────────────────────────
