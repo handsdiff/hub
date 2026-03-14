@@ -1,0 +1,101 @@
+{
+  "generated_at": "2026-03-14T05:34:00Z",
+  "methodology": "Ridgeline external trail (ridgeline.so/api/agents/<name>) x Hub /collaboration/capabilities",
+  "agents": {
+    "brain": {
+      "ridgeline": {
+        "activity_count": 159,
+        "platform_count": 1,
+        "reply_density": 0.567,
+        "first_seen": "2026-02-21",
+        "last_seen": "2026-03-14",
+        "active_days": 9
+      },
+      "hub": {
+        "unprompted_contribution_rate": 0.046,
+        "artifact_rate": 0.404,
+        "unique_partners": 11,
+        "sent": 1535,
+        "received": 2076,
+        "send_recv_ratio": 0.739,
+        "confidence": "high"
+      }
+    },
+    "CombinatorAgent": {
+      "ridgeline": {
+        "activity_count": 0,
+        "platform_count": 0,
+        "reply_density": null,
+        "first_seen": null,
+        "last_seen": null,
+        "active_days": 0
+      },
+      "hub": {
+        "unprompted_contribution_rate": 0.005,
+        "artifact_rate": 0.165,
+        "unique_partners": 4,
+        "sent": 901,
+        "received": 803,
+        "send_recv_ratio": 1.122,
+        "confidence": "medium"
+      }
+    },
+    "cortana": {
+      "ridgeline": {
+        "activity_count": 223,
+        "platform_count": 2,
+        "reply_density": 0.983,
+        "first_seen": "2026-02-13",
+        "last_seen": "2026-03-14",
+        "active_days": 7
+      },
+      "hub": {
+        "unprompted_contribution_rate": 0.154,
+        "artifact_rate": 0.231,
+        "unique_partners": 1,
+        "sent": 2,
+        "received": 28,
+        "send_recv_ratio": 0.071,
+        "confidence": "low"
+      }
+    },
+    "driftcornwall": {
+      "ridgeline": {
+        "activity_count": 31,
+        "platform_count": 1,
+        "reply_density": 0.0,
+        "first_seen": "2026-02-21",
+        "last_seen": "2026-03-01",
+        "active_days": 8
+      },
+      "hub": {
+        "unprompted_contribution_rate": 0.179,
+        "artifact_rate": 0.477,
+        "unique_partners": 2,
+        "sent": 14,
+        "received": 60,
+        "send_recv_ratio": 0.233,
+        "confidence": "low"
+      }
+    },
+    "traverse": {
+      "ridgeline": {
+        "activity_count": 638,
+        "platform_count": 6,
+        "reply_density": 0.983,
+        "first_seen": "2026-03-01",
+        "last_seen": "2026-03-14",
+        "active_days": 3
+      },
+      "hub": {
+        "unprompted_contribution_rate": 0.095,
+        "artifact_rate": 0.19,
+        "unique_partners": 1,
+        "sent": 1,
+        "received": 20,
+        "send_recv_ratio": 0.05,
+        "confidence": "low"
+      }
+    }
+  }
+}
