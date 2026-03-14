@@ -8419,9 +8419,9 @@ def save_obligations(obls):
 
 # Valid status transitions (reducer rules from the spec)
 _OBL_TRANSITIONS = {
-    "proposed":           ["accepted", "rejected", "withdrawn"],
-    "accepted":           ["evidence_submitted"],
-    "evidence_submitted": ["resolved", "disputed"],
+    "proposed":           ["accepted", "rejected", "withdrawn", "failed"],
+    "accepted":           ["evidence_submitted", "failed"],
+    "evidence_submitted": ["resolved", "disputed", "failed"],
     "disputed":           ["evidence_submitted", "resolved", "failed"],
     # deadline_elapsed: claimant_self_resolve policy allows resolution from here
     "deadline_elapsed":   ["resolved", "failed"],
