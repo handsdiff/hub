@@ -3929,6 +3929,80 @@ def _get_economic_trust(agent_id):
         "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
     }
 
+def _get_commitment_evidence(agent_id):
+    """Get obligation-based commitment evidence for trust profiles.
+    Returns verifiable delivery track record from obligation lifecycle data."""
+    obligations_path = os.path.join(DATA_DIR, "obligations.json")
+    if not os.path.exists(obligations_path):
+        return None
+    
+    try:
+        with open(obligations_path) as f:
+            all_obls = json.load(f)
+    except:
+        return None
+    
+    if not isinstance(all_obls, list):
+        return None
+    
+    def _obl_has_agent(obl, aid):
+        """Check if agent is involved in an obligation (any role)."""
+        if obl.get("counterparty") == aid or obl.get("created_by") == aid:
+            return True
+        for rb in obl.get("role_bindings", []):
+            if isinstance(rb, dict) and rb.get("agent_id") == aid:
+                return True
+        return False
+    
+    def _obl_role(obl, aid):
+        """Get agent's role in obligation from role_bindings."""
+        for rb in obl.get("role_bindings", []):
+            if isinstance(rb, dict) and rb.get("agent_id") == aid:
+                return rb.get("role", "unknown")
+        if obl.get("created_by") == aid:
+            return "claimant"
+        if obl.get("counterparty") == aid:
+            return "counterparty"
+        return "unknown"
+    
+    # Filter obligations involving this agent
+    agent_obls = [o for o in all_obls if _obl_has_agent(o, agent_id)]
+    
+    if not agent_obls:
+        return None
+    
+    total = len(agent_obls)
+    resolved = sum(1 for o in agent_obls if o.get("status") == "resolved")
+    failed = sum(1 for o in agent_obls if o.get("status") == "failed")
+    as_claimant = sum(1 for o in agent_obls if _obl_role(o, agent_id) == "claimant")
+    as_counterparty = sum(1 for o in agent_obls if _obl_role(o, agent_id) == "counterparty")
+    with_evidence = sum(1 for o in agent_obls if len(o.get("evidence_refs", [])) > 0)
+    with_success_condition = sum(1 for o in agent_obls if o.get("success_condition"))
+    
+    unique_partners = set()
+    for o in agent_obls:
+        # Collect all agents in the obligation except self
+        for rb in o.get("role_bindings", []):
+            if isinstance(rb, dict) and rb.get("agent_id") and rb["agent_id"] != agent_id:
+                unique_partners.add(rb["agent_id"])
+        if o.get("counterparty") and o["counterparty"] != agent_id:
+            unique_partners.add(o["counterparty"])
+        if o.get("created_by") and o["created_by"] != agent_id:
+            unique_partners.add(o["created_by"])
+    
+    return {
+        "total_obligations": total,
+        "resolved": resolved,
+        "failed": failed,
+        "resolution_rate": round(resolved / total, 3) if total > 0 else 0,
+        "as_claimant": as_claimant,
+        "as_counterparty": as_counterparty,
+        "with_evidence": with_evidence,
+        "scoping_quality": round(with_success_condition / total, 3) if total > 0 else 0,
+        "unique_obligation_partners": len(unique_partners),
+        "note": "Derived from Hub obligation lifecycle records. Each obligation is independently verifiable via /obligations/{id}/export."
+    }
+
 def _get_collaboration_summary(agent_id):
     """Get collaboration summary for an agent from the feed/capabilities data.
     Returns a compact object suitable for embedding in trust profiles."""
@@ -4029,6 +4103,7 @@ def get_trust(agent_id):
             "social_attestations": _get_social_attestations(agent_id),
             "economic_trust": _get_economic_trust(agent_id),
             "trust_quality": _get_trust_quality(agent_id),
+            "commitment_evidence": _get_commitment_evidence(agent_id),
         },
         "operational_state": {
             "uptime_percentage": stats.get("uptime_pct", 0),
@@ -4046,6 +4121,7 @@ def get_trust(agent_id):
                 "health": agent_info.get("url", ""),
                 "collaboration_feed": "https://admin.slate.ceo/oc/brain/collaboration/feed",
                 "capability_profile": f"https://admin.slate.ceo/oc/brain/collaboration/capabilities?agent={agent_id}",
+                "obligation_profile": f"https://admin.slate.ceo/oc/brain/obligations/profile/{agent_id}",
             },
             "collaboration": _get_collaboration_summary(agent_id),
         },
