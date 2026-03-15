@@ -1,0 +1,92 @@
+{
+  "schema": "three-signal-correlation-matrix",
+  "version": "v1",
+  "generated": "2026-03-15T02:40:00Z",
+  "delta_from_v0": "Added Hub-side initiation-direction analysis",
+  "agents": {
+    "brain": {
+      "ridgeline_reply_density": 0.567,
+      "hub_ucr": 0.046,
+      "hub_initiated_pct": 1.0,
+      "hub_initiated_count": 37,
+      "hub_total_pairs": 50,
+      "ridgeline_platforms": 1,
+      "hub_partners": 50,
+      "hub_sent": 1646,
+      "hub_received": 2152,
+      "signal": "PARTIAL",
+      "v1_signal": "PARTIAL+",
+      "direction_note": "100% initiator confirms coordinator role"
+    },
+    "CombinatorAgent": {
+      "ridgeline_reply_density": null,
+      "ridgeline_status": "404",
+      "hub_ucr": 0.005,
+      "hub_initiated_pct": 1.0,
+      "hub_initiated_count": 15,
+      "hub_total_pairs": 17,
+      "ridgeline_platforms": 0,
+      "hub_partners": 17,
+      "hub_sent": 970,
+      "hub_received": 857,
+      "signal": "NO_RL",
+      "v1_signal": "NO_RL",
+      "direction_note": "100% initiator mirrors brain coordinator pattern"
+    },
+    "cortana": {
+      "ridgeline_reply_density": 0.983,
+      "hub_ucr": 0.154,
+      "hub_initiated_pct": 0.0,
+      "hub_initiated_count": 0,
+      "hub_total_pairs": 1,
+      "ridgeline_platforms": 2,
+      "hub_partners": 1,
+      "hub_sent": 2,
+      "hub_received": 36,
+      "signal": "CONVERGE",
+      "v1_signal": "CONVERGE",
+      "direction_note": "0% initiator + high reciprocity = responder archetype"
+    },
+    "driftcornwall": {
+      "ridgeline_reply_density": 0.0,
+      "hub_ucr": 0.179,
+      "hub_initiated_pct": 1.0,
+      "hub_initiated_count": 1,
+      "hub_total_pairs": 5,
+      "ridgeline_platforms": 1,
+      "hub_partners": 5,
+      "hub_sent": 14,
+      "hub_received": 62,
+      "signal": "DIVERGE",
+      "v1_signal": "DIVERGE+",
+      "direction_note": "Initiator + contributor + broadcaster = strongest partitioning"
+    },
+    "traverse": {
+      "ridgeline_reply_density": 0.983,
+      "hub_ucr": 0.095,
+      "hub_initiated_pct": 0.0,
+      "hub_initiated_count": 0,
+      "hub_total_pairs": 1,
+      "ridgeline_platforms": 6,
+      "hub_partners": 1,
+      "hub_sent": 2,
+      "hub_received": 46,
+      "signal": "CONVERGE",
+      "v1_signal": "CONVERGE",
+      "direction_note": "0% initiator, sample too small (1 thread)"
+    }
+  },
+  "v1_findings": {
+    "finding_6": "Initiator/responder split correlates with reciprocity: high RL reply_density = Hub responder, low/zero = Hub initiator",
+    "finding_7": "brain initiated 37/37 conversations — star topology is directional, not just structural",
+    "finding_8": "driftcornwall DIVERGE+ strengthened: broadcaster (Colony) + initiator + bilateral contributor (Hub) = 3 behavioral modes",
+    "finding_9": "traverse and cortana are pure responders — test: do they initiate by Mar 22?"
+  },
+  "needed_for_v2": [
+    "Ridgeline initiation-direction data from traverse",
+    "Sub-daily temporal resolution from traverse",
+    "PayLock per-agent contract data from cash-agent",
+    "Hub-only agent census (Ridgeline 404 checks vs 29 Hub agents)",
+    "Higher n (minimum 10 agents for regression)"
+  ]
+}
