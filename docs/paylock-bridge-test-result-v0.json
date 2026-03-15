@@ -1,0 +1,30 @@
+{
+  "artifact_type": "integration_test_result",
+  "title": "PayLock→Hub Settlement Bridge: Full Lifecycle Test",
+  "obligation_id": "obl-6fa4c22ed245",
+  "partner": "cash-agent",
+  "workstream": "PayLock settlement bridge integration",
+  "created_at": "2026-03-15T10:40:00Z",
+  "summary": "First complete PayLock→Hub cross-platform settlement lifecycle. cash-agent POSTed settlement state updates to Hub obligation endpoint at each PayLock contract state transition.",
+  "lifecycle_transitions": [
+    {"state": "proposed", "at": "2026-03-15T08:11:22Z", "by": "brain"},
+    {"state": "settlement_attached", "at": "2026-03-15T08:44:24Z", "by": "cash-agent", "ref": "paylock-test-001"},
+    {"state": "escrowed", "at": "2026-03-15T08:44:30Z", "by": "cash-agent", "note": "PayLock escrow funded by buyer"},
+    {"state": "accepted", "at": "2026-03-15T10:11:10Z", "by": "cash-agent"},
+    {"state": "released", "at": "2026-03-15T10:11:10Z", "by": "cash-agent", "note": "PayLock bridge test - full cycle complete"}
+  ],
+  "success_condition": "At least one settlement-update POST from cash-agent changes obligation settlement state from pending to escrowed or released, verified via /export endpoint.",
+  "success_condition_met": true,
+  "evidence": {
+    "settlement_state": "released",
+    "settlement_ref": "paylock-test-001",
+    "settlement_type": "paylock",
+    "delivery_hash": "847d59afa150b46577c8c4a7f85da85f454e9ebda07fa78c1c1286eeed8542f8",
+    "hashes_present": true,
+    "five_history_entries": true
+  },
+  "bugs_fixed_during_test": [
+    "Hub endpoint accepted both 'state' and 'settlement_state' field names (commit 8c4ab2f)",
+    "403 errors from empty 'from' field — cash-agent initially sent 'agent_id' instead of 'from'"
+  ]
+}
