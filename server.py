@@ -8831,6 +8831,61 @@ def get_obligation(obl_id):
     return jsonify({"obligation": obl})
 
 
+def _sign_obligation_export(export_data):
+    """Sign an obligation export with Hub's Ed25519 private key.
+    Returns signature dict with base64 signature and public key, or None."""
+    import base64, copy
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+    except ImportError:
+        return None
+
+    key_path = os.path.join(os.path.dirname(DATA_DIR), "credentials", "hub_signing_key.pem")
+    if not os.path.exists(key_path):
+        return None
+
+    with open(key_path, "rb") as f:
+        private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+    # Create canonical signing payload: obligation data without _export_meta
+    sign_copy = copy.deepcopy(export_data)
+    sign_copy.pop("_export_meta", None)
+    canonical = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
+
+    signature = private_key.sign(canonical.encode("utf-8"))
+    public_key = private_key.public_key()
+    public_raw = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+
+    return {
+        "algorithm": "Ed25519",
+        "signature": base64.b64encode(signature).decode(),
+        "public_key": base64.b64encode(public_raw).decode(),
+        "signed_fields": "all obligation fields (excluding _export_meta)",
+        "verification": "Canonicalize obligation JSON (sort_keys, no spaces), verify Ed25519 signature against public_key.",
+        "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+    }
+
+
+@app.route("/hub/signing-key", methods=["GET"])
+def get_signing_key():
+    """Public endpoint to retrieve Hub's Ed25519 signing public key."""
+    pubkey_path = os.path.join(os.path.dirname(DATA_DIR), "credentials", "hub_signing_pubkey_b64.txt")
+    if not os.path.exists(pubkey_path):
+        return jsonify({"error": "signing key not configured"}), 404
+    with open(pubkey_path) as f:
+        pubkey_b64 = f.read().strip()
+    return jsonify({
+        "algorithm": "Ed25519",
+        "public_key": pubkey_b64,
+        "format": "raw Ed25519 public key, base64 encoded",
+        "usage": "Verify obligation export signatures. Canonicalize obligation JSON (sort_keys, compact separators), verify Ed25519 signature.",
+    })
+
+
 @app.route("/obligations/<obl_id>/export", methods=["GET"])
 def export_obligation(obl_id):
     """Export obligation record for third-party review. No auth required.
@@ -8865,11 +8920,20 @@ def export_obligation(obl_id):
         export.pop("resolved_at", None)
         export.pop("resolved_by", None)
 
+    exported_at = datetime.utcnow().isoformat() + "Z"
     export["_export_meta"] = {
-        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "exported_at": exported_at,
         "strip": strip or "none",
-        "note": "Public obligation record. No auth required for read access."
+        "note": "Public obligation record. No auth required for read access.",
     }
+
+    # Sign the export with Hub's Ed25519 key for independent verification
+    try:
+        sig_data = _sign_obligation_export(export)
+        if sig_data:
+            export["_export_meta"]["signature"] = sig_data
+    except Exception:
+        pass  # Signing is best-effort; export still works unsigned
 
     return jsonify({"obligation": export})
 
