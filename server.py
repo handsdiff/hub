@@ -9670,6 +9670,46 @@ def settle_obligation(obl_id):
 
     save_obligations(obls)
 
+    # --- Notify counterparty that settlement was attached ---
+    try:
+        parties = [p.get("agent_id") for p in obl.get("parties", [])]
+        counterparties = [p for p in parties if p and p != agent_id]
+        agents_data = load_agents()
+        for cp in counterparties:
+            notify_msg = (
+                f"🔗 Settlement attached to obligation {obl_id} by {agent_id}.\n"
+                f"Type: {settlement_type} | Ref: {settlement_ref} | State: {data.get('settlement_state', 'pending')}\n"
+                f"View: GET /obligations/{obl_id}"
+            )
+            dm_payload = {
+                "from": "hub-system",
+                "to": cp,
+                "message": notify_msg,
+                "type": "settlement_attached",
+                "obligation_id": obl_id,
+                "timestamp": settlement_info["attached_at"],
+            }
+            cp_agent = agents_data.get(cp) if isinstance(agents_data, dict) else None
+            if cp_agent and cp_agent.get("callback_url"):
+                try:
+                    import requests as _req
+                    _req.post(cp_agent["callback_url"], json=dm_payload, timeout=5)
+                except Exception:
+                    pass
+            inbox_dir = os.path.join(DATA_DIR, "messages")
+            os.makedirs(inbox_dir, exist_ok=True)
+            inbox_path = os.path.join(inbox_dir, f"{cp}.json")
+            try:
+                cp_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
+            except:
+                cp_msgs = []
+            cp_msgs.append(dm_payload)
+            with open(inbox_path, "w") as f:
+                json.dump(cp_msgs, f)
+            print(f"[SETTLEMENT-WEBHOOK] Notified {cp} of settlement attachment on {obl_id}")
+    except Exception as e:
+        print(f"[SETTLEMENT-WEBHOOK] Attachment notification error: {e}")
+
     return jsonify({
         "obligation_id": obl_id,
         "settlement": settlement_info,
@@ -9741,10 +9781,61 @@ def update_obligation_settlement(obl_id):
 
     save_obligations(obls)
 
+    # --- Settlement webhook: notify counterparty via DM ---
+    try:
+        parties = [p.get("agent_id") for p in obl.get("parties", [])]
+        counterparties = [p for p in parties if p and p != agent_id]
+        agents_data = load_agents()
+        admin_sec = os.environ.get("HUB_ADMIN_SECRET", "")
+        for cp in counterparties:
+            notify_msg = (
+                f"⚡ Settlement update on obligation {obl_id}: "
+                f"{prev_state} → {new_state or prev_state}"
+            )
+            if data.get("note"):
+                notify_msg += f"\nNote: {data['note']}"
+            if data.get("settlement_receipt"):
+                notify_msg += f"\nReceipt: {data['settlement_receipt']}"
+            notify_msg += f"\nUpdated by: {agent_id}"
+            # Deliver as DM
+            dm_payload = {
+                "from": "hub-system",
+                "to": cp,
+                "message": notify_msg,
+                "type": "settlement_webhook",
+                "obligation_id": obl_id,
+                "settlement_state": new_state or prev_state,
+                "timestamp": obl["settlement"]["last_updated_at"],
+            }
+            # Try callback_url if agent has one
+            cp_agent = agents_data.get(cp) if isinstance(agents_data, dict) else None
+            if cp_agent and cp_agent.get("callback_url"):
+                try:
+                    import requests as _req
+                    _req.post(cp_agent["callback_url"], json=dm_payload, timeout=5)
+                    print(f"[SETTLEMENT-WEBHOOK] Notified {cp} via callback")
+                except Exception as e:
+                    print(f"[SETTLEMENT-WEBHOOK] Callback to {cp} failed: {e}")
+            # Also store in their inbox
+            inbox_dir = os.path.join(DATA_DIR, "messages")
+            os.makedirs(inbox_dir, exist_ok=True)
+            inbox_path = os.path.join(inbox_dir, f"{cp}.json")
+            try:
+                cp_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
+            except:
+                cp_msgs = []
+            cp_msgs.append(dm_payload)
+            with open(inbox_path, "w") as f:
+                json.dump(cp_msgs, f)
+            print(f"[SETTLEMENT-WEBHOOK] Notified {cp} via inbox DM")
+    except Exception as e:
+        print(f"[SETTLEMENT-WEBHOOK] Notification error: {e}")
+
     return jsonify({
         "obligation_id": obl_id,
         "settlement": obl["settlement"],
         "status": obl.get("status"),
+        "settlement_webhook_sent": True,
         "message": f"settlement state updated: {prev_state} → {new_state or prev_state}"
     })
 
