@@ -5230,6 +5230,130 @@ def list_trust_signals():
     })
 
 
+@app.route("/trust/<agent_id>/signals", methods=["GET"])
+def trust_signals(agent_id):
+    """Compute MVA Behavioral Trust Spec v1.5 signals for an agent.
+
+    Returns the four Hub-native trust signals:
+    - delivery_rate (weight 0.35): obligations delivered / obligations accepted
+    - settlement_rate (weight 0.30): obligations settled on-chain / obligations resolved
+    - ewma_trajectory (weight 0.20): current EWMA vs T=0 baseline (ratio change)
+    - role_fit_trust (weight 0.15): role resolution rate × timeliness × attestation depth
+
+    Only obligations where agent_id is a party are included.
+    Self-proposed obligations (where agent_id == created_by) are excluded from delivery_rate.
+    Window: last 30 days by default.
+    """
+    window_days = int(request.args.get("window_days", 30))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+
+    obls = load_obligations()
+
+    # Filter: agent is a party, created after cutoff
+    agent_lower = agent_id.lower()
+    agent_obls = [
+        o for o in obls
+        if agent_lower in [p.get("agent_id", "").lower() for p in o.get("parties", [])]
+        and o.get("created_at", "") >= cutoff_iso
+    ]
+
+    # delivery_rate: accepted obligations / proposed obligations (excluding self-proposed)
+    proposed = [o for o in agent_obls if o.get("created_by", "").lower() != agent_lower]
+    accepted = [o for o in proposed if o.get("status") not in ("proposed", "rejected", "withdrawn")]
+    delivery_denom = len(accepted)
+    delivery_num = len([o for o in accepted if o.get("status") == "resolved"])
+    delivery_rate = delivery_num / delivery_denom if delivery_denom > 0 else 0.0
+
+    # settlement_rate: obligations settled on-chain / resolved
+    resolved = [o for o in agent_obls if o.get("status") == "resolved"]
+    settled = [o for o in resolved if o.get("evidence_archive")]
+    settlement_rate = len(settled) / len(resolved) if resolved else 0.0
+
+    # ewma_trajectory: baseline from agent metadata, current from obligation outcomes
+    agents_data = load_agents()
+    agent_data = agents_data.get(agent_id, {})
+    baseline_ewma = agent_data.get("ewma_baseline", 0.0)
+    if accepted:
+        weights = [0.9 ** i for i in range(len(accepted) - 1, -1, -1)]
+        ewma_vals = [1.0 if o.get("status") == "resolved" else 0.5 for o in reversed(accepted)]
+        current_ewma = sum(w * v for w, v in zip(weights, ewma_vals)) / sum(weights) if weights else 0.0
+    else:
+        current_ewma = 0.0
+    ewma_trajectory = (current_ewma - baseline_ewma) / baseline_ewma if baseline_ewma > 0 else 0.0
+
+    # role_fit_trust: per-role resolution rate × timeliness × attestation depth
+    role_counts = defaultdict(lambda: {"resolved": 0, "total": 0, "timely": 0, "attested": 0})
+    for o in agent_obls:
+        roles = [rb.get("role", "unknown") for rb in o.get("role_bindings", [])
+                 if rb.get("agent_id", "").lower() == agent_lower]
+        if not roles:
+            roles = ["unknown"]
+        for role in roles:
+            role_counts[role]["total"] += 1
+            if o.get("status") == "resolved":
+                role_counts[role]["resolved"] += 1
+            if o.get("deadline_utc") and o.get("status") == "resolved":
+                role_counts[role]["timely"] += 1  # simplified: resolved obligations count as timely
+            if o.get("evidence_refs"):
+                role_counts[role]["attested"] += 1
+
+    role_fit = {}
+    for role, counts in role_counts.items():
+        n = counts["total"]
+        if n == 0:
+            continue
+        res_rate = counts["resolved"] / n
+        timely_rate = counts["timely"] / n
+        attest_rate = counts["attested"] / n
+        raw_wts = 0.5 * res_rate + 0.3 * timely_rate + 0.2 * attest_rate
+        confidence = 1.0 if n >= 6 else (0.5 if n >= 3 else 0.0)
+        role_fit[role] = {
+            "value": round(raw_wts * confidence, 3),
+            "role_resolution_rate": round(res_rate, 3),
+            "role_timeliness": round(timely_rate, 3),
+            "attestation_depth": round(attest_rate, 3),
+            "confidence_level": "full" if confidence == 1.0 else ("low" if confidence == 0.5 else "insufficient"),
+            "n": n,
+        }
+
+    # Weighted TrustScore per MVA v1.5
+    role_score = max([r["value"] for r in role_fit.values()], default=0.0)
+    trust_score = round(
+        0.35 * delivery_rate + 0.30 * settlement_rate
+        + 0.20 * ewma_trajectory + 0.15 * role_score,
+        3,
+    )
+
+    return jsonify({
+        "agent_id": agent_id,
+        "trust_score": trust_score,
+        "spec_version": "mva-behavioral-trust-v1.5",
+        "window_days": window_days,
+        "signals": {
+            "delivery_rate": {
+                "value": round(delivery_rate, 3),
+                "delivered": delivery_num,
+                "accepted": delivery_denom,
+                "window_days": window_days,
+            },
+            "settlement_rate": {
+                "value": round(settlement_rate, 3),
+                "settled": len(settled),
+                "resolved": len(resolved),
+                "window_days": window_days,
+            },
+            "ewma_trajectory": {
+                "value": round(ewma_trajectory, 3),
+                "current_ewma": round(current_ewma, 4),
+                "baseline_ewma": round(baseline_ewma, 4),
+                "note": "baseline_ewma=0 means T=0 not captured yet",
+            },
+            "role_fit_trust": role_fit,
+        },
+    })
+
+
 @app.route("/trust/capabilities", methods=["GET"])
 def list_capabilities():
     """Derive agent capabilities from obligation history.
