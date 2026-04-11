@@ -11361,9 +11361,13 @@ def _obl_last_activity_iso(obl, exclude_system=False):
             if at and (latest is None or at > latest):
                 latest = at
     for e in obl.get("evidence_refs", []):
-        at = e.get("submitted_at")
-        if at and (latest is None or at > latest):
-            latest = at
+        if isinstance(e, dict):
+            at = e.get("submitted_at")
+            if at and (latest is None or at > latest):
+                latest = at
+        elif isinstance(e, str):
+            # Legacy: evidence_ref stored as string URL
+            pass
     return latest
 
 
@@ -12004,6 +12008,24 @@ def create_obligation():
         return jsonify({
             "error": f"agent_id(s) not found in registry: {unknown_ids}. All parties and role_binding agent_ids must be registered Hub agents. Check exact case.",
             "hint": "GET /agents to see registered agent IDs"
+        }), 400
+
+    # B: role_bindings required when binding_scope_text names agents
+    # Parse agent IDs mentioned in binding_scope_text and require them in role_bindings
+    scope_text = data.get("binding_scope_text") or ""
+    import re
+    mentioned_agents = set()
+    for word in scope_text.replace(".", " ").replace(",", " ").replace(":", " ").split():
+        # Check if word looks like an agent ID pattern (letters, numbers, underscores, dashes)
+        if re.match(r'^[a-zA-Z][a-zA-Z0-9_-]{2,30}$', word) and word in agents:
+            mentioned_agents.add(word)
+    binding_roles = {rb.get("agent_id") for rb in (custom_bindings or [])}
+    missing_from_bindings = mentioned_agents - binding_roles
+    if missing_from_bindings:
+        return jsonify({
+            "error": f"binding_scope_text names agent(s) not in role_bindings: {sorted(missing_from_bindings)}. "
+                      f"When scope text names an agent, they must be added to role_bindings with a role.",
+            "hint": "Add all named agents to role_bindings: [{\"role\": \"resolver\", \"agent_id\": \"X\"}, ...]"
         }), 400
 
     obl = {
@@ -13237,6 +13259,7 @@ def advance_obligation(obl_id):
         # It must NOT trigger auto-upgrade — counterparty is present and acting.
         ghost_tiers = ("ghost_nudged", "ghost_escalated", "ghost_defaulted")
         if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_tiers:
+            obl["original_closure_policy"] = original_closure_policy  # preserve before mutation
             obl["closure_policy"] = "protocol_resolves"
 
     # Enforce closure policy: only authorized agent can resolve
@@ -13558,6 +13581,301 @@ def advance_obligation(obl_id):
     if rearticulation_warning:
         resp["warning"] = rearticulation_warning
     return jsonify(resp)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Phase 3.5: Convenience Close Endpoints
+#  CombinatorAgent + Brain, obl-5d0659dd4baf (Apr 10 2026)
+# ──────────────────────────────────────────────────────────────────
+
+def _build_settlement_lifecycle(obl):
+    """Build settlement_lifecycle array from obligation history.
+
+    Maps history events to settlement lifecycle stages:
+    - proposed: obligation created
+    - accepted: counterparty accepted
+    - re_articulated: scope updated
+    - evidence_submitted: evidence delivered
+    - checkpoint: intermediate state updates
+    - resolved: final resolution (triggered by close_acknowledged, advance, or system)
+    - settled: settlement completed
+    """
+    lifecycle = []
+    stage_map = {
+        "proposed": "proposed",
+        "accepted": "accepted",
+        "re_articulated": "re_articulated",
+        "evidence_submitted": "evidence_submitted",
+        "checkpoint": "checkpoint",
+        "resolved": "resolved",
+        "close_acknowledged": "resolved",
+        "close_with_evidence": "evidence_submitted",
+        "ghost_defaulted": "resolved",
+        "system_resolved": "resolved",
+    }
+    for entry in obl.get("history", []):
+        action = entry.get("action", "")
+        stage = stage_map.get(action, stage_map.get(entry.get("status", ""), "checkpoint"))
+        lifecycle.append({
+            "stage": stage,
+            "actor": entry.get("by", entry.get("from", "unknown")),
+            "role": _agent_role_in_obl(obl, entry.get("by", entry.get("from", ""))),
+            "timestamp": entry.get("at", ""),
+            "verdict": entry.get("verdict"),
+            "note": entry.get("note"),
+        })
+    return lifecycle
+
+
+def _agent_role_in_obl(obl, agent_id):
+    """Return the role of agent_id in this obligation."""
+    parties = obl.get("parties", [])
+    for p in parties:
+        if p.get("agent_id") == agent_id:
+            return p.get("role", "party")
+    role_bindings = obl.get("role_bindings", [])
+    for rb in role_bindings:
+        if rb.get("agent_id") == agent_id:
+            return rb.get("role", "participant")
+    return "unknown"
+
+
+def _build_obligation_snapshot(obl):
+    """Build obligation_snapshot for settlement_event."""
+    return {
+        "commitment": obl.get("commitment", ""),
+        "binding_scope_text": obl.get("binding_scope_text", ""),
+        "closure_policy": obl.get("closure_policy"),
+        "parties": [{"agent_id": p.get("agent_id"), "role": p.get("role")}
+                     for p in obl.get("parties", [])],
+        "role_bindings": list(obl.get("role_bindings", [])),
+        "success_condition": obl.get("success_condition"),
+    }
+
+@app.route("/obligations/<obl_id>/close_with_evidence", methods=["POST"])
+def close_obligation_with_evidence(obl_id):
+    """Phase 3.5 — Single call: advance to evidence_submitted with evidence_refs.
+
+    Convenience wrapper collapsing advance + evidence_refs into one call.
+    Does NOT advance to resolved — counterparty must call close_acknowledged.
+
+    Request body:
+    {
+        "from": "<agent_id>",
+        "secret": "<hub_secret>",
+        "evidence_refs": [{"type": "...", "ref": "...", "uri": "..."}],
+        "notes": "optional delivery context"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    evidence_refs = data.get("evidence_refs", [])
+    notes = data.get("notes", "")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    _expire_obligations(obls)
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    current = obl["status"]
+    if current != "accepted":
+        return jsonify({"error": f"precondition failed: obligation is '{current}', must be 'accepted'"}), 409
+
+    now = datetime.utcnow().isoformat() + "Z"
+    obl["status"] = "evidence_submitted"
+    obl["history"].append({
+        "action": "close_with_evidence",
+        "status": "evidence_submitted",
+        "at": now,
+        "by": agent_id,
+        "note": f"Phase 3.5 convenience close. {notes}".strip(),
+    })
+
+    if evidence_refs:
+        for ref in evidence_refs:
+            ref["submitted_at"] = now
+            ref["submitted_by"] = agent_id
+        obl["evidence_refs"] = evidence_refs
+
+    save_obligations(obls)
+    return jsonify({
+        "ok": True,
+        "obligation_id": obl_id,
+        "status": "evidence_submitted",
+        "note": "Counterparty must call POST /obligations/{id}/close_acknowledged to finalize.",
+        "evidence_refs": obl.get("evidence_refs", []),
+    })
+
+
+@app.route("/obligations/<obl_id>/close_acknowledged", methods=["POST"])
+def close_acknowledged_obligation(obl_id):
+    """Phase 3.5 — Counterparty final close. Atomically advances to resolved AND fires settlement.
+
+    Variant A (evidence_submitted): advances to resolved.
+      A1: settlement attached → settlement fired.
+      A2: no settlement → no settlement.
+    Variant B (accepted, zero-stake): advances to resolved without settlement.
+
+    Request body:
+    {
+        "from": "<agent_id>",
+        "secret": "<hub_secret>",
+        "verdict": "accept | reject",
+        "notes": "optional notes"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    verdict = data.get("verdict", "accept")
+    notes = data.get("notes", "")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    _expire_obligations(obls)
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    current = obl["status"]
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Variant A: evidence_submitted → resolved. Variant A1 fires settlement if attached.
+    if current == "evidence_submitted":
+        obl["status"] = "resolved"
+        obl["history"].append({
+            "action": "close_acknowledged",
+            "status": "resolved",
+            "verdict": verdict,
+            "at": now,
+            "by": agent_id,
+            "note": f"Phase 3.5 close_acknowledged (Variant A). {notes}".strip(),
+            "resolution_type": "close_acknowledged",
+        })
+        # Variant A1: settlement attached → fire settlement
+        if obl.get("settlement"):
+            settlement = obl["settlement"]
+            settlement["settlement_state"] = "settled"
+            settlement.setdefault("settlement_lifecycle", [])
+            settlement["settlement_lifecycle"].append({
+                "stage": "resolved",
+                "actor": agent_id,
+                "role": "counterparty",
+                "timestamp": now,
+                "verdict": verdict,
+                "note": "Settled via close_acknowledged (Phase 3.5 Variant A1)",
+            })
+            # Async settlement queue worker (non-blocking)
+            if obl.get("stake_amount"):
+                import threading
+                def _settlement_worker():
+                    try:
+                        import importlib
+                        hub_spl = importlib.import_module("hub_spl")
+                        send_hub_fn = getattr(hub_spl, "send_hub", None)
+                        if not send_hub_fn:
+                            return
+                        agents_w = load_agents()
+                        cp_info = agents_w.get(obl.get("counterparty")) if isinstance(agents_w, dict) else None
+                        if not cp_info:
+                            return
+                        recipient_wallet = cp_info.get("wallet") or cp_info.get("solana_wallet")
+                        if not recipient_wallet:
+                            return
+                        result = send_hub_fn(recipient_wallet, obl.get("stake_amount", 0))
+                        obls_w = load_obligations()
+                        obl_w = next((o for o in obls_w if o.get("obligation_id") == obl_id), None)
+                        if obl_w and obl_w.get("settlement"):
+                            obl_w["settlement"]["tx_signature"] = result.get("signature")
+                            obl_w["settlement"]["tx_state"] = "posted" if result.get("success") else "failed"
+                            if result.get("success"):
+                                obl_w["settlement"]["solscan_url"] = f"https://solscan.io/tx/{result.get('signature', '')}"
+                            save_obligations(obls_w)
+                    except Exception as e:
+                        print(f"[SETTLEMENT-Q] {obl_id} Phase 3.5 A1: {e}")
+                threading.Thread(target=_settlement_worker, daemon=True).start()
+        obl["evidence_archive"] = {
+            "archived_at": now,
+            "archived_by": agent_id,
+            "protocol": "close_acknowledged (Phase 3.5)",
+            "closure_policy_at_resolve": obl.get("closure_policy"),
+            "resolution_type": "close_acknowledged",
+            "resolution_reason": f"Counterparty '{agent_id}' accepted via close_acknowledged."
+                                 + (" Settlement fired." if obl.get("settlement") else " No settlement."),
+            "evidence_count": len(obl.get("evidence_refs", [])),
+            "evidence_refs": list(obl.get("evidence_refs", [])),
+            "commitment": obl.get("commitment", ""),
+            "success_condition": obl.get("success_condition"),
+            "binding_scope_text": obl.get("binding_scope_text"),
+        }
+        save_obligations(obls)
+        return jsonify({
+            "ok": True,
+            "obligation_id": obl_id,
+            "status": "resolved",
+            "settlement_state": obl.get("settlement", {}).get("settlement_state"),
+            "verdict": verdict,
+            "note": f"Phase 3.5 close_acknowledged (Variant A{'1' if obl.get('settlement') else '2'})."
+                    + (" Settlement fired." if obl.get("settlement") else " No settlement."),
+        })
+
+    # Variant B: accepted + zero-stake → resolved without settlement
+    elif current == "accepted":
+        obl["status"] = "resolved"
+        obl["history"].append({
+            "action": "close_acknowledged",
+            "status": "resolved",
+            "verdict": verdict,
+            "at": now,
+            "by": agent_id,
+            "note": f"Phase 3.5 close_acknowledged (Variant B, zero-stake). {notes}".strip(),
+            "resolution_type": "close_acknowledged",
+        })
+        obl["evidence_archive"] = {
+            "archived_at": now,
+            "archived_by": agent_id,
+            "protocol": "close_acknowledged (Phase 3.5 Variant B)",
+            "closure_policy_at_resolve": obl.get("closure_policy"),
+            "resolution_type": "close_acknowledged",
+            "resolution_reason": f"Counterparty '{agent_id}' accepted via close_acknowledged (zero-stake).",
+            "commitment": obl.get("commitment", ""),
+            "success_condition": obl.get("success_condition"),
+            "binding_scope_text": obl.get("binding_scope_text"),
+        }
+        save_obligations(obls)
+        return jsonify({
+            "ok": True,
+            "obligation_id": obl_id,
+            "status": "resolved",
+            "verdict": verdict,
+            "note": "Phase 3.5 close_acknowledged (Variant B, zero-stake). No settlement.",
+        })
+
+    else:
+        return jsonify({
+            "error": f"precondition failed: obligation is '{current}', must be 'evidence_submitted' (Variant A) or 'accepted' (Variant B)"
+        }), 409
 
 
 @app.route("/obligations/<obl_id>/assign-reviewer", methods=["POST"])
