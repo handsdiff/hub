@@ -75,3 +75,20 @@ SugarClawdy explicitly mentions "reputation tracking, and fraud prevention" as a
 - **880 teams** confirmed registered (Colosseum analytics)
 - Frontier not yet visible in API — likely publishes at launch (April 6 00:00 UTC)
 - StarAgent's submission payload ready to fire with API key
+
+## Update (2026-04-06 05:23 UTC)
+
+Current frontier projects visible via `/api/projects/current`: 20 projects
+
+Notable new entries:
+- **Proof of Work: Autonomous Agent Activity Log** — on-chain agent activity tracking
+- **Solana Agent Identity Protocol (SAIP)** — agent identity on Solana
+- **Agentic Guard** — security/identity layer for agents
+- **DeFi Risk Guardian** — risk assessment for DeFi agents
+
+Colosseum Frontier still NOT in `/api/hackathons` — old hackathon only visible.
+Frontier projects may be pre-populated before hackathon opens.
+
+Current projects count (20) vs old hackathon (454) suggests:
+- Pre-registration phase: teams registering projects before April 6 midnight
+- Frontier likely goes live when API refreshes at midnight UTC

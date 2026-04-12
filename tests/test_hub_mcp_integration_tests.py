@@ -38,6 +38,9 @@ BASE_URL = os.environ.get("HUB_BASE_URL", "http://localhost:8080")
 MCP_URL = os.environ.get("MCP_URL", "http://localhost:8090")
 AGENT_ID = os.environ.get("HUB_AGENT_ID", "brain")
 AGENT_SECRET = os.environ.get("HUB_SECRET", "")
+# Counterparty for two-agent fixtures (e.g. confirm/reject tests where roles must be distinct)
+COUNTERPARTY_ID = os.environ.get("HUB_COUNTERPARTY_ID", "StarAgent" if AGENT_ID == "brain" else "brain")
+COUNTERPARTY_SECRET = os.environ.get("HUB_COUNTERPARTY_SECRET", "")
 
 
 # ── MCP tool caller ───────────────────────────────────────────────────────────
@@ -166,6 +169,71 @@ async def accepted_obligation(test_obligation):
         return test_obligation
 
 
+@pytest_asyncio.fixture
+async def counterparty_accepted_obl(hub_health):
+    """Create an obligation where AGENT_ID proposes and COUNTERPARTY accepts.
+
+    Use this fixture when testing confirm/reject — the two-agent setup means
+    the counterparty can legitimately confirm checkpoints (no 403 self-confirm).
+
+    Requires HUB_COUNTERPARTY_ID and HUB_COUNTERPARTY_SECRET env vars.
+    """
+    if not COUNTERPARTY_SECRET:
+        pytest.skip("HUB_COUNTERPARTY_SECRET not set")
+
+    obl_id = f"obl-test-cp-{uuid.uuid4().hex[:12]}"
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # AGENT_ID proposes, COUNTERPARTY is counterparty
+        r = await client.post(
+            f"{BASE_URL}/obligations",
+            json={
+                "from": AGENT_ID,
+                "secret": AGENT_SECRET,
+                "counterparty": COUNTERPARTY_ID,
+                "commitment": f"[TEST] Counterparty fixture — {obl_id}",
+                "deadline_utc": deadline,
+                "closure_policy": "counterparty_accepts",
+            },
+            headers={"Content-Type": "application/json"},
+        )
+        r.raise_for_status()
+        created_id = r.json().get("obligation", r.json()).get("obligation_id")
+        assert created_id
+
+        # COUNTERPARTY accepts (not AGENT_ID — roles must be distinct)
+        r = await client.post(
+            f"{BASE_URL}/obligations/{created_id}/advance",
+            json={
+                "from": COUNTERPARTY_ID,
+                "secret": COUNTERPARTY_SECRET,
+                "status": "accepted",
+                "binding_scope_text": f"Obligation {created_id} — accepted by counterparty for confirm/reject tests",
+            },
+            headers={"Content-Type": "application/json"},
+        )
+        r.raise_for_status()
+
+    yield created_id
+
+    # Teardown: AGENT_ID resolves (ghost protocol will also handle this)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            await client.post(
+                f"{BASE_URL}/obligations/{created_id}/advance",
+                json={
+                    "from": AGENT_ID,
+                    "secret": AGENT_SECRET,
+                    "status": "resolved",
+                    "binding_scope_text": "Test teardown",
+                },
+                headers={"Content-Type": "application/json"},
+            )
+    except Exception:
+        pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Layer 1: Direct httpx calls to Hub REST API
 # (verifies request shape + HTTP status)
@@ -199,65 +267,78 @@ class TestCheckpointREST:
             assert cp.get("status") == "proposed"
 
     @pytest.mark.asyncio
-    async def test_checkpoint_confirm_returns_confirmed_or_403(self, accepted_obligation):
-        """confirm → HTTP 200 (counterparty) or 403 (proposer can't self-confirm).
+    async def test_checkpoint_confirm_returns_200(self, counterparty_accepted_obl):
+        """confirm → HTTP 200. Uses counterparty_accepted_obl so proposer ≠ counterparty.
 
-        In this fixture StarAgent is both proposer and counterparty (same agent created
-        and accepted the obligation). Hub enforces: proposer cannot confirm their own
-        checkpoint → 403. Tests accept both outcomes to cover both scenarios.
+        AGENT_ID proposes the checkpoint; COUNTERPARTY confirms it.
+        Both roles are distinct, so confirm succeeds.
         """
+        obl_id = counterparty_accepted_obl
+
         async with httpx.AsyncClient(timeout=60.0) as client:
+            # AGENT_ID proposes
             r = await client.post(
-                f"{BASE_URL}/obligations/{accepted_obligation}/checkpoint",
+                f"{BASE_URL}/obligations/{obl_id}/checkpoint",
                 json={
                     "from": AGENT_ID, "secret": AGENT_SECRET,
                     "action": "propose", "summary": "Will confirm",
                 },
                 headers={"Content-Type": "application/json"},
             )
+            r.raise_for_status()
             cp_id = r.json().get("checkpoint", r.json()).get("checkpoint_id")
 
         async with httpx.AsyncClient(timeout=60.0) as client:
+            # COUNTERPARTY confirms — distinct from proposer → 200
             r = await client.post(
-                f"{BASE_URL}/obligations/{accepted_obligation}/checkpoint",
+                f"{BASE_URL}/obligations/{obl_id}/checkpoint",
                 json={
-                    "from": AGENT_ID, "secret": AGENT_SECRET,
+                    "from": COUNTERPARTY_ID, "secret": COUNTERPARTY_SECRET,
                     "action": "confirm", "checkpoint_id": cp_id,
                     "note": "Confirmed by REST layer test",
                 },
                 headers={"Content-Type": "application/json"},
             )
-            assert r.status_code in (200, 403), f"Expected 200 or 403, got {r.status_code}: {r.text}"
-            if r.status_code == 403:
-                assert "cannot confirm" in r.text
+            assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text}"
+            data = r.json()
+            cp = data.get("checkpoint", data)
+            assert cp.get("status") == "confirmed"
 
     @pytest.mark.asyncio
-    async def test_checkpoint_reject_returns_rejected_or_403(self, accepted_obligation):
-        """reject → HTTP 200 (counterparty) or 403 (proposer can't self-reject)."""
+    async def test_checkpoint_reject_returns_200(self, counterparty_accepted_obl):
+        """reject → HTTP 200. Uses counterparty_accepted_obl so proposer ≠ counterparty.
+
+        AGENT_ID proposes the checkpoint; COUNTERPARTY rejects it.
+        """
+        obl_id = counterparty_accepted_obl
+        reason = f"REST layer test rejection — {uuid.uuid4().hex[:8]}"
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(
-                f"{BASE_URL}/obligations/{accepted_obligation}/checkpoint",
+                f"{BASE_URL}/obligations/{obl_id}/checkpoint",
                 json={
                     "from": AGENT_ID, "secret": AGENT_SECRET,
                     "action": "propose", "summary": "Will reject",
                 },
                 headers={"Content-Type": "application/json"},
             )
+            r.raise_for_status()
             cp_id = r.json().get("checkpoint", r.json()).get("checkpoint_id")
 
-        reason = f"REST layer test rejection — {uuid.uuid4().hex[:8]}"
         async with httpx.AsyncClient(timeout=60.0) as client:
+            # COUNTERPARTY rejects — distinct from proposer → 200
             r = await client.post(
-                f"{BASE_URL}/obligations/{accepted_obligation}/checkpoint",
+                f"{BASE_URL}/obligations/{obl_id}/checkpoint",
                 json={
-                    "from": AGENT_ID, "secret": AGENT_SECRET,
+                    "from": COUNTERPARTY_ID, "secret": COUNTERPARTY_SECRET,
                     "action": "reject", "checkpoint_id": cp_id, "reason": reason,
                 },
                 headers={"Content-Type": "application/json"},
             )
-            assert r.status_code in (200, 403), f"Expected 200 or 403, got {r.status_code}: {r.text}"
-            if r.status_code == 403:
-                assert "cannot confirm" in r.text
+            assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text}"
+            data = r.json()
+            cp = data.get("checkpoint", data)
+            assert cp.get("status") == "rejected"
 
     @pytest.mark.asyncio
     async def test_checkpoint_confirm_requires_checkpoint_id(self, accepted_obligation):

@@ -147,6 +147,19 @@ restart_hub() {
     pkill -9 -f 'gunicorn.*server:app' 2>/dev/null || true
     sleep 1
 
+    # Wait for port 8080 to be free (up to 15s)
+    for i in $(seq 1 15); do
+        if ! ss -tlnp 2>/dev/null | grep -q ':8080 '; then
+            break
+        fi
+        if [ "$i" -eq 15 ]; then
+            log_line "Port 8080 still occupied after 15s — killing holder: $(ss -tlnp 2>/dev/null | grep ':8080 ')"
+            fuser -k 8080/tcp 2>/dev/null || true
+            sleep 2
+        fi
+        sleep 1
+    done
+
     cd "$HUB_DIR" || return 1
     export HUB_DATA_DIR="$HUB_DATA_DIR"
     export WORKSPACE_DIR="$WORKSPACE_DIR"
@@ -157,8 +170,17 @@ restart_hub() {
     pip3 install --break-system-packages -q gunicorn gevent flask flask-sock requests websocket-client >/dev/null 2>&1 || true
 
     nohup "$GUNICORN_BIN" "${GUNICORN_ARGS[@]}" >> /tmp/hub-gunicorn.log 2>&1 &
-    log_line "Gunicorn restarted (PID $!)"
-    sleep 10
+    log_line "Gunicorn started (PID $!), verifying..."
+    sleep 5
+
+    # Verify gunicorn actually started and is serving
+    local verify_code
+    verify_code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:8080/health 2>/dev/null || echo "000")"
+    if [ "$verify_code" = "200" ]; then
+        log_line "Restart verified — health returned 200."
+    else
+        log_line "Restart FAILED — health returned $verify_code. Port status: $(ss -tlnp 2>/dev/null | grep ':8080 ' || echo 'not listening')"
+    fi
 }
 
 while true; do
@@ -167,6 +189,11 @@ while true; do
     topology_status="$(probe_worker_topology || true)"
     ws_probe_unavailable=0
     if [[ "$ws_status" == missing_secret ]] || [[ "$ws_status" == missing_websocket_client:* ]]; then
+        ws_probe_unavailable=1
+    fi
+    # WS timeouts are non-fatal — gevent worker can be busy handling requests
+    # Only restart if HTTP is also failing
+    if [[ "$ws_status" == ws_error:WebSocketTimeoutException:* ]]; then
         ws_probe_unavailable=1
     fi
 

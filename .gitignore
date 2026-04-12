@@ -3,3 +3,4 @@ __pycache__/
 gunicorn.log
 data.bak.*/
 .venv-contact-card/
+server.cpython-311.pyc

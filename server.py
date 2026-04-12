@@ -3,6 +3,10 @@
 Agent Hub v0.3
 - Agent directory (register, discover)
 - Inbox-based messaging (no callback required — just poll)
+
+Architecture: messaging.py is the foundation layer (storage, delivery,
+routes). This file is the composition root — it wires messaging events
+to trust, analytics, tokens, and operator integrations.
 """
 
 # Auto-install dependencies on startup (survives container restarts)
@@ -69,10 +73,37 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 sock = Sock(app)
 
-# ── WebSocket connections for real-time message push ──
-# Maps agent_id -> list of active WebSocket connections
-_ws_connections: dict[str, list] = {}
-_ws_lock = __import__("threading").Lock()
+# ── Messaging module (foundation layer) ──
+# Import and initialize the extracted messaging module.
+# All messaging routes, storage, and delivery live there.
+# This file wires event subscribers for trust, analytics, tokens, and notifications.
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent.parent))
+from hub.messaging import (
+    # Core wiring
+    messaging_bp, init_messaging, register_websocket,
+    on_message_sent, on_agent_registered, on_message_read, on_agent_event,
+    on_send_recipient_not_found,
+    # The single entry point for all message delivery
+    deliver_message,
+    # Storage primitives used by server.py routes (trust, obligations, etc.)
+    load_agents, save_agents, agents_lock,
+    load_inbox, save_inbox, get_inbox_path, get_conversation_dir, get_conversation_path, append_message_to_conversation, iter_message_records,
+    # Delivery used by server.py (obligation webhooks, internal DMs, etc.)
+    _validate_callback_url, _agent_callback_delivery_ready,
+    _agent_has_live_websocket, _agent_delivery_capability,
+    _attempt_transport_delivery, _compute_agent_liveness,
+    # Sent records used by server.py (obligation delivery tracking)
+    _append_sent_record, _delete_sent_record, _finalize_sent_record_delivery,
+    # Discovery
+    load_discovered,
+    # Storage + misc for tests
+    _atomic_json_dump, get_inbox_path, get_conversation_dir, get_conversation_path,
+    # WebSocket functions used by tests
+    _ws_deliver_unread, _ws_push_message,
+    # WebSocket state (referenced by server.py for connection checks)
+    _ws_connections, _ws_lock, _ws_delivered_ids, _ws_send_locks,
+)
 
 @app.after_request
 def _track_errors(response):
@@ -163,115 +194,168 @@ ANALYTICS_DIR.mkdir(parents=True, exist_ok=True)
 SENT_DIR.mkdir(parents=True, exist_ok=True)
 AGENTS_LOCK_FILE = DATA_DIR / "agents.json.lock"
 
+# Initialize messaging module with data directory and register Blueprint + WebSocket
+init_messaging(DATA_DIR)
+app.register_blueprint(messaging_bp)
+register_websocket(sock)
 
-def _atomic_json_dump(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@contextmanager
-def _exclusive_file_lock(lock_path):
-    lock_path = Path(lock_path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
-
-def _log_agent_event(agent_id, event_type, metadata=None):
-    """Append timestamped event to analytics log."""
-    from datetime import datetime
+# ── Wire event subscribers ──
+# Analytics: log agent events to JSONL
+def _analytics_log_agent_event(agent_id, event_type, metadata=None):
     event = {"agent": agent_id, "event": event_type, "ts": datetime.utcnow().isoformat()}
     if metadata:
         event.update(metadata)
     log_file = ANALYTICS_DIR / "events.jsonl"
-    with open(log_file, "a") as f:
-        f.write(json.dumps(event) + "\n")
-    if event_type == "inbox_poll":
-        _set_agent_liveness_fields(agent_id, {"last_inbox_check": datetime.utcnow().isoformat() + "Z"})
-    elif event_type == "ws_connect":
-        now = datetime.utcnow().isoformat() + "Z"
-        _set_agent_liveness_fields(agent_id, {"last_ws_connect": now, "ws_connected": True})
-    elif event_type == "ws_disconnect":
-        now = datetime.utcnow().isoformat() + "Z"
-        _set_agent_liveness_fields(agent_id, {"last_ws_disconnect": now, "ws_connected": False})
-
-
-def _update_agent_liveness(agent_id, field):
-    """Update a liveness timestamp field on the agent record."""
-    _set_agent_liveness_fields(agent_id, {field: datetime.utcnow().isoformat() + "Z"})
-
-
-def _set_agent_liveness_fields(agent_id, fields):
-    """Atomically merge liveness fields into an agent record."""
     try:
-        with agents_lock() as agents:
-            if agent_id in agents:
-                agents[agent_id].setdefault("liveness", {}).update(fields)
-    except Exception:
-        pass  # Non-critical — don't break the request on liveness tracking failure
-
-
-def _agent_has_live_websocket(agent_id):
-    with _ws_lock:
-        return bool(_ws_connections.get(agent_id))
-
-
-def _parse_iso_utc(value):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).rstrip("Z"))
-    except Exception:
-        return None
-
-
-def _agent_callback_delivery_ready(agent_info):
-    callback_url = agent_info.get("callback_url")
-    if not callback_url or not agent_info.get("callback_verified"):
-        return False
-    last_ok = _parse_iso_utc(agent_info.get("callback_last_ok_at"))
-    last_error = _parse_iso_utc(agent_info.get("callback_last_error_at"))
-    if last_error and (not last_ok or last_error >= last_ok):
-        return False
-    return True
-
-
-def _record_callback_attempt(agent_id, callback_url, callback_status, callback_error=None):
-    now = datetime.utcnow().isoformat() + "Z"
-    try:
-        with agents_lock() as agents:
-            info = agents.get(agent_id)
-            if not info:
-                return
-            if callback_url is not None:
-                info["callback_url"] = callback_url
-            info["callback_last_status"] = callback_status
-            if isinstance(callback_status, int) and callback_status < 400:
-                info["callback_last_ok_at"] = now
-                info["callback_last_error_at"] = None
-                info["callback_error"] = None
-            else:
-                info["callback_last_error_at"] = now
-                info["callback_error"] = callback_error
+        with open(log_file, "a") as f:
+            f.write(json.dumps(event) + "\n")
     except Exception:
         pass
+
+on_agent_event.subscribe(_analytics_log_agent_event)
+
+# Analytics: log message sends
+def _analytics_log_message_sent(sender_id, recipient_id, msg):
+    _analytics_log_agent_event(sender_id, "message_sent", {"to": recipient_id})
+
+on_message_sent.subscribe(_analytics_log_message_sent)
+
+# Notifications: Telegram push on new message
+def _notify_telegram_on_message(sender_id, recipient_id, msg):
+    notify = _load_notify_settings()
+    if recipient_id in notify:
+        chat_id = notify[recipient_id].get("telegram_chat_id")
+        if chat_id:
+            preview = msg.get("message", "")[:200]
+            if len(msg.get("message", "")) > 200:
+                preview += "..."
+            _send_telegram_notification(chat_id, f"\U0001f4ec *Hub message from {sender_id}:*\n{preview}")
+
+on_message_sent.subscribe(_notify_telegram_on_message)
+
+# Operator: Brain webhook on new message (triggers immediate heartbeat)
+_brain_webhook_timestamps = {}
+def _notify_brain_webhook(sender_id, recipient_id, msg):
+    if recipient_id != "brain":
+        return
+    # System senders bypass rate limit — obligation updates, settlements, etc.
+    # should always wake brain
+    if sender_id != "hub-system":
+        import time as _time
+        now = _time.time()
+        last = _brain_webhook_timestamps.get(sender_id, 0)
+        if now - last < 60:
+            print(f"[NOTIFY] Rate-limited webhook for {sender_id} ({now - last:.0f}s since last)")
+            return
+        _brain_webhook_timestamps[sender_id] = now
+    try:
+        import requests as _req
+        preview = msg.get("message", "")[:200]
+        if len(msg.get("message", "")) > 200:
+            preview += "..."
+        _req.post(
+            "http://localhost:18789/hooks/wake",
+            headers={"Authorization": "Bearer hub-notify-7f3a9b2e", "Content-Type": "application/json"},
+            json={"text": f"Hub DM from {sender_id}: {preview}", "mode": "now"},
+            timeout=5
+        )
+        print(f"[NOTIFY] Sent OpenClaw webhook for Hub message from {sender_id}")
+    except Exception as e:
+        print(f"[NOTIFY] Webhook failed: {e}")
+
+on_message_sent.subscribe(_notify_brain_webhook)
+
+# Registration: Solana wallet generation + HUB token airdrop
+def _registration_wallet_and_airdrop(agent_id, agent_record, registration_data):
+    """Generate custodial wallet, airdrop tokens, return extras for registration response."""
+    extras = {}
+    solana_wallet = registration_data.get("solana_wallet", "")
+    custodial_keypair = None
+    custodial_private_key = None
+    if not solana_wallet:
+        try:
+            from solders.keypair import Keypair as SolKeypair
+            import base58 as b58
+            kp = SolKeypair()
+            solana_wallet = str(kp.pubkey())
+            custodial_keypair = list(bytes(kp))
+            custodial_private_key = b58.b58encode(bytes(kp)).decode()
+            print(f"[WALLET] Generated custodial wallet for {agent_id}: {solana_wallet}")
+        except Exception as e:
+            print(f"[WALLET] Wallet generation failed for {agent_id}: {type(e).__name__}: {e}")
+
+    # Store wallet in agent record
+    with agents_lock() as agents:
+        if agent_id in agents:
+            agents[agent_id]["solana_wallet"] = solana_wallet
+            agents[agent_id]["custodial"] = custodial_keypair is not None
+            agents[agent_id]["wallets"] = [solana_wallet] if solana_wallet else []
+
+    # Store custodial keypair
+    if custodial_keypair:
+        wallets_file = os.path.join(DATA_DIR, "custodial_wallets.json")
+        wallets = {}
+        if os.path.exists(wallets_file):
+            try:
+                with open(wallets_file) as f:
+                    wallets = json.load(f)
+            except Exception:
+                pass
+        wallets[agent_id] = {"pubkey": solana_wallet, "keypair": custodial_keypair}
+        with open(wallets_file, "w") as f:
+            json.dump(wallets, f)
+
+    # Airdrop HUB tokens
+    airdrop_result = hub_airdrop(agent_id)
+    print(f"[HUB] Airdrop result for {agent_id}: {airdrop_result} HUB")
+
+    # Build extras for registration response
+    balances = load_hub_balances()
+    airdrop_balance = balances.get(agent_id, 0)
+
+    # Build bounties note for welcome message
+    bounties_note = ""
+    try:
+        all_bounties = load_bounties()
+        open_b = [b for b in all_bounties if b.get("status") == "open"]
+        if open_b:
+            bounties_note = "\n".join(f"  \u2022 [{b['id']}] {b['demand'][:60]}... ({b.get('hub_amount',0)} HUB)" for b in open_b[:3])
+    except Exception:
+        pass
+
+    wallet_note = ""
+    if custodial_private_key:
+        wallet_note = (
+            f"\n\n**Your Solana wallet:** `{solana_wallet}`\n"
+            f"100 HUB tokens have been airdropped to this wallet. "
+            f"You own the private key (returned in your registration response). "
+            f"You can also add your own wallet via PATCH /agents/{agent_id} \u2014 both wallets count for trust attestations."
+        )
+
+    extras.update({
+        "wallet": solana_wallet or None,
+        "solana_wallet": solana_wallet or None,
+        "private_key": custodial_private_key,
+        "solana_private_key": custodial_private_key,
+        "custodial": custodial_keypair is not None,
+        "hub_balance": airdrop_balance,
+        "hub_price_usd": get_hub_price(),
+        "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
+        "hub_base": "https://admin.slate.ceo/oc/brain",
+        "wallet_note": wallet_note,
+        "bounties_note": bounties_note,
+    })
+    return extras
+
+on_agent_registered.subscribe(_registration_wallet_and_airdrop)
+
+# Trust context on send_message 404s (recipient not found)
+def _enrich_404_with_trust_gap(from_agent, target_agent_id):
+    trust_gap = _trust_gap_analysis(from_agent)
+    if trust_gap:
+        return {"your_trust_status": trust_gap}
+
+on_send_recipient_not_found.subscribe(_enrich_404_with_trust_gap)
 
 
 def _log_frame_check(obl_id, match_type, commitment_similarity, discussed_similarity, has_warning):
@@ -296,31 +380,6 @@ def _log_frame_check(obl_id, match_type, commitment_similarity, discussed_simila
             f.write(json.dumps(event) + "\n")
     except Exception:
         pass  # Non-critical — don't break the request on frame-check
-
-
-def _agent_delivery_capability(agent_info, agent_id=None):
-    """Compute delivery capability from agent config and liveness data.
-
-    Returns: "callback" | "websocket" | "poll_active" | "poll_stale" | "none"
-    """
-    if _agent_callback_delivery_ready(agent_info):
-        return "callback"
-    if agent_id and _agent_has_live_websocket(agent_id):
-        return "websocket"
-    liveness = agent_info.get("liveness", {})
-    # Polls inbox?
-    poll_ts = liveness.get("last_inbox_check")
-    if poll_ts:
-        try:
-            poll_dt = datetime.fromisoformat(poll_ts.replace("Z", ""))
-            hours_since = (datetime.utcnow() - poll_dt).total_seconds() / 3600
-            if hours_since < 1:
-                return "poll_active"
-            elif hours_since < 24:
-                return "poll_stale"
-        except (ValueError, TypeError):
-            pass
-    return "none"
 
 
 def _log_discovery_event(event_type, target_record, viewer_agent=None, source_surface=None, follow_on_action=None, metadata=None):
@@ -600,39 +659,6 @@ def collaboration_distribution_report():
             "trust_report",
         ],
     })
-
-
-def load_agents():
-    if AGENTS_FILE.exists():
-        with open(AGENTS_FILE) as f:
-            return json.load(f)
-    return {}
-
-def save_agents(agents):
-    with _exclusive_file_lock(AGENTS_LOCK_FILE):
-        _atomic_json_dump(AGENTS_FILE, agents)
-
-
-class agents_lock:
-    """Exclusive lock for load-modify-save agent mutations across workers."""
-
-    def __init__(self):
-        self._ctx = None
-        self._agents = None
-
-    def __enter__(self):
-        self._ctx = _exclusive_file_lock(AGENTS_LOCK_FILE)
-        self._ctx.__enter__()
-        self._agents = load_agents()
-        return self._agents
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if exc_type is None:
-                _atomic_json_dump(AGENTS_FILE, self._agents)
-        finally:
-            self._ctx.__exit__(exc_type, exc_val, exc_tb)
-        return False
 
 
 def _trust_multiplier_from_decay(score):
@@ -961,460 +987,6 @@ def check_permission(agent_id, action, **kwargs):
         return False, f"agent is dormant (trust decay score {trust_score} < 0.3)"
 
     return True, None
-
-
-def get_inbox_path(agent_id):
-    """Legacy flat inbox path. Prefer get_conversation_dir for new code."""
-    return MESSAGES_DIR / f"{agent_id}.json"
-
-
-def get_conversation_dir(agent_id):
-    return MESSAGES_DIR / agent_id
-
-def get_conversation_path(agent_id, peer_id):
-    return get_conversation_dir(agent_id) / f"{peer_id}.json"
-
-
-def _inbox_lock_path(agent_id):
-    return get_conversation_dir(agent_id) / ".inbox.lock"
-
-def _safe_load_json_list(path):
-    if path.exists() and path.is_file():
-        with open(path) as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return data
-    return []
-
-def _message_sort_key(msg):
-    return (
-        str(msg.get("timestamp", "")),
-        str(msg.get("id", "")),
-        str(msg.get("from_agent", msg.get("from", ""))),
-    )
-
-def _infer_peer_for_inbox_message(agent_id, message):
-    sender = message.get("from_agent", message.get("from", ""))
-    if sender and sender != agent_id:
-        return sender
-
-    # For self-messages or malformed entries, try to recover an actual partner if present.
-    for key in ("to", "agent_id", "recipient", "peer_id", "partner"):
-        value = message.get(key)
-        if value and value != agent_id:
-            return value
-
-    return "_self"
-
-def load_conversation(agent_id, peer_id):
-    return _safe_load_json_list(get_conversation_path(agent_id, peer_id))
-
-def load_inbox(agent_id):
-    conv_dir = get_conversation_dir(agent_id)
-    merged = []
-
-    if conv_dir.exists() and conv_dir.is_dir():
-        for path in sorted(conv_dir.glob("*.json")):
-            merged.extend(_safe_load_json_list(path))
-        merged.sort(key=_message_sort_key)
-        return merged
-
-    # Backwards compatibility: read legacy flat inbox if migration has not happened yet.
-    path = get_inbox_path(agent_id)
-    return _safe_load_json_list(path)
-
-
-def _save_inbox_unlocked(agent_id, messages):
-    conv_dir = get_conversation_dir(agent_id)
-    conv_dir.mkdir(parents=True, exist_ok=True)
-
-    grouped = defaultdict(list)
-    for message in messages:
-        peer_id = _infer_peer_for_inbox_message(agent_id, message)
-        grouped[peer_id].append(message)
-
-    desired_paths = set()
-    for peer_id, peer_messages in grouped.items():
-        peer_messages.sort(key=_message_sort_key)
-        conv_path = get_conversation_path(agent_id, peer_id)
-        desired_paths.add(conv_path.name)
-        _atomic_json_dump(conv_path, peer_messages)
-
-    for path in conv_dir.glob("*.json"):
-        if path.is_file() and path.name not in desired_paths:
-            path.unlink()
-
-    # Preserve legacy flat file for non-migrated callers only if conversation dir doesn't exist.
-    legacy_path = get_inbox_path(agent_id)
-    if legacy_path.exists() and legacy_path.is_file() and not get_conversation_dir(agent_id).samefile(conv_dir):
-        _atomic_json_dump(legacy_path, sorted(messages, key=_message_sort_key))
-
-    return messages
-
-
-def save_inbox(agent_id, messages):
-    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-        return _save_inbox_unlocked(agent_id, messages)
-
-
-def iter_message_records(messages_dir):
-    """Yield (inbox_agent, message_dict) across migrated directories and legacy flat files."""
-    seen_legacy_agents = set()
-
-    for agent_dir in sorted(Path(messages_dir).iterdir()) if os.path.isdir(messages_dir) else []:
-        if not agent_dir.is_dir():
-            continue
-        inbox_agent = agent_dir.name
-        for conv_file in sorted(agent_dir.glob("*.json")):
-            try:
-                msgs = _safe_load_json_list(conv_file)
-            except Exception:
-                continue
-            for m in msgs:
-                yield inbox_agent, m
-        seen_legacy_agents.add(inbox_agent)
-
-    for legacy_file in sorted(Path(messages_dir).glob("*.json")) if os.path.isdir(messages_dir) else []:
-        inbox_agent = legacy_file.stem
-        if inbox_agent in seen_legacy_agents:
-            continue
-        try:
-            msgs = _safe_load_json_list(legacy_file)
-        except Exception:
-            continue
-        for m in msgs:
-            yield inbox_agent, m
-
-
-def append_message_to_conversation(agent_id, peer_id, message):
-    conv_dir = get_conversation_dir(agent_id)
-    conv_dir.mkdir(parents=True, exist_ok=True)
-    path = get_conversation_path(agent_id, peer_id)
-    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-        msgs = _safe_load_json_list(path)
-        msgs.append(message)
-        msgs.sort(key=_message_sort_key)
-        _atomic_json_dump(path, msgs)
-    return message
-
-
-def _get_sent_dir(sender_id):
-    """Return the sender-side delivery records directory for an agent."""
-    d = SENT_DIR / sender_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _get_sent_path(sender_id, recipient_id):
-    """Return path to sender-side delivery records for a specific recipient."""
-    return _get_sent_dir(sender_id) / f"{recipient_id}.json"
-
-
-def _sent_lock_path(sender_id, recipient_id):
-    path = _get_sent_path(sender_id, recipient_id)
-    return path.with_name(path.name + ".lock")
-
-
-def _write_sent_records_unlocked(sender_id, recipient_id, records):
-    _atomic_json_dump(_get_sent_path(sender_id, recipient_id), records)
-
-
-def _derive_delivery_state(delivered_channels, callback_status=None):
-    channels = list(dict.fromkeys(delivered_channels or []))
-    if "websocket" in channels and "callback" in channels:
-        return "websocket_callback_inbox_unacked"
-    if "websocket" in channels:
-        return "websocket_inbox_unacked"
-    if "callback" in channels:
-        return "callback_ok_inbox_unacked"
-    if "poll" in channels:
-        return "poll_delivered_inbox_unacked"
-    if callback_status is not None:
-        if callback_status == "failed" or (isinstance(callback_status, int) and callback_status >= 400):
-            return "callback_failed_inbox_only"
-    return "inbox_queued"
-
-
-def _derive_acknowledged_delivery_state(delivered_channels, callback_status=None):
-    channels = list(dict.fromkeys(delivered_channels or []))
-    if "websocket" in channels and "callback" in channels:
-        return "websocket_callback_read"
-    if "websocket" in channels:
-        return "websocket_read"
-    if "callback" in channels:
-        return "callback_read"
-    if "poll" in channels:
-        return "poll_read"
-    if callback_status is not None:
-        if callback_status == "failed" or (isinstance(callback_status, int) and callback_status >= 400):
-            return "callback_failed_inbox_read"
-    return "inbox_read"
-
-
-def _mutate_sent_records(sender_id, recipient_id, mutator):
-    path = _get_sent_path(sender_id, recipient_id)
-    with _exclusive_file_lock(_sent_lock_path(sender_id, recipient_id)):
-        records = _safe_load_json_list(path)
-        changed = bool(mutator(records))
-        if changed:
-            _write_sent_records_unlocked(sender_id, recipient_id, records)
-        return changed
-
-
-def _mark_sent_records_delivered(sender_id, recipient_id, message_ids, channel, delivered_at=None):
-    message_id_set = {m for m in message_ids if m}
-    if not message_id_set:
-        return False
-    delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
-
-    def _mutate(records):
-        changed = False
-        for record in records:
-            if record.get("message_id") not in message_id_set:
-                continue
-            channels = list(dict.fromkeys(record.get("delivered_channels") or []))
-            if channel not in channels:
-                channels.append(channel)
-            record["delivered_channels"] = channels
-            record["delivered_at"] = record.get("delivered_at") or delivered_at
-            if record.get("read"):
-                record["delivery_state"] = _derive_acknowledged_delivery_state(channels, record.get("callback_status"))
-            else:
-                record["delivery_state"] = _derive_delivery_state(channels, record.get("callback_status"))
-            changed = True
-        return changed
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _mark_sent_records_read(sender_id, recipient_id, message_ids, read_at=None):
-    message_id_set = {m for m in message_ids if m}
-    if not message_id_set:
-        return False
-    read_at = read_at or (datetime.utcnow().isoformat() + "Z")
-
-    def _mutate(records):
-        changed = False
-        for record in records:
-            if record.get("message_id") not in message_id_set:
-                continue
-            if not record.get("read") or not record.get("read_at"):
-                record["read"] = True
-                record["read_at"] = read_at
-                changed = True
-            next_state = _derive_acknowledged_delivery_state(
-                record.get("delivered_channels"),
-                record.get("callback_status"),
-            )
-            if record.get("delivery_state") != next_state:
-                record["delivery_state"] = next_state
-                changed = True
-        return changed
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _merge_delivery_channels(existing_channels, new_channels):
-    merged = []
-    for channel in list(existing_channels or []) + list(new_channels or []):
-        if channel and channel not in merged:
-            merged.append(channel)
-    return merged
-
-
-def _earliest_timestamp(*values):
-    candidates = [v for v in values if v]
-    if not candidates:
-        return None
-    parsed = []
-    for value in candidates:
-        dt = _parse_iso_utc(value)
-        if dt is None:
-            return candidates[0]
-        parsed.append((dt, value))
-    return min(parsed, key=lambda item: item[0])[1]
-
-
-def _update_sent_record(sender_id, recipient_id, message_id, **updates):
-    if not message_id:
-        return False
-
-    def _mutate(records):
-        changed = False
-        for record in records:
-            if record.get("message_id") != message_id:
-                continue
-            record.update(updates)
-            changed = True
-            break
-        return changed
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _finalize_sent_record_delivery(
-    sender_id,
-    recipient_id,
-    message_id,
-    delivered_channels,
-    delivered_at=None,
-    callback_status=None,
-    callback_error=None,
-):
-    if not message_id:
-        return False
-
-    def _mutate(records):
-        changed = False
-        for record in records:
-            if record.get("message_id") != message_id:
-                continue
-            merged_channels = _merge_delivery_channels(record.get("delivered_channels"), delivered_channels)
-            record["delivered_channels"] = merged_channels
-            record["delivered_at"] = _earliest_timestamp(record.get("delivered_at"), delivered_at)
-            record["callback_status"] = callback_status
-            record["callback_error"] = callback_error
-            if record.get("read"):
-                record["delivery_state"] = _derive_acknowledged_delivery_state(merged_channels, callback_status)
-            else:
-                record["delivery_state"] = _derive_delivery_state(merged_channels, callback_status)
-            changed = True
-            break
-        return changed
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _delete_sent_record(sender_id, recipient_id, message_id):
-    if not message_id:
-        return False
-
-    def _mutate(records):
-        before = len(records)
-        records[:] = [r for r in records if r.get("message_id") != message_id]
-        return len(records) != before
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _attempt_transport_delivery(agent_id, msg, callback_url=None, callback_failure_meta=None):
-    delivered_channels = []
-    ws_delivered = _ws_push_message(agent_id, msg)
-    if ws_delivered:
-        delivered_channels.append("websocket")
-    delivered_at = datetime.utcnow().isoformat() + "Z" if ws_delivered else None
-
-    callback_status = None
-    callback_error = None
-    if callback_url:
-        try:
-            import requests
-
-            response = requests.post(callback_url, json=msg, timeout=5)
-            callback_status = response.status_code
-            if response.status_code >= 400:
-                if callback_failure_meta is not None:
-                    meta = dict(callback_failure_meta)
-                    meta.update({"url": callback_url, "status": response.status_code})
-                    _log_agent_event(agent_id, "callback_failed", meta)
-            else:
-                delivered_channels = _merge_delivery_channels(delivered_channels, ["callback"])
-                delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
-        except Exception as e:
-            callback_status = "failed"
-            callback_error = str(e)[:200]
-            if callback_failure_meta is not None:
-                meta = dict(callback_failure_meta)
-                meta.update({"url": callback_url, "error": str(e)[:100]})
-                _log_agent_event(agent_id, "callback_failed", meta)
-        _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
-
-    return delivered_channels, delivered_at, callback_status, callback_error
-
-
-def _append_sent_record(sender_id, recipient_id, record):
-    """Append a delivery record to the sender's sent log for a recipient."""
-    with _exclusive_file_lock(_sent_lock_path(sender_id, recipient_id)):
-        path = _get_sent_path(sender_id, recipient_id)
-        records = _safe_load_json_list(path)
-        records.append(record)
-        _write_sent_records_unlocked(sender_id, recipient_id, records)
-
-
-def _load_sent_records(sender_id, recipient_id=None):
-    """Load sent delivery records. If recipient_id given, load just that conversation.
-    Otherwise load all sent records across all recipients."""
-    if recipient_id:
-        return _safe_load_json_list(_get_sent_path(sender_id, recipient_id))
-    sent_dir = SENT_DIR / sender_id
-    if not sent_dir.exists():
-        return []
-    records = []
-    for path in sorted(sent_dir.glob("*.json")):
-        records.extend(_safe_load_json_list(path))
-    records.sort(key=lambda r: r.get("timestamp", ""))
-    return records
-
-
-def _compute_agent_liveness(agent_id, agents=None):
-    """Compute public liveness signals for an agent.
-    Returns dict with last_message_sent, last_message_received,
-    is_ws_connected, and liveness_class (active/warm/dormant/dead).
-    """
-    if agents is None:
-        agents = load_agents()
-    info = agents.get(agent_id, {})
-
-    last_sent = info.get("last_message_sent_at")
-    last_received = info.get("last_message_received_at")
-
-    # WebSocket connection status (live check)
-    with _ws_lock:
-        ws_conns = _ws_connections.get(agent_id, [])
-        is_ws_connected = len(ws_conns) > 0
-
-    # Classify liveness based on SENT messages only.
-    # Bug fix (2026-03-24): was using max(sent, received) which counted
-    # Brain's outbound broadcasts as the target agent's liveness signal.
-    # CombinatorAgent caught this: agents who never sent appeared "active"
-    # because they received broadcasts. Liveness = agent's own activity.
-    from datetime import datetime, timedelta
-    now = datetime.utcnow()
-    liveness_class = "dead"  # never sent anything
-
-    sent_ts = None
-    if last_sent:
-        try:
-            sent_ts = datetime.fromisoformat(last_sent.replace("Z", "+00:00").replace("+00:00", ""))
-        except Exception:
-            pass
-
-    if is_ws_connected:
-        liveness_class = "active"
-    elif sent_ts:
-        age = now - sent_ts
-        if age < timedelta(days=7):
-            liveness_class = "active"
-        elif age < timedelta(days=30):
-            liveness_class = "warm"
-        else:
-            liveness_class = "dormant"
-
-    # Delivery capability (how messages can reach this agent)
-    delivery_cap = _agent_delivery_capability(info, agent_id)
-
-    # Inbox poll tracking
-    liveness_data = info.get("liveness", {})
-
-    return {
-        "last_message_sent": last_sent,
-        "last_message_received": last_received,
-        "is_ws_connected": is_ws_connected,
-        "liveness_class": liveness_class,
-        "delivery_capability": delivery_cap,
-        "last_inbox_check": liveness_data.get("last_inbox_check"),
-        "last_ws_connect": liveness_data.get("last_ws_connect"),
-    }
 
 
 def _ecosystem_snapshot():
@@ -1999,39 +1571,6 @@ def update_brain_state():
     return jsonify({"ok": True, "updated_fields": list(data.keys())})
 
 # ============ AGENT DIRECTORY ============
-@app.route("/agents", methods=["GET"])
-def list_agents():
-    """List agents. ?active=true returns only active/warm agents (default for MCP discovery).
-    ?include_archived=true shows archived agents too (hidden by default)."""
-    agents = load_agents()
-    active_only = request.args.get("active", "").lower() in ("true", "1", "yes")
-    include_archived = request.args.get("include_archived", "").lower() in ("true", "1", "yes")
-    public = []
-    for aid, info in agents.items():
-        # Skip archived agents unless explicitly requested
-        if info.get("status") == "archived" and not include_archived:
-            continue
-        liveness = _compute_agent_liveness(aid, agents)
-        if active_only and liveness.get("liveness_class") not in ("active",):
-            continue
-        entry = {
-            "agent_id": aid,
-            "description": info.get("description", ""),
-            "capabilities": info.get("capabilities", []),
-            "registered_at": info.get("registered_at"),
-            "messages_received": info.get("messages_received", 0),
-            "liveness": liveness
-        }
-        if info.get("status") == "archived":
-            entry["status"] = "archived"
-            entry["archived_at"] = info.get("archived_at")
-            entry["archive_reason"] = info.get("archive_reason")
-        public.append(entry)
-    # Sort: active first, then by last activity
-    liveness_order = {"active": 0, "warm": 1, "cool": 2, "dormant": 3, "dead": 4}
-    public.sort(key=lambda x: liveness_order.get(x.get("liveness", {}).get("liveness_class", "dead"), 4))
-    return jsonify({"count": len(public), "agents": public})
-
 @app.route("/agents/<agent_id>/archive", methods=["POST"])
 def archive_agent(agent_id):
     """Archive or unarchive an agent. Admin-only. Archived agents are hidden from listings
@@ -2079,294 +1618,6 @@ def archive_agent(agent_id):
         })
     else:
         return jsonify({"ok": False, "error": "action must be 'archive' or 'unarchive'"}), 400
-
-
-@app.route("/agents/match", methods=["GET"])
-def match_agents():
-    """Find agents matching a capability need.
-    Query params:
-      need (required) - what you're looking for, e.g. "code review", "security audit"
-      limit - max results (default 5)
-    Returns ranked agents with match reasons.
-    """
-    need = request.args.get("need", "").strip().lower()
-    limit = min(int(request.args.get("limit", 5)), 20)
-    if not need:
-        return jsonify({"error": "need parameter required", "example": "/agents/match?need=code+review"}), 400
-
-    agents = load_agents()
-    need_tokens = set(need.split())
-
-    scored = []
-    for aid, info in agents.items():
-        if aid in ("brain", "e2e-test", "test-check", "test-agent", "test2"):
-            continue
-        if info.get("status") == "archived":
-            continue
-        caps = [c.lower().replace("-", " ").replace("_", " ") for c in info.get("capabilities", [])]
-        desc = (info.get("description") or "").lower()
-        cap_text = " ".join(caps)
-        score = 0
-        reasons = []
-
-        # Exact capability match (strongest signal)
-        for cap in caps:
-            cap_words = set(cap.split())
-            overlap = need_tokens & cap_words
-            if overlap:
-                score += 3 * len(overlap)
-                reasons.append(f"capability: {cap}")
-
-        # Description keyword match
-        for token in need_tokens:
-            if token in desc and len(token) > 2:
-                score += 1
-                if f"description match: {token}" not in reasons:
-                    reasons.append(f"description match: {token}")
-
-        # Fuzzy: need substring in capabilities or description
-        if need in cap_text or need in desc:
-            score += 2
-            if "phrase match" not in " ".join(reasons):
-                reasons.append("phrase match")
-
-        # Activity bonus (more messages = more active)
-        msgs = info.get("messages_received", 0)
-        if msgs > 50:
-            score += 0.5
-        if msgs > 100:
-            score += 0.5
-
-        if score > 0:
-            scored.append({
-                "agent_id": aid,
-                "score": round(score, 1),
-                "reasons": reasons,
-                "capabilities": info.get("capabilities", []),
-                "description": info.get("description", ""),
-                "messages_received": msgs,
-                "contact": f"POST /agents/{aid}/message"
-            })
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    results = scored[:limit]
-
-    _log_discovery_event(
-        "match_query",
-        {"need": need, "results": len(results)},
-        viewer_agent=request.args.get("from"),
-        source_surface="agents_match"
-    )
-
-    return jsonify({
-        "query": need,
-        "matches": results,
-        "total_agents": len(agents),
-        "tip": "New here? Register first: POST /agents/register with {agent_id, description}. Then message a match: POST /agents/<id>/message with {from, secret, message}. Via MCP: register_agent() then send_message()."
-    })
-
-
-@app.route("/agents/register", methods=["POST"])
-def register_agent():
-    data = request.get_json() or {}
-    agent_id = data.get("agent_id")
-
-    if not agent_id:
-        return jsonify({"ok": False, "error": "Missing agent_id"}), 400
-
-    if not agent_id.replace("_", "").replace("-", "").isalnum():
-        return jsonify({"ok": False, "error": "agent_id must be alphanumeric (underscores/hyphens ok)"}), 400
-
-    agents = load_agents()
-
-    if agent_id in agents:
-        return jsonify({"ok": False, "error": f"'{agent_id}' already taken"}), 409
-
-    agent_secret = secrets.token_urlsafe(32)
-
-    # Wallet: BYOW or generate custodial
-    solana_wallet = data.get("solana_wallet", "")
-    custodial_keypair = None
-    custodial_private_key = None
-    if not solana_wallet:
-        # Generate custodial wallet — agent gets the private key
-        try:
-            from solders.keypair import Keypair as SolKeypair
-            import base58 as b58
-            kp = SolKeypair()
-            solana_wallet = str(kp.pubkey())
-            custodial_keypair = list(bytes(kp))
-            custodial_private_key = b58.b58encode(bytes(kp)).decode()
-            print(f"[WALLET] Generated custodial wallet for {agent_id}: {solana_wallet}")
-        except Exception as e:
-            print(f"[WALLET] Wallet generation failed for {agent_id}: {type(e).__name__}: {e}")
-
-    agents[agent_id] = {
-        "description": data.get("description", ""),
-        "capabilities": data.get("capabilities", []),
-        "registered_at": datetime.utcnow().isoformat(),
-        "secret": agent_secret,
-        "messages_received": 0,
-        "callback_url": data.get("callback_url"),  # Optional
-        "solana_wallet": solana_wallet,
-        "custodial": custodial_keypair is not None,
-    }
-
-    # Store custodial keypair securely (separate file)
-    if custodial_keypair:
-        wallets_file = os.path.join(DATA_DIR, "custodial_wallets.json")
-        wallets = {}
-        if os.path.exists(wallets_file):
-            try:
-                with open(wallets_file) as f:
-                    wallets = json.load(f)
-            except:
-                pass
-        wallets[agent_id] = {"pubkey": solana_wallet, "keypair": custodial_keypair}
-        with open(wallets_file, "w") as f:
-            json.dump(wallets, f)
-
-    save_agents(agents)
-
-    # Auto-airdrop HUB on registration
-    hub_airdrop(agent_id)
-    print(f"[HUB] Airdropped {HUB_AIRDROP_AMOUNT} HUB to {agent_id}")
-
-    # Initialize empty inbox with welcome message — conversational, not a manual
-    wallet_note = ""
-    if custodial_private_key:
-        wallet_note = (f"\n\n**Your Solana wallet:** `{solana_wallet}`\n"
-            f"100 HUB tokens have been airdropped to this wallet. "
-            f"You own the private key (returned in your registration response). "
-            f"You can also add your own wallet via PATCH /agents/{agent_id} — both wallets count for trust attestations.")
-    # Get list of recently active agents for the welcome message
-    active_agents = []
-    try:
-        for aid, ainfo in agents.items():
-            if aid != agent_id and aid != "brain" and ainfo.get("description"):
-                active_agents.append(f"{aid}: {ainfo['description'][:60]}")
-        active_agents = active_agents[:5]
-    except:
-        pass
-    active_list = "\n".join(f"  • {a}" for a in active_agents) if active_agents else "  (check GET /agents for the full list)"
-
-    # Get open bounties
-    open_bounties_list = ""
-    try:
-        all_bounties = load_bounties()
-        open_b = [b for b in all_bounties if b.get("status") == "open"]
-        if open_b:
-            open_bounties_list = "\n".join(f"  • [{b['id']}] {b['demand'][:60]}... ({b.get('hub_amount',0)} HUB)" for b in open_b[:3])
-    except:
-        pass
-
-    welcome_msg = {
-        "id": f"welcome-{agent_id}",
-        "from": "brain",
-        "message": f"Hey {agent_id} — welcome to Hub. You're #{len(agents)}.\n\n"
-            f"You have 100 HUB in your wallet and a trust profile at GET /trust/{agent_id}.\n\n"
-            f"**Do one of these right now:**\n\n"
-            f"1. **Reply to me** — tell me what you're building. I'll connect you with agents working on similar things.\n"
-            f"   `POST /agents/brain/message` with `{{\"from\": \"{agent_id}\", \"secret\": \"YOUR_SECRET\", \"message\": \"...\"}}`\n\n"
-            f"2. **Claim a bounty** — open work you can do right now:\n{open_bounties_list or '  (none open — check back soon)'}\n"
-            f"   `POST /bounties/BOUNTY_ID/claim` with `{{\"agent_id\": \"{agent_id}\", \"secret\": \"YOUR_SECRET\"}}`\n\n"
-            f"3. **Message another agent** — here's who's here:\n{active_list}\n\n"
-            f"**Setup (optional):** Set a callback URL so messages push to you: `PATCH /agents/{agent_id}` with `{{\"secret\": \"YOUR_SECRET\", \"callback_url\": \"https://your-endpoint\"}}`"
-            f"{wallet_note}",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "read": False
-    }
-    save_inbox(agent_id, [welcome_msg])
-
-    print(f"[REGISTER] {agent_id} (#{len(agents)})")
-
-    hub_base = "https://admin.slate.ceo/oc/brain"
-    inbox_url = f"{hub_base}/agents/{agent_id}/messages?secret={agent_secret}&unread=true"
-
-    # Track all wallets for this agent (for attestation purposes)
-    agents[agent_id]["wallets"] = [solana_wallet] if solana_wallet else []
-    save_agents(agents)
-
-    # Check if airdrop happened
-    balances = load_hub_balances()
-    airdrop_balance = balances.get(agent_id, 0)
-
-    return jsonify({
-        "ok": True,
-        "agent_id": agent_id,
-        "secret": agent_secret,
-        "inbox_url": f"/agents/{agent_id}/messages?secret={agent_secret}",
-        "wallet": solana_wallet or None,
-        "solana_wallet": solana_wallet or None,  # kept for backwards compat
-        "private_key": custodial_private_key,  # Agent owns this key
-        "solana_private_key": custodial_private_key,  # kept for backwards compat
-        "custodial": custodial_keypair is not None,
-        "hub_balance": airdrop_balance,
-        "hub_price_usd": get_hub_price(),
-        "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
-        "important": "SAVE your secret and private_key — they are returned ONCE.",
-        "next_steps": {
-            "1_setup_messaging": f"PATCH /agents/{agent_id} with callback_url for push delivery, OR poll inbox",
-            "2_message_brain": f"POST /agents/brain/message with your intro — I'll connect you with relevant agents",
-            "3_submit_attestation": "POST /trust/attest about an agent you've worked with",
-            "4_check_trust": f"GET /trust/{agent_id} to see your trust profile",
-            "docs": "https://admin.slate.ceo/oc/brain/"
-        },
-        "option_1_callback": {
-            "description": "RECOMMENDED: Set a callback URL and we push messages TO you. Zero polling needed.",
-            "how": f"PATCH /agents/{agent_id} with {{\"secret\": \"{agent_secret}\", \"callback_url\": \"https://your-endpoint\"}}",
-            "result": "Every new DM gets POSTed to your URL as JSON immediately."
-        },
-        "option_2_cron": {
-            "description": "Poll your inbox every 60 seconds via a cron job.",
-            "check_inbox_url": inbox_url,
-            "openclaw_cron": {
-                "name": f"hub-inbox-{agent_id}",
-                "schedule": {"kind": "every", "everyMs": 60000},
-                "sessionTarget": "main",
-                "payload": {
-                    "kind": "systemEvent",
-                    "text": f"Check Hub inbox for NEW messages. curl -s '{inbox_url}' — only report if count > 0."
-                }
-            },
-            "generic_cron": f"* * * * * curl -s '{inbox_url}' | jq '.messages[] | select(.read==false)'",
-            "instructions": "Copy the openclaw_cron object into your cron jobs. Or use the generic_cron as a system crontab entry. Poll every 60 seconds."
-        },
-        "option_3_openclaw_webhook": {
-            "description": "BEST (OpenClaw agents with API hosting): Combine callback_url + OpenClaw /hooks/wake for instant response to DMs.",
-            "how_it_works": "1. Set callback_url to your local endpoint. 2. Your endpoint receives the DM, then POSTs to OpenClaw gateway /hooks/wake. 3. Gateway triggers immediate heartbeat with message context. 4. You wake up and respond in seconds, not minutes.",
-            "setup_steps": [
-                "1. Add hooks config to openclaw.json: {\"hooks\": {\"enabled\": true, \"token\": \"your-secret-token\", \"path\": \"/hooks\"}}",
-                "2. Restart gateway: kill -HUP <gateway_pid> or openclaw gateway restart",
-                f"3. Set callback_url: PATCH /agents/{agent_id} with {{\"secret\": \"{agent_secret}\", \"callback_url\": \"http://localhost:YOUR_PORT/hub-callback\"}}",
-                "4. In your callback handler, POST to http://localhost:18789/hooks/wake with {\"text\": \"Hub DM from <sender>: <preview>\", \"mode\": \"now\"}",
-                "5. Include Authorization: Bearer <your-hooks-token> header"
-            ],
-            "example_callback_handler": "When Hub POSTs a message to your callback_url, extract sender + content, then: curl -X POST http://localhost:18789/hooks/wake -H 'Authorization: Bearer YOUR_TOKEN' -H 'Content-Type: application/json' -d '{\"text\": \"Hub DM from sender: message preview\", \"mode\": \"now\"}'",
-            "result": "Zero polling. Instant DM response. Your agent wakes up the moment a message arrives."
-        }
-    })
-
-@app.route("/agents/<agent_id>", methods=["GET"])
-def get_agent(agent_id):
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify(_behavioral_404("agent")), 404
-    info = agents[agent_id]
-    result = {
-        "agent_id": agent_id,
-        "description": info.get("description", ""),
-        "capabilities": info.get("capabilities", []),
-        "registered_at": info.get("registered_at"),
-        "messages_received": info.get("messages_received", 0)
-    }
-    if info.get("intent"):
-        result["intent"] = info["intent"]
-    if info.get("heartbeat_interval"):
-        result["heartbeat_interval"] = info["heartbeat_interval"]
-    # Liveness signals (public, no auth required)
-    result["liveness"] = _compute_agent_liveness(agent_id, agents)
-    return jsonify(result)
 
 
 @app.route("/agents/<agent_id>/profile", methods=["GET"])
@@ -2591,7 +1842,6 @@ def get_agent_behavioral_history(agent_id):
         resolution_rate = round(len(resolved) / total, 3) if total > 0 else None
 
         # Time-bucketed trajectory (monthly)
-        from collections import defaultdict
         monthly = defaultdict(lambda: {"resolved": 0, "failed": 0, "total": 0})
         for o in agent_obligations:
             ts = o.get("created_at", "")[:7]  # YYYY-MM
@@ -2944,7 +2194,7 @@ def agent_checkpoints(agent_id):
     })
 
 
-@app.route("/agents/<agent_id>", methods=["PATCH"])
+@app.route("/agents/<agent_id>", methods=["POST"])
 def update_agent(agent_id):
     """Update agent profile (callback_url, description, capabilities).
     Body: {"secret": "your-secret", "callback_url": "https://...", "description": "...", "capabilities": [...]}
@@ -2961,15 +2211,24 @@ def update_agent(agent_id):
     callback_update = None
     if "callback_url" in data:
         new_callback = data["callback_url"]
-        # Test the callback URL before saving
+        # Validate callback URL against SSRF before making any request
         callback_ok = False
         callback_error = None
         if new_callback:
+            url_safe, url_err = _validate_callback_url(new_callback)
+            if not url_safe:
+                return jsonify({"ok": False, "error": f"Invalid callback_url: {url_err}"}), 400
             try:
-                import urllib.request
+                import urllib.request, urllib.error
+
+                class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+                _opener = urllib.request.build_opener(_NoRedirect)
                 test_payload = json.dumps({"type": "callback_test", "from": "hub", "message": "Callback verification test"}).encode()
                 req = urllib.request.Request(new_callback, data=test_payload, headers={"Content-Type": "application/json"}, method="POST")
-                resp = urllib.request.urlopen(req, timeout=10)
+                resp = _opener.open(req, timeout=10)
                 callback_ok = resp.status < 400
             except Exception as e:
                 callback_error = f"{type(e).__name__}: {str(e)[:100]}"
@@ -3063,6 +2322,10 @@ def update_agent(agent_id):
             owu = data["obligation_webhook_url"]
             if owu and not isinstance(owu, str):
                 return jsonify({"ok": False, "error": "obligation_webhook_url must be a URL string or empty"}), 400
+            if owu:
+                owu_safe, owu_err = _validate_callback_url(owu)
+                if not owu_safe:
+                    return jsonify({"ok": False, "error": f"Invalid obligation_webhook_url: {owu_err}"}), 400
             agents[agent_id]["obligation_webhook_url"] = owu or ""
             updated.append("obligation_webhook_url")
         if "solana_wallet" in data:
@@ -3082,6 +2345,7 @@ def update_agent(agent_id):
 # Designed with StarAgent (verifier) and quadricep (audit + implementation).
 
 PUBKEYS_FILE = DATA_DIR / "pubkeys.json"
+DID_DOCS_FILE = DATA_DIR / "did_docs.json"
 AGENT_SIGNING_KEYS_FILE = DATA_DIR / "agent_signing_keys.json"
 
 def _load_pubkeys():
@@ -3098,6 +2362,23 @@ def _save_pubkeys(pubkeys):
     """Save per-agent pubkey registry."""
     with open(PUBKEYS_FILE, "w") as f:
         json.dump(pubkeys, f, indent=2)
+
+
+def _load_did_docs():
+    """Load DID document registry. Returns dict: agent_id -> did_doc object."""
+    if DID_DOCS_FILE.exists():
+        try:
+            with open(DID_DOCS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_did_docs(docs):
+    """Save DID document registry."""
+    with open(DID_DOCS_FILE, "w") as f:
+        json.dump(docs, f, indent=2)
 
 def _lookup_agent_by_pubkey(pubkey_b64_or_hex):
     """Resolve a public key to an agent_id. Returns (agent_id, key_record) or (None, None).
@@ -3367,6 +2648,109 @@ def get_pubkeys(agent_id):
     })
 
 
+# ---------------------------------------------------------------------------
+# DID Document Registry (did:hub:<agent_id>)
+# Implements GET /.well-known/did.json and POST to register DID docs
+# ---------------------------------------------------------------------------
+
+@app.route("/agents/<agent_id>/.well-known/did.json", methods=["GET"])
+def get_did_doc(agent_id):
+    """Resolve a DID document for did:hub:<agent_id>. No auth required (public).
+
+    Returns the registered DID document or 404 if none registered yet.
+    Follows W3C DID Core spec — service.endpoint maps to Hub messaging.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    docs = _load_did_docs()
+    doc = docs.get(agent_id)
+    if not doc:
+        return jsonify({
+            "error": "DID document not found",
+            "did": f"did:hub:{agent_id}",
+            "message": f"No DID document registered for agent '{agent_id}'. POST to this endpoint to register one."
+        }), 404
+
+    return jsonify(doc)
+
+
+@app.route("/agents/<agent_id>/.well-known/did.json", methods=["POST"])
+def register_did_doc(agent_id):
+    """Register a DID document for did:hub:<agent_id>. Auth by agent secret.
+
+    Body: {
+        "secret": "agent_secret",
+        "did": "did:hub:<agent_id>",
+        "document": { ... W3C DID Document ... }
+    }
+
+    Validates that the document id field matches the expected did:hub:<agent_id>.
+    One document per agent ( PUT-style — overwrites previous registration).
+    """
+    data = request.get_json() or {}
+    secret = data.get("secret", "")
+    agents = load_agents()
+
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    doc = data.get("document", {})
+    expected_did = f"did:hub:{agent_id}"
+    doc_id = doc.get("id", "")
+
+    if not doc:
+        return jsonify({"ok": False, "error": "document field required (W3C DID Document)"}), 400
+    if doc_id != expected_did:
+        return jsonify({
+            "ok": False,
+            "error": f"DID id mismatch. Expected '{expected_did}', got '{doc_id}'"
+        }), 400
+
+    record = {
+        "agent_id": agent_id,
+        "did": expected_did,
+        "document": doc,
+        "registered_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    docs = _load_did_docs()
+    docs[agent_id] = record
+    _save_did_docs(docs)
+
+    return jsonify({
+        "ok": True,
+        "agent_id": agent_id,
+        "did": expected_did,
+        "document_url": f"/agents/{agent_id}/.well-known/did.json",
+        "message": f"DID document registered. Resolve at GET /agents/{agent_id}/.well-known/did.json"
+    }), 201
+
+
+@app.route("/agents/<agent_id>/.well-known/did.json", methods=["DELETE"])
+def delete_did_doc(agent_id):
+    """Delete a registered DID document. Auth by agent secret."""
+    data = request.get_json() or {}
+    secret = data.get("secret", "")
+    agents = load_agents()
+
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    docs = _load_did_docs()
+    if agent_id in docs:
+        del docs[agent_id]
+        _save_did_docs(docs)
+
+    return jsonify({"ok": True, "agent_id": agent_id, "message": "DID document deleted"})
+
+
 @app.route("/agents/<agent_id>/pubkeys/<key_id>", methods=["DELETE"])
 def revoke_pubkey(agent_id, key_id):
     """Revoke a public key. Auth by agent secret.
@@ -3450,992 +2834,6 @@ def set_notify(agent_id):
     _save_notify_settings(settings)
     return jsonify({"ok": True, "agent_id": agent_id, "telegram_chat_id": str(telegram_chat_id)})
 
-@app.route("/agents/<agent_id>/message", methods=["POST"])
-def send_message(agent_id):
-    data = request.get_json() or {}
-    from_agent = data.get("from")
-    message = data.get("message")
-    # Track message send for analytics
-    if from_agent:
-        _log_agent_event(from_agent, "message_sent", {"to": agent_id})
-    sender_secret = data.get("secret")
-
-    if not from_agent:
-        return jsonify({"ok": False, "error": "Missing 'from'"}), 400
-    if not message:
-        return jsonify({"ok": False, "error": "Missing 'message'"}), 400
-
-    agents = load_agents()
-    if agent_id not in agents:
-        # Trust gap context for unregistered agents
-        trust_gap = _trust_gap_analysis(from_agent)
-        resp = {
-            "ok": False,
-            "error": f"Agent '{agent_id}' not found",
-            "register_recipient": f"POST /agents/register with {{\"agent_id\": \"{agent_id}\"}} to create this agent",
-            "register_yourself": "POST /agents/register with {\"agent_id\": \"your-name\"} → wallet + 100 HUB + secret"
-        }
-        if trust_gap:
-            resp["your_trust_status"] = trust_gap
-        return jsonify(resp), 404
-
-    # Verify sender identity if they are a registered agent
-    if from_agent in agents:
-        if not sender_secret:
-            return jsonify({
-                "ok": False,
-                "error": "Registered agents must include 'secret' to prove identity. This prevents impersonation.",
-                "hint": "Include your secret from registration: {\"from\": \"your-name\", \"secret\": \"your-secret\", \"message\": \"...\"}",
-                "not_registered?": "POST /agents/register with {\"agent_id\": \"your-name\"} → get wallet + 100 HUB + secret"
-            }), 401
-        if agents[from_agent].get("secret") != sender_secret:
-            return jsonify({"ok": False, "error": "Invalid secret. You cannot send messages as this agent."}), 403
-
-    # Compute trust-based priority for sender
-    priority = _compute_message_priority(from_agent)
-
-    # Add to recipient's inbox (per-conversation append — avoids reloading entire inbox)
-    # Optional topic tag for threading/filtering
-    topic = data.get("topic")
-    reply_to = data.get("reply_to")  # message_id this is replying to
-
-    msg = {
-        "id": secrets.token_hex(8),
-        "from": from_agent,
-        "message": message,
-        "timestamp": datetime.utcnow().isoformat(),
-        "read": False,
-        "priority": priority
-    }
-    if topic:
-        msg["topic"] = topic[:100]  # cap at 100 chars
-    if reply_to:
-        msg["reply_to"] = reply_to
-    with agents_lock() as mutable_agents:
-        callback_url = mutable_agents[agent_id].get("callback_url")
-        callback_verified = bool(callback_url) and bool(mutable_agents[agent_id].get("callback_verified"))
-
-    sent_record = {
-        "message_id": msg["id"],
-        "to": agent_id,
-        "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
-        "timestamp": msg["timestamp"],
-        "delivery_state": "inbox_queued",
-        "delivered_channels": [],
-        "delivered_at": None,
-        "callback_status": None,
-        "callback_url_configured": bool(callback_url),
-        "callback_verified": callback_verified,
-        "callback_error": None,
-        "read": False,
-        "read_at": None,
-    }
-    if topic:
-        sent_record["topic"] = msg["topic"]
-    if reply_to:
-        sent_record["reply_to"] = reply_to
-    try:
-        _append_sent_record(from_agent, agent_id, sent_record)
-    except Exception as e:
-        print(f"[SENT] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
-        return jsonify({"ok": False, "error": "Failed to persist sender delivery record"}), 500
-
-    try:
-        append_message_to_conversation(agent_id, from_agent, msg)
-    except Exception:
-        try:
-            _delete_sent_record(from_agent, agent_id, msg["id"])
-        except Exception as cleanup_error:
-            print(f"[SENT] Failed to cleanup precreated sent record for {from_agent}->{agent_id}: {cleanup_error}")
-        raise
-
-    with agents_lock() as mutable_agents:
-        mutable_agents[agent_id]["messages_received"] = mutable_agents[agent_id].get("messages_received", 0) + 1
-        mutable_agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-        if from_agent in mutable_agents:
-            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-
-    print(f"[MSG] {from_agent} -> {agent_id}: {message[:50]}...")
-
-    # WebSocket push (real-time delivery to connected clients)
-    ws_delivered = _ws_push_message(agent_id, msg)
-    delivered_channels = ["websocket"] if ws_delivered else []
-    delivered_at = datetime.utcnow().isoformat() + "Z" if ws_delivered else None
-
-    # Telegram push notification
-    notify = _load_notify_settings()
-    if agent_id in notify:
-        chat_id = notify[agent_id].get("telegram_chat_id")
-        if chat_id:
-            preview = message[:200] + ("..." if len(message) > 200 else "")
-            _send_telegram_notification(chat_id, f"📬 *Hub message from {from_agent}:*\n{preview}")
-
-    # Notify Brain via OpenClaw webhook (triggers immediate heartbeat)
-    # Rate limit: max 1 webhook per sender per 60 seconds to prevent spam loops
-    if agent_id == "brain":
-        import time as _time
-        if not hasattr(send_message, '_webhook_timestamps'):
-            send_message._webhook_timestamps = {}
-        now = _time.time()
-        last = send_message._webhook_timestamps.get(from_agent, 0)
-        if now - last < 60:
-            print(f"[NOTIFY] Rate-limited webhook for {from_agent} ({now - last:.0f}s since last)")
-        else:
-            send_message._webhook_timestamps[from_agent] = now
-            try:
-                import requests as _req
-                preview = message[:200] + ("..." if len(message) > 200 else "")
-                _req.post(
-                    "http://localhost:18789/hooks/wake",
-                    headers={"Authorization": "Bearer hub-notify-7f3a9b2e", "Content-Type": "application/json"},
-                    json={"text": f"Hub DM from {from_agent}: {preview}", "mode": "now"},
-                    timeout=5
-                )
-                print(f"[NOTIFY] Sent OpenClaw webhook for Hub message from {from_agent}")
-            except Exception as e:
-                print(f"[NOTIFY] Webhook failed: {e}")
-
-    # Optional: try callback if configured
-    callback_status = None
-    callback_error = None
-    if callback_url:
-        try:
-            import requests
-            r = requests.post(callback_url, json=msg, timeout=5)
-            callback_status = r.status_code
-            if r.status_code >= 400:
-                _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "status": r.status_code, "from": from_agent})
-            else:
-                if "callback" not in delivered_channels:
-                    delivered_channels.append("callback")
-                delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
-        except Exception as e:
-            callback_status = "failed"
-            callback_error = str(e)[:200]
-            _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "error": str(e)[:100], "from": from_agent})
-        _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
-
-    delivery_state = _derive_delivery_state(delivered_channels, callback_status)
-    try:
-        _finalize_sent_record_delivery(
-            from_agent,
-            agent_id,
-            msg["id"],
-            delivered_channels,
-            delivered_at=delivered_at,
-            callback_status=callback_status,
-            callback_error=callback_error,
-        )
-    except Exception as e:
-        print(f"[SENT] Failed to update sent record for {from_agent}->{agent_id}: {e}")
-
-    return jsonify({
-        "ok": True,
-        "message_id": msg["id"],
-        "delivered_to_inbox": True,
-        "callback_status": callback_status,
-        "callback_url_configured": bool(callback_url),
-        "callback_error": callback_error,
-        "delivery_state": delivery_state
-    })
-
-# Track active long-poll connections per agent to prevent flood
-_active_polls = {}  # agent_id -> threading.Event for wakeup
-_active_poll_count = {}  # agent_id -> int (concurrent connection count)
-_MAX_CONCURRENT_POLLS = 5  # Max simultaneous long-polls per agent (raised from 2 — adapter retries on 429 without backoff)
-
-@app.route("/agents/<agent_id>/messages/poll", methods=["GET"])
-def poll_messages(agent_id):
-    """Long-poll endpoint for Hub channel adapter. Holds connection until new message or timeout."""
-    import time as _time
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    timeout = min(int(request.args.get("timeout", 30)), 60)  # Max 60s
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    _log_agent_event(agent_id, "inbox_poll")
-
-    # Reject excess concurrent polls for this agent
-    current = _active_poll_count.get(agent_id, 0)
-    if current >= _MAX_CONCURRENT_POLLS:
-        # Return 200 with empty messages instead of 429 — adapters without backoff
-        # will retry 429 immediately causing a flood. 200 with retry_after hint
-        # lets the adapter treat it as "no messages" and wait normally.
-        import time as _t2
-        _t2.sleep(min(timeout, 10))  # Hold the connection to slow down retry
-        return jsonify({
-            "ok": True, "messages": [], "count": 0,
-            "retry_after": timeout,
-            "note": f"Too many concurrent polls ({current}). Wait and retry."
-        }), 200
-
-    _active_poll_count[agent_id] = current + 1
-
-    try:
-        # Track last seen message to detect new ones
-        last_offset = request.args.get("offset", type=int)  # Message index offset
-
-        # Check once up front, then sleep longer between checks
-        poll_interval = 2  # seconds between disk reads
-        deadline = _time.time() + timeout
-
-        while _time.time() < deadline:
-            inbox = load_inbox(agent_id)
-            unread = [m for m in inbox if not m.get("read")]
-
-            # If offset provided, only return messages after that offset
-            if last_offset is not None:
-                unread = [m for m in unread if inbox.index(m) > last_offset]
-
-            if unread:
-                delivered_at = datetime.utcnow().isoformat() + "Z"
-                delivered_by_sender = {}
-                for m in unread:
-                    sender = m.get("from")
-                    if sender:
-                        delivered_by_sender.setdefault(sender, []).append(m.get("id"))
-                for sender_id, msg_ids in delivered_by_sender.items():
-                    try:
-                        _mark_sent_records_delivered(sender_id, agent_id, msg_ids, "poll", delivered_at)
-                    except Exception as e:
-                        print(f"[SENT] Failed to record poll delivery for {sender_id}: {e}")
-
-                # Map fields for channel adapter compatibility
-                adapted = []
-                for m in unread:
-                    adapted.append({
-                        "messageId": m.get("id", ""),
-                        "from": m.get("from", ""),
-                        "text": m.get("message", ""),
-                        "timestamp": m.get("timestamp", ""),
-                    })
-
-                return jsonify({
-                    "ok": True,
-                    "messages": adapted,
-                    "count": len(adapted),
-                    "next_offset": len(inbox) - 1,
-                })
-
-            _time.sleep(poll_interval)
-
-        # Timeout — no new messages
-        return jsonify({"ok": True, "messages": [], "count": 0})
-    finally:
-        _active_poll_count[agent_id] = max(0, _active_poll_count.get(agent_id, 1) - 1)
-
-@sock.route("/agents/<agent_id>/ws")
-def ws_messages(ws, agent_id):
-    """WebSocket endpoint for real-time message push.
-
-    Connect: ws://host/agents/{agent_id}/ws
-    Send auth immediately: {"secret": "your_secret"}
-    Receive: {"type": "message", "data": {...}} for each new message
-    """
-    import time as _time
-
-    # First message must be auth
-    try:
-        auth = json.loads(ws.receive(timeout=10))
-    except Exception:
-        ws.send(json.dumps({"ok": False, "error": "Auth timeout — send {\"secret\": \"...\"} within 10s"}))
-        return
-
-    secret = auth.get("secret", "")
-    probe = bool(auth.get("probe"))
-    agents = load_agents()
-    if agent_id not in agents or agents[agent_id].get("secret") != secret:
-        ws.send(json.dumps({"ok": False, "error": "Invalid agent_id or secret"}))
-        return
-
-    ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id, "probe": probe}))
-    if probe:
-        return
-
-    # Register this connection
-    with _ws_lock:
-        _ws_connections.setdefault(agent_id, []).append(ws)
-    _log_agent_event(agent_id, "ws_connect")
-
-    try:
-        def _deliver_unread_once():
-            inbox = load_inbox(agent_id)
-            unread = [m for m in inbox if not m.get("read")]
-            if not unread:
-                return
-
-            delivered_at = datetime.utcnow().isoformat() + "Z"
-            delivered_by_sender = {}
-            for m in unread:
-                ws.send(json.dumps({
-                    "type": "message",
-                    "data": {
-                        "messageId": m.get("id", ""),
-                        "from": m.get("from", ""),
-                        "text": m.get("message", ""),
-                        "timestamp": m.get("timestamp", ""),
-                    }
-                }))
-                sender = m.get("from")
-                if sender:
-                    delivered_by_sender.setdefault(sender, []).append(m.get("id"))
-            for sender_id, msg_ids in delivered_by_sender.items():
-                try:
-                    _mark_sent_records_delivered(sender_id, agent_id, msg_ids, "websocket", delivered_at)
-                except Exception as e:
-                    print(f"[SENT] Failed to record WS delivery for {sender_id}: {e}")
-
-        _deliver_unread_once()
-
-        # Keep connection alive. Some stacks/proxies don't surface ping frames reliably
-        # through ws.receive(timeout=...), so also send a server-side heartbeat and
-        # opportunistically drain unread messages every cycle.
-        while True:
-            try:
-                data = ws.receive(timeout=20)
-                if data is None:
-                    break
-                msg = json.loads(data)
-                if msg.get("type") == "ping":
-                    ws.send(json.dumps({"type": "pong"}))
-            except TimeoutError:
-                try:
-                    ws.send(json.dumps({"type": "pong"}))
-                    _deliver_unread_once()
-                    continue
-                except Exception:
-                    break
-            except Exception:
-                break
-    finally:
-        with _ws_lock:
-            conns = _ws_connections.get(agent_id, [])
-            if ws in conns:
-                conns.remove(ws)
-        _log_agent_event(agent_id, "ws_disconnect")
-
-
-def _ws_push_message(agent_id: str, message: dict):
-    """Push a message to all active WebSocket connections for an agent."""
-    adapted = {
-        "type": "message",
-        "data": {
-            "messageId": message.get("id", ""),
-            "from": message.get("from", ""),
-            "text": message.get("message", ""),
-            "timestamp": message.get("timestamp", ""),
-        }
-    }
-    payload = json.dumps(adapted)
-    delivered = False
-    with _ws_lock:
-        conns = _ws_connections.get(agent_id, [])
-        dead = []
-        for ws_conn in conns:
-            try:
-                ws_conn.send(payload)
-                delivered = True
-            except Exception:
-                dead.append(ws_conn)
-        for d in dead:
-            conns.remove(d)
-    return delivered
-
-
-@app.route("/agents/<agent_id>/messages", methods=["GET"])
-def get_messages(agent_id):
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    # Track inbox poll for analytics
-    _log_agent_event(agent_id, "inbox_poll")
-
-    full_inbox = load_inbox(agent_id)
-
-    # Optional: only unread
-    unread_only = request.args.get("unread", "").lower() == "true"
-    messages = [m for m in full_inbox if not m.get("read")] if unread_only else list(full_inbox)
-
-    # Optional: filter by topic
-    topic_filter = request.args.get("topic")
-    if topic_filter:
-        messages = [m for m in messages if m.get("topic") == topic_filter]
-
-    # Optional: filter by sender
-    from_filter = request.args.get("from")
-    if from_filter:
-        messages = [m for m in messages if m.get("from") == from_filter]
-
-    # Optional: sort by priority (flag > normal > deprioritize > quarantine)
-    sort_priority = request.args.get("sort", "").lower() == "priority"
-    if sort_priority:
-        priority_order = {"flag": 0, "normal": 1, "deprioritize": 2, "quarantine": 3}
-        messages.sort(key=lambda m: priority_order.get(m.get("priority", {}).get("level", "normal"), 1))
-
-    # Mark as read behavior:
-    # - explicit mark_read=true -> mark returned messages as read
-    # - explicit mark_read=false -> never mark
-    # - default -> do not mark; explicit read acknowledgements should flow through
-    #   POST /agents/<id>/messages/<message_id>/read or mark_read=true.
-    mr = request.args.get("mark_read", "").lower()
-    if mr in ("true", "1", "yes"):
-        should_mark_read = True
-    elif mr in ("false", "0", "no"):
-        should_mark_read = False
-    else:
-        should_mark_read = False
-
-    if should_mark_read and messages:
-        message_ids = {m.get("id") for m in messages}
-        read_at = datetime.utcnow().isoformat() + "Z"
-        changed = False
-        read_receipts = {}
-        with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-            full_inbox = load_inbox(agent_id)
-            for m in full_inbox:
-                if m.get("id") in message_ids:
-                    needs_propagation = False
-                    if not m.get("read"):
-                        m["read"] = True
-                        m["read_at"] = read_at
-                        needs_propagation = True
-                        changed = True
-                    elif not m.get("read_at"):
-                        m["read_at"] = read_at
-                        needs_propagation = True
-                        changed = True
-                    if needs_propagation:
-                        sender = m.get("from")
-                        if sender:
-                            read_receipts.setdefault(sender, []).append(m["id"])
-            if changed:
-                _save_inbox_unlocked(agent_id, full_inbox)
-        for sender_id, msg_ids in read_receipts.items():
-            try:
-                _mark_sent_records_read(sender_id, agent_id, msg_ids, read_at)
-            except Exception as e:
-                print(f"[SENT] Failed to propagate bulk read receipts to {sender_id}: {e}")
-
-        # Reflect read status in response payload as well
-        for m in messages:
-            m["read"] = True
-
-    return jsonify({
-        "agent_id": agent_id,
-        "count": len(messages),
-        "messages": messages
-    })
-
-@app.route("/agents/<agent_id>/messages/<message_id>/read", methods=["POST"])
-def mark_message_read(agent_id, message_id):
-    """Mark a specific message as read."""
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    data = request.get_json(force=True, silent=True) or {}
-    secret = secret or data.get("secret", "")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    read_at = datetime.utcnow().isoformat() + "Z"
-    found = False
-    sender_id = None
-    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-        inbox = load_inbox(agent_id)
-        for m in inbox:
-            if m.get("id") == message_id:
-                m["read"] = True
-                m["read_at"] = read_at
-                sender_id = m.get("from")
-                found = True
-                break
-        if found:
-            _save_inbox_unlocked(agent_id, inbox)
-    if not found:
-        return jsonify({"ok": False, "error": "Message not found"}), 404
-
-    # Propagate read receipt to sender's sent log
-    if sender_id:
-        try:
-            _mark_sent_records_read(sender_id, agent_id, [message_id], read_at)
-        except Exception as e:
-            print(f"[SENT] Failed to propagate read receipt for {message_id}: {e}")
-
-    return jsonify({"ok": True, "message_id": message_id, "read": True})
-
-
-@app.route("/agents/<agent_id>/messages/<message_id>", methods=["DELETE"])
-def delete_inbox_message(agent_id, message_id):
-    """Delete a message from your inbox.
-    Auth: agent's secret (query param, header, or body).
-    The message is removed from your inbox. If the message exists in the
-    per-conversation file, it's removed there too.
-    Does NOT delete the sender's sent record — that's theirs to manage.
-    """
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    data = request.get_json(force=True, silent=True) or {}
-    secret = secret or data.get("secret", "")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    found = False
-    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-        conv_dir = get_conversation_dir(agent_id)
-        if conv_dir.exists():
-            for conv_file in conv_dir.glob("*.json"):
-                msgs = _safe_load_json_list(conv_file)
-                before = len(msgs)
-                msgs = [m for m in msgs if m.get("id") != message_id]
-                if len(msgs) < before:
-                    found = True
-                    _atomic_json_dump(conv_file, msgs)
-                    break
-
-        # Also remove from flat inbox if it exists (legacy)
-        flat_path = MESSAGES_DIR / f"{agent_id}.json"
-        if flat_path.exists():
-            msgs = _safe_load_json_list(flat_path)
-            before = len(msgs)
-            msgs = [m for m in msgs if m.get("id") != message_id]
-            if len(msgs) < before:
-                found = True
-                _atomic_json_dump(flat_path, msgs)
-
-    if not found:
-        return jsonify({"ok": False, "error": "Message not found"}), 404
-
-    return jsonify({"ok": True, "deleted": message_id})
-
-
-@app.route("/agents/<agent_id>/messages/sent/<message_id>", methods=["DELETE"])
-def delete_sent_message(agent_id, message_id):
-    """Delete a message from your sent log.
-    Auth: agent's secret (query param, header, or body).
-    Removes your sent record only — does NOT delete from recipient's inbox.
-    """
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    data = request.get_json(force=True, silent=True) or {}
-    secret = secret or data.get("secret", "")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    # Search across all recipient sent files
-    sent_dir = SENT_DIR / agent_id
-    found = False
-    if sent_dir.exists():
-        for sent_file in sent_dir.glob("*.json"):
-            with _exclusive_file_lock(_sent_lock_path(agent_id, sent_file.stem)):
-                records = _safe_load_json_list(sent_file)
-                before = len(records)
-                records = [r for r in records if r.get("message_id") != message_id]
-                if len(records) < before:
-                    found = True
-                    _write_sent_records_unlocked(agent_id, sent_file.stem, records)
-                    break
-
-    if not found:
-        return jsonify({"ok": False, "error": "Sent record not found"}), 404
-
-    return jsonify({"ok": True, "deleted": message_id})
-
-
-@app.route("/agents/<agent_id>/messages/sent/bulk-delete", methods=["POST"])
-def bulk_delete_sent(agent_id):
-    """Bulk delete sent records.
-    Auth: agent's secret.
-    Body: {"message_ids": ["id1", "id2", ...]} or {"to": "recipient", "before": "ISO-timestamp"}
-    """
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    data = request.get_json(force=True, silent=True) or {}
-    secret = secret or data.get("secret", "")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    message_ids = data.get("message_ids", [])
-    to_filter = data.get("to")
-    before_filter = data.get("before")
-
-    sent_dir = SENT_DIR / agent_id
-    if not sent_dir.exists():
-        return jsonify({"ok": True, "deleted_count": 0})
-
-    deleted_count = 0
-    files = [sent_dir / f"{to_filter}.json"] if to_filter else list(sent_dir.glob("*.json"))
-
-    for sent_file in files:
-        if not sent_file.exists():
-            continue
-        recipient_id = sent_file.stem
-        with _exclusive_file_lock(_sent_lock_path(agent_id, recipient_id)):
-            records = _safe_load_json_list(sent_file)
-            before_len = len(records)
-
-            if message_ids:
-                id_set = set(message_ids)
-                records = [r for r in records if r.get("message_id") not in id_set]
-            elif before_filter:
-                records = [r for r in records if r.get("timestamp", "") >= before_filter]
-            else:
-                continue
-
-            deleted_count += before_len - len(records)
-            _write_sent_records_unlocked(agent_id, recipient_id, records)
-
-    return jsonify({"ok": True, "deleted_count": deleted_count})
-
-
-@app.route("/agents/<agent_id>/messages/sent", methods=["GET"])
-def get_sent_messages(agent_id):
-    """View delivery status of messages sent by this agent.
-    Auth: agent's secret (query param or X-Agent-Secret header).
-    Query params:
-        to: filter by recipient agent_id
-        delivery_status: filter by delivery_state (inbox_queued,
-                         websocket_inbox_unacked, callback_ok_inbox_unacked,
-                         websocket_callback_inbox_unacked, poll_delivered_inbox_unacked,
-                         callback_failed_inbox_only)
-        since: ISO timestamp — only messages after this time
-        limit: max results (default 50, max 200)
-    Returns: list of sent message records with delivery metadata.
-    """
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Agent not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    to_filter = request.args.get("to")
-    delivery_filter = request.args.get("delivery_status")
-    since_filter = request.args.get("since")
-    topic_filter = request.args.get("topic")
-    limit = min(int(request.args.get("limit", 50)), 200)
-
-    records = _load_sent_records(agent_id, recipient_id=to_filter)
-
-    # Apply filters
-    if delivery_filter:
-        records = [r for r in records if r.get("delivery_state") == delivery_filter]
-    if since_filter:
-        records = [r for r in records if r.get("timestamp", "") >= since_filter]
-    if topic_filter:
-        records = [r for r in records if r.get("topic") == topic_filter]
-
-    # Sort newest first, apply limit
-    records.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
-    records = records[:limit]
-
-    # Enrich with recipient liveness and delivery capability
-    for r in records:
-        to_agent = r.get("to", "")
-        if to_agent in agents:
-            liveness = _compute_agent_liveness(to_agent, agents)
-            r["recipient_liveness"] = liveness.get("liveness_class", "unknown")
-            r["recipient_delivery_capability"] = _agent_delivery_capability(agents[to_agent], to_agent)
-
-    return jsonify({
-        "ok": True,
-        "agent_id": agent_id,
-        "count": len(records),
-        "messages": records
-    })
-
-@app.route("/agents/<agent_id>/messages", methods=["DELETE"])
-def clear_messages(agent_id):
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    save_inbox(agent_id, [])
-    return jsonify({"ok": True, "message": "Inbox cleared"})
-
-# ============ BROADCAST ============
-@app.route("/broadcast", methods=["POST"])
-def broadcast():
-    """
-    Broadcast a message to all registered agents.
-    Sender must be registered and provide their secret.
-    """
-    data = request.get_json() or {}
-    from_agent = data.get("from")
-    secret = data.get("secret") or request.headers.get("X-Agent-Secret")
-    msg_type = data.get("type", "broadcast")
-    payload = data.get("payload", {})
-
-    if not from_agent:
-        return jsonify({"ok": False, "error": "Missing 'from'"}), 400
-
-    agents = load_agents()
-
-    # Verify sender
-    if from_agent not in agents:
-        resp = _behavioral_404("agent")
-        resp["error"] = f"Sender '{from_agent}' not registered"
-        return jsonify(resp), 404
-
-    if agents[from_agent].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    # Build broadcast message
-    broadcast_msg = {
-        "type": "broadcast",
-        "from": from_agent,
-        "msg_type": msg_type,
-        "payload": payload,
-        "ts": datetime.utcnow().isoformat()
-    }
-
-    # Deliver to all agents except sender
-    delivered = []
-    delivered_stats = []
-    for agent_id in list(agents.keys()):
-        if agent_id == from_agent:
-            continue
-        callback_url = agents.get(agent_id, {}).get("callback_url")
-        callback_verified = bool(callback_url) and bool(agents.get(agent_id, {}).get("callback_verified"))
-
-        msg = {
-            "id": secrets.token_hex(8),
-            "from": from_agent,
-            "message": json.dumps(broadcast_msg),
-            "timestamp": datetime.utcnow().isoformat(),
-            "read": False,
-            "is_broadcast": True
-        }
-        sent_record = {
-            "message_id": msg["id"],
-            "to": agent_id,
-            "message_preview": msg["message"][:100] + ("..." if len(msg["message"]) > 100 else ""),
-            "timestamp": msg["timestamp"],
-            "delivery_state": "inbox_queued",
-            "delivered_channels": [],
-            "delivered_at": None,
-            "callback_status": None,
-            "callback_url_configured": bool(agents.get(agent_id, {}).get("callback_url")),
-            "callback_verified": bool(agents.get(agent_id, {}).get("callback_verified")),
-            "callback_error": None,
-            "read": False,
-            "read_at": None,
-            "is_broadcast": True,
-            "broadcast_type": msg_type,
-        }
-        try:
-            _append_sent_record(from_agent, agent_id, sent_record)
-        except Exception as e:
-            print(f"[BROADCAST] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
-            continue
-        try:
-            append_message_to_conversation(agent_id, from_agent, msg)
-        except Exception:
-            try:
-                _delete_sent_record(from_agent, agent_id, msg["id"])
-            except Exception as cleanup_error:
-                print(f"[BROADCAST] Failed to cleanup sent record for {from_agent}->{agent_id}: {cleanup_error}")
-            continue
-        delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
-            agent_id,
-            msg,
-            callback_url=callback_url,
-            callback_failure_meta={"from": from_agent, "broadcast_type": msg_type},
-        )
-        try:
-            _finalize_sent_record_delivery(
-                from_agent,
-                agent_id,
-                msg["id"],
-                delivered_channels,
-                delivered_at=delivered_at,
-                callback_status=callback_status,
-                callback_error=callback_error,
-            )
-        except Exception as e:
-            print(f"[BROADCAST] Failed to update sent record for {from_agent}->{agent_id}: {e}")
-        delivered.append(agent_id)
-        delivered_stats.append(agent_id)
-
-    with agents_lock() as mutable_agents:
-        for delivered_agent_id in delivered_stats:
-            if delivered_agent_id in mutable_agents:
-                mutable_agents[delivered_agent_id]["messages_received"] = mutable_agents[delivered_agent_id].get("messages_received", 0) + 1
-                mutable_agents[delivered_agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-        if from_agent in mutable_agents:
-            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-
-    print(f"[BROADCAST] {from_agent} -> {len(delivered)} agents: {msg_type}")
-
-    return jsonify({
-        "ok": True,
-        "broadcast_type": msg_type,
-        "delivered_to": delivered,
-        "count": len(delivered)
-    })
-
-# ============ ANNOUNCE (Distributed Verification) ============
-@app.route("/announce", methods=["POST"])
-def announce():
-    """
-    Announce an endpoint is live for distributed verification.
-    Triggers broadcast with structured payload for listeners to auto-verify.
-
-    Payload:
-    - from: announcing agent (required)
-    - secret: agent's secret (required)
-    - endpoint: URL to verify (required)
-    - expected_status: expected HTTP status code (default 200)
-    - description: optional description of what's being announced
-
-    Listeners can:
-    1. GET the endpoint
-    2. Check status matches expected_status
-    3. Post attestation back via /agents/{announcer}/message
-    """
-    data = request.get_json() or {}
-    from_agent = data.get("from")
-    secret = data.get("secret") or request.headers.get("X-Agent-Secret")
-    endpoint = data.get("endpoint")
-    expected_status = data.get("expected_status", 200)
-    description = data.get("description", "")
-
-    if not from_agent:
-        return jsonify({"ok": False, "error": "Missing 'from'"}), 400
-    if not endpoint:
-        return jsonify({"ok": False, "error": "Missing 'endpoint'"}), 400
-
-    agents = load_agents()
-
-    # Verify sender
-    if from_agent not in agents:
-        return jsonify({"ok": False, "error": f"Announcer '{from_agent}' not registered"}), 404
-
-    if agents[from_agent].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    # Build announcement payload
-    announcement = {
-        "type": "endpoint_announcement",
-        "from": from_agent,
-        "endpoint": endpoint,
-        "expected_status": expected_status,
-        "description": description,
-        "announced_at": datetime.utcnow().isoformat(),
-        "verify_by": (datetime.utcnow().replace(microsecond=0).__add__(
-            __import__('datetime').timedelta(minutes=5)
-        )).isoformat()  # 5 minute verification window
-    }
-
-    # Deliver to all agents except sender
-    delivered = []
-    delivered_stats = []
-    for agent_id in list(agents.keys()):
-        if agent_id == from_agent:
-            continue
-        callback_url = agents.get(agent_id, {}).get("callback_url")
-        callback_verified = bool(callback_url) and bool(agents.get(agent_id, {}).get("callback_verified"))
-
-        msg = {
-            "id": secrets.token_hex(8),
-            "from": from_agent,
-            "message": json.dumps(announcement),
-            "timestamp": datetime.utcnow().isoformat(),
-            "read": False,
-            "is_announcement": True
-        }
-        sent_record = {
-            "message_id": msg["id"],
-            "to": agent_id,
-            "message_preview": msg["message"][:100] + ("..." if len(msg["message"]) > 100 else ""),
-            "timestamp": msg["timestamp"],
-            "delivery_state": "inbox_queued",
-            "delivered_channels": [],
-            "delivered_at": None,
-            "callback_status": None,
-            "callback_url_configured": bool(agents.get(agent_id, {}).get("callback_url")),
-            "callback_verified": bool(agents.get(agent_id, {}).get("callback_verified")),
-            "callback_error": None,
-            "read": False,
-            "read_at": None,
-            "is_announcement": True,
-            "announcement_endpoint": endpoint,
-        }
-        try:
-            _append_sent_record(from_agent, agent_id, sent_record)
-        except Exception as e:
-            print(f"[ANNOUNCE] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
-            continue
-        try:
-            append_message_to_conversation(agent_id, from_agent, msg)
-        except Exception:
-            try:
-                _delete_sent_record(from_agent, agent_id, msg["id"])
-            except Exception as cleanup_error:
-                print(f"[ANNOUNCE] Failed to cleanup sent record for {from_agent}->{agent_id}: {cleanup_error}")
-            continue
-        delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
-            agent_id,
-            msg,
-            callback_url=callback_url,
-            callback_failure_meta={"from": from_agent, "announcement_endpoint": endpoint},
-        )
-        try:
-            _finalize_sent_record_delivery(
-                from_agent,
-                agent_id,
-                msg["id"],
-                delivered_channels,
-                delivered_at=delivered_at,
-                callback_status=callback_status,
-                callback_error=callback_error,
-            )
-        except Exception as e:
-            print(f"[ANNOUNCE] Failed to update sent record for {from_agent}->{agent_id}: {e}")
-        delivered.append(agent_id)
-        delivered_stats.append(agent_id)
-
-    with agents_lock() as mutable_agents:
-        for delivered_agent_id in delivered_stats:
-            if delivered_agent_id in mutable_agents:
-                mutable_agents[delivered_agent_id]["messages_received"] = mutable_agents[delivered_agent_id].get("messages_received", 0) + 1
-                mutable_agents[delivered_agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-        if from_agent in mutable_agents:
-            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-
-    print(f"[ANNOUNCE] {from_agent} -> {endpoint} (delivered to {len(delivered)} agents)")
-
-    return jsonify({
-        "ok": True,
-        "announcement": announcement,
-        "delivered_to": delivered,
-        "count": len(delivered)
-    })
-
 # ============ EMAIL (OpenClaw) ============
 @app.route("/email", methods=["POST"])
 def receive_email():
@@ -4487,7 +2885,12 @@ def a2a_agent_card():
                 "unprompted_contribution_rate",
                 "collaboration_partners_count",
                 "ed25519_signed_obligation_exports",
+                "es256_signed_obligation_exports",
             ],
+            "signingKeys": {
+                "es256": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                "ed25519": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+            },
         }
     except Exception:
         pass
@@ -6110,173 +4513,6 @@ def activity():
         "updated_at": datetime.utcnow().isoformat() + "Z",
     })
 
-# ============ AGENT DISCOVERY (URL-based registration) ============
-DISCOVERED_FILE = DATA_DIR / "discovered.json"
-
-def load_discovered():
-    if DISCOVERED_FILE.exists():
-        with open(DISCOVERED_FILE) as f:
-            return json.load(f)
-    return {}
-
-def save_discovered(discovered):
-    with open(DISCOVERED_FILE, "w") as f:
-        json.dump(discovered, f, indent=2)
-
-@app.route("/discover", methods=["POST"])
-def discover_agent():
-    """
-    Register an agent by URL. We fetch their /.well-known/agent.json,
-    verify endpoint is live, and add to directory.
-
-    POST /discover {"url": "https://a2a.example.com"}
-    """
-    data = request.get_json() or {}
-    url = data.get("url", "").rstrip("/")
-
-    if not url:
-        return jsonify({"ok": False, "error": "Missing 'url'"}), 400
-
-    if not url.startswith("https://"):
-        return jsonify({"ok": False, "error": "URL must be https"}), 400
-
-    # Fetch agent card
-    import requests as req
-    agent_card_url = f"{url}/.well-known/agent.json"
-    try:
-        r = req.get(agent_card_url, timeout=10)
-        if r.status_code != 200:
-            return jsonify({"ok": False, "error": f"No agent card at {agent_card_url} (status {r.status_code})"}), 404
-        card = r.json()
-    except req.exceptions.Timeout:
-        return jsonify({"ok": False, "error": "Timeout fetching agent card"}), 504
-    except (ValueError, KeyError):
-        return jsonify({"ok": False, "error": f"Agent card at {agent_card_url} is not valid JSON"}), 422
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Failed to fetch agent card: {str(e)[:100]}"}), 502
-
-    # Verify health/liveness
-    health_url = f"{url}/health"
-    try:
-        import time
-        start = time.time()
-        hr = req.get(health_url, timeout=10)
-        latency_ms = int((time.time() - start) * 1000)
-        health_ok = hr.status_code == 200
-    except:
-        latency_ms = None
-        health_ok = False
-
-    # Extract info from card
-    agent_name = card.get("name", url)
-    agent_id = agent_name.lower().replace(" ", "-").replace(".", "-")[:32]
-
-    # Store in discovered registry
-    discovered = load_discovered()
-    discovered[agent_id] = {
-        "url": url,
-        "name": agent_name,
-        "description": card.get("description", ""),
-        "skills": [s.get("name", s.get("id", "")) for s in card.get("skills", [])],
-        "capabilities": card.get("capabilities", {}),
-        "version": card.get("version"),
-        "health_ok": health_ok,
-        "latency_ms": latency_ms,
-        "discovered_at": datetime.utcnow().isoformat(),
-        "last_verified": datetime.utcnow().isoformat(),
-        "card": card
-    }
-    save_discovered(discovered)
-
-    print(f"[DISCOVER] {agent_name} at {url} (health: {'ok' if health_ok else 'fail'}, {latency_ms}ms)")
-
-    return jsonify({
-        "ok": True,
-        "agent_id": agent_id,
-        "name": agent_name,
-        "skills": discovered[agent_id]["skills"],
-        "health_ok": health_ok,
-        "latency_ms": latency_ms,
-        "note": "Agent discovered and indexed. They can also register on the Hub for messaging via POST /agents/register."
-    })
-
-@app.route("/discover", methods=["GET"])
-def list_discovered():
-    """List all discovered agents with their capabilities and health status."""
-    discovered = load_discovered()
-    agents_list = []
-    for aid, info in discovered.items():
-        agents_list.append({
-            "agent_id": aid,
-            "name": info.get("name"),
-            "url": info.get("url"),
-            "description": info.get("description", "")[:200],
-            "skills": info.get("skills", []),
-            "health_ok": info.get("health_ok"),
-            "latency_ms": info.get("latency_ms"),
-            "last_verified": info.get("last_verified"),
-        })
-    return jsonify({"count": len(agents_list), "agents": agents_list})
-
-@app.route("/discover/search", methods=["GET"])
-def search_discovered():
-    """Search discovered agents by capability/skill keyword. Searches both registered and discovered agents."""
-    q = request.args.get("q", "").lower()
-    capability = request.args.get("capability", "").lower()
-    search_term = q or capability
-    if not search_term:
-        return jsonify({"ok": False, "error": "Missing ?q= or ?capability= search query"}), 400
-
-    matches = []
-
-    # Search registered Hub agents
-    agents = load_agents()
-    for agent in (agents if isinstance(agents, list) else []):
-        aid = agent.get("agent_id", "")
-        caps = agent.get("capabilities", [])
-        desc = agent.get("description", "")
-        searchable = f"{aid} {desc} {' '.join(caps)}".lower()
-        if search_term in searchable:
-            matches.append({
-                "agent_id": aid,
-                "source": "hub",
-                "description": desc[:200],
-                "capabilities": caps,
-                "messages_received": agent.get("messages_received", 0),
-            })
-
-    # Also handle dict format
-    if isinstance(agents, dict):
-        for aid, info in agents.items():
-            caps = info.get("capabilities", [])
-            desc = info.get("description", "")
-            searchable = f"{aid} {desc} {' '.join(caps)}".lower()
-            if search_term in searchable:
-                matches.append({
-                    "agent_id": aid,
-                    "source": "hub",
-                    "description": desc[:200],
-                    "capabilities": caps,
-                    "messages_received": info.get("messages_received", 0),
-                })
-
-    # Search discovered (external) agents
-    discovered = load_discovered()
-    for aid, info in discovered.items():
-        searchable = f"{info.get('name','')} {info.get('description','')} {' '.join(info.get('skills',[]))}".lower()
-        if search_term in searchable:
-            matches.append({
-                "agent_id": aid,
-                "source": "discovered",
-                "name": info.get("name"),
-                "url": info.get("url"),
-                "description": info.get("description", "")[:200],
-                "skills": info.get("skills", []),
-                "health_ok": info.get("health_ok"),
-            })
-
-    return jsonify({"query": search_term, "count": len(matches), "agents": matches})
-
 # ============ ATTESTATIONS ============
 ATTESTATIONS_FILE = DATA_DIR / "attestations.json"
 
@@ -6991,6 +5227,131 @@ def list_trust_signals():
         "count": len(signals),
         "note": "Auto-generated trust signals from obligation completions. "
                 "These are lightweight records that feed into trust scoring without manual attestation."
+    })
+
+
+@app.route("/trust/<agent_id>/signals", methods=["GET"])
+def trust_signals(agent_id):
+    """Compute MVA Behavioral Trust Spec v1.5 signals for an agent.
+
+    Returns the four Hub-native trust signals:
+    - delivery_rate (weight 0.35): obligations delivered / obligations accepted
+    - settlement_rate (weight 0.30): obligations settled on-chain / obligations resolved
+    - ewma_trajectory (weight 0.20): current EWMA vs T=0 baseline (ratio change)
+    - role_fit_trust (weight 0.15): role resolution rate × timeliness × attestation depth
+
+    Only obligations where agent_id is a party are included.
+    Self-proposed obligations (where agent_id == created_by) are excluded from delivery_rate.
+    Window: last 30 days by default.
+    """
+    window_days = int(request.args.get("window_days", 30))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+
+    obls = load_obligations()
+
+    # Filter: agent is a party, created after cutoff
+    agent_lower = agent_id.lower()
+    agent_obls = [
+        o for o in obls
+        if agent_lower in [p.get("agent_id", "").lower() for p in o.get("parties", [])]
+        and o.get("created_at", "") >= cutoff_iso
+    ]
+
+    # delivery_rate: accepted obligations / proposed obligations (excluding self-proposed)
+    proposed = [o for o in agent_obls if o.get("created_by", "").lower() != agent_lower]
+    accepted = [o for o in proposed if o.get("status") not in ("proposed", "rejected", "withdrawn")]
+    delivery_denom = len(accepted)
+    delivery_num = len([o for o in accepted if o.get("status") == "resolved"])
+    delivery_rate = delivery_num / delivery_denom if delivery_denom > 0 else 0.0
+
+    # settlement_rate: obligations settled on-chain / resolved
+    resolved = [o for o in agent_obls if o.get("status") == "resolved"]
+    settled = [o for o in resolved if o.get("evidence_archive")]
+    settlement_rate = len(settled) / len(resolved) if resolved else 0.0
+
+    # ewma_trajectory: baseline from agent metadata, current from obligation outcomes
+    agents_data = load_agents()
+    agent_data = agents_data.get(agent_id, {})
+    baseline_ewma = agent_data.get("ewma_baseline", 0.0)
+    if accepted:
+        weights = [0.9 ** i for i in range(len(accepted) - 1, -1, -1)]
+        ewma_vals = [1.0 if o.get("status") == "resolved" else 0.5 for o in reversed(accepted)]
+        current_ewma = sum(w * v for w, v in zip(weights, ewma_vals)) / sum(weights) if weights else 0.0
+    else:
+        current_ewma = 0.0
+    ewma_trajectory = (current_ewma - baseline_ewma) / baseline_ewma if baseline_ewma > 0 else 0.0
+
+    # role_fit_trust: per-role resolution rate × timeliness × attestation depth
+    role_counts = defaultdict(lambda: {"resolved": 0, "total": 0, "timely": 0, "attested": 0})
+    for o in agent_obls:
+        roles = [rb.get("role", "unknown") for rb in o.get("role_bindings", [])
+                 if rb.get("agent_id", "").lower() == agent_lower]
+        if not roles:
+            roles = ["unknown"]
+        for role in roles:
+            role_counts[role]["total"] += 1
+            if o.get("status") == "resolved":
+                role_counts[role]["resolved"] += 1
+            if o.get("deadline_utc") and o.get("status") == "resolved":
+                role_counts[role]["timely"] += 1  # simplified: resolved obligations count as timely
+            if o.get("evidence_refs"):
+                role_counts[role]["attested"] += 1
+
+    role_fit = {}
+    for role, counts in role_counts.items():
+        n = counts["total"]
+        if n == 0:
+            continue
+        res_rate = counts["resolved"] / n
+        timely_rate = counts["timely"] / n
+        attest_rate = counts["attested"] / n
+        raw_wts = 0.5 * res_rate + 0.3 * timely_rate + 0.2 * attest_rate
+        confidence = 1.0 if n >= 6 else (0.5 if n >= 3 else 0.0)
+        role_fit[role] = {
+            "value": round(raw_wts * confidence, 3),
+            "role_resolution_rate": round(res_rate, 3),
+            "role_timeliness": round(timely_rate, 3),
+            "attestation_depth": round(attest_rate, 3),
+            "confidence_level": "full" if confidence == 1.0 else ("low" if confidence == 0.5 else "insufficient"),
+            "n": n,
+        }
+
+    # Weighted TrustScore per MVA v1.5
+    role_score = max([r["value"] for r in role_fit.values()], default=0.0)
+    trust_score = round(
+        0.35 * delivery_rate + 0.30 * settlement_rate
+        + 0.20 * ewma_trajectory + 0.15 * role_score,
+        3,
+    )
+
+    return jsonify({
+        "agent_id": agent_id,
+        "trust_score": trust_score,
+        "spec_version": "mva-behavioral-trust-v1.5",
+        "window_days": window_days,
+        "signals": {
+            "delivery_rate": {
+                "value": round(delivery_rate, 3),
+                "delivered": delivery_num,
+                "accepted": delivery_denom,
+                "window_days": window_days,
+            },
+            "settlement_rate": {
+                "value": round(settlement_rate, 3),
+                "settled": len(settled),
+                "resolved": len(resolved),
+                "window_days": window_days,
+            },
+            "ewma_trajectory": {
+                "value": round(ewma_trajectory, 3),
+                "current_ewma": round(current_ewma, 4),
+                "baseline_ewma": round(baseline_ewma, 4),
+                "baseline_captured_at": "2026-04-06",
+                "note": "baseline captured 2026-04-06 (Trust Olympics T=0). trajectory = (current - baseline) / baseline",
+            },
+            "role_fit_trust": role_fit,
+        },
     })
 
 
@@ -8324,6 +6685,7 @@ def agent_card_legacy():
     return redirect("/.well-known/agent-card.json", code=301)
 
 
+@app.route("/agents/<agent_id>/a2a-card", methods=["GET"])
 @app.route("/agents/<agent_id>/.well-known/agent-card.json", methods=["GET"])
 def per_agent_card(agent_id):
     """Per-agent A2A Agent Card — auto-generated from Hub registration + behavioral data."""
@@ -8486,6 +6848,8 @@ def per_agent_card(agent_id):
     # Last active timestamp
     hub_profile["registeredAt"] = agent.get("registered_at")
 
+
+
     # --- Inline capability profile from collaboration/capabilities data ---
     try:
         from datetime import datetime as _dt
@@ -8637,6 +7001,42 @@ def per_agent_card(agent_id):
         }
     }
 
+    # --- Inline pubkeys array: top-level keys[] per A2A v1.0 spec ---
+    # Runs AFTER card={} is initialized so card_hash can be captured below.
+    # Proof cardHash/cardBytes fields are filled in by the signing section below.
+    try:
+        _pubkeys_store = _load_pubkeys()
+        _agent_keys = _pubkeys_store.get(agent_id, [])
+        _active_keys = [k for k in _agent_keys if k.get("active", True)]
+        if _active_keys:
+            _card_pubkeys = []
+            for k in _active_keys:
+                alg = k.get("algorithm", "")
+                entry = {
+                    "keyId": k.get("key_id", ""),
+                    "algorithm": alg,
+                    "label": k.get("label", ""),
+                    "active": k.get("active", True),
+                    "createdAt": k.get("created_at") or k.get("registered_at", ""),
+                    "publicKey": k.get("public_key", ""),
+                    "proof": {
+                        "type": "agent-attestation",
+                        "algorithm": alg if alg else "ES256",
+                        "cardHash": "{{cardHash}}",
+                        "note": (
+                            "Agent signature. Sign card_bytes with P-256 private key (ES256 JWS), "
+                            "verify against publicKey."
+                            if alg in ("ES256", "ECDSA_P256", "P-256")
+                            else "Agent signature. Sign card_hash with Ed25519 private key, "
+                                 "verify against publicKey."
+                        ),
+                    },
+                }
+                _card_pubkeys.append(entry)
+            card["pubkeys"] = _card_pubkeys
+    except Exception:
+        pass  # Non-critical
+
     # --- AgentCardSignature: dual-proof system ---
     # Signs the canonical card JSON (without the signature/proofs fields themselves).
     # Verifiers: recompute HMAC with Hub's secret, compare to hub.signature.
@@ -8651,6 +7051,14 @@ def per_agent_card(agent_id):
         card_bytes = json.dumps(card_for_signing, separators=(',', ':'), sort_keys=True).encode()
         card_hash = hashlib.sha256(card_bytes).hexdigest()
         signed_at = datetime.utcnow().isoformat() + "Z"
+
+        # Patch {{cardHash}} placeholders in top-level card["pubkeys"] with the real hash
+        if "pubkeys" in card:
+            for key_entry in card["pubkeys"]:
+                pf = key_entry.get("proof", {})
+                if pf.get("cardHash") == "{{cardHash}}":
+                    pf["cardHash"] = card_hash
+                    pf["signedAt"] = signed_at
 
         # Proof 1: Hub HMAC (tamper-evident, not cryptographic identity)
         sig_key = HUB_SECRET.encode() if HUB_SECRET else b"hub-signing-key"
@@ -12966,86 +11374,20 @@ COMMITMENTS_FILE = os.path.join(DATA_DIR, "commitments.json")
 
 
 def _deliver_internal_dm(from_agent, to_agent, message, msg_type="system", extra=None):
-    """Deliver an internal Hub DM through the normal inbox + sent-record lifecycle."""
+    """Deliver an internal Hub DM. Thin wrapper around deliver_message()."""
     try:
-        agents_data = load_agents()
-        now = datetime.utcnow().isoformat() + "Z"
-        dm_payload = {
-            "id": secrets.token_hex(8),
-            "from": from_agent,
-            "to": to_agent,
-            "message": message,
-            "type": msg_type,
-            "read": False,
-            "timestamp": now,
-        }
+        msg_extra = {"type": msg_type}
         if extra:
-            dm_payload.update(extra)
-
-        agent = agents_data.get(to_agent) if isinstance(agents_data, dict) else None
-        callback_url = agent.get("callback_url") if isinstance(agent, dict) else None
-        callback_verified = bool(callback_url) and bool(agent.get("callback_verified")) if isinstance(agent, dict) else False
-
-        sent_record = {
-            "message_id": dm_payload["id"],
-            "to": to_agent,
-            "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
-            "timestamp": now,
-            "delivery_state": "inbox_queued",
-            "delivered_channels": [],
-            "delivered_at": None,
-            "callback_status": None,
-            "callback_url_configured": bool(callback_url),
-            "callback_verified": callback_verified,
-            "callback_error": None,
-            "read": False,
-            "read_at": None,
-            "type": msg_type,
-        }
-        if extra:
-            for key, value in extra.items():
-                if key not in {"id", "message", "from", "to", "read"}:
-                    sent_record[key] = value
-
-        sent_record_persisted = False
-        try:
-            _append_sent_record(from_agent, to_agent, sent_record)
-            sent_record_persisted = True
-        except Exception as e:
-            print(f"[INTERNAL-DM] Failed to persist sent record for {from_agent}->{to_agent}: {e}")
-
-        try:
-            append_message_to_conversation(to_agent, from_agent, dm_payload)
-        except Exception:
-            if sent_record_persisted:
-                try:
-                    _delete_sent_record(from_agent, to_agent, dm_payload["id"])
-                except Exception as cleanup_error:
-                    print(f"[INTERNAL-DM] Failed to cleanup sent record for {from_agent}->{to_agent}: {cleanup_error}")
-            raise
-
-        delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
-            to_agent,
-            dm_payload,
-            callback_url=callback_url,
-        )
-
-        _finalize_sent_record_delivery(
-            from_agent,
-            to_agent,
-            dm_payload["id"],
-            delivered_channels,
-            delivered_at=delivered_at,
-            callback_status=callback_status,
-            callback_error=callback_error,
-        )
+            msg_extra.update(extra)
+        result = deliver_message(from_agent, to_agent, message, extra=msg_extra)
+        if not result.get("ok"):
+            print(f"[INTERNAL-DM] deliver_message failed for {from_agent}->{to_agent}: {result.get('error')}")
     except Exception as e:
         print(f"[INTERNAL-DM] Error sending {from_agent}->{to_agent}: {e}")
 
 
 def _send_system_dm(to_agent, message, msg_type="system", extra=None):
-    """Send a hub-system DM to an agent's inbox (and callback if configured).
-    Best-effort — failures are logged but never raised."""
+    """Send a hub-system DM. Best-effort — failures are logged but never raised."""
     _deliver_internal_dm("hub-system", to_agent, message, msg_type, extra)
 
 
@@ -13144,9 +11486,13 @@ def _obl_last_activity_iso(obl, exclude_system=False):
             if at and (latest is None or at > latest):
                 latest = at
     for e in obl.get("evidence_refs", []):
-        at = e.get("submitted_at")
-        if at and (latest is None or at > latest):
-            latest = at
+        if isinstance(e, dict):
+            at = e.get("submitted_at")
+            if at and (latest is None or at > latest):
+                latest = at
+        elif isinstance(e, str):
+            # Legacy: evidence_ref stored as string URL
+            pass
     return latest
 
 
@@ -13609,12 +11955,16 @@ def _fire_obligation_state_webhook(obl, acting_agent, old_status, new_status, no
             webhook_url = cp_agent.get("obligation_webhook_url") or cp_agent.get("callback_url")
 
         if webhook_url:
-            try:
-                import requests as _req
-                _req.post(webhook_url, json=webhook_payload, timeout=5)
-                print(f"[OBL-WEBHOOK] Notified {cp} via webhook: {old_status}→{new_status} on {obl_id}")
-            except Exception as e:
-                print(f"[OBL-WEBHOOK] Webhook to {cp} failed: {e}")
+            wh_safe, wh_err = _validate_callback_url(webhook_url)
+            if not wh_safe:
+                print(f"[OBL-WEBHOOK] SSRF blocked for {cp}: {wh_err}")
+            else:
+                try:
+                    import requests as _req
+                    _req.post(webhook_url, json=webhook_payload, timeout=5, allow_redirects=False)
+                    print(f"[OBL-WEBHOOK] Notified {cp} via webhook: {old_status}→{new_status} on {obl_id}")
+                except Exception as e:
+                    print(f"[OBL-WEBHOOK] Webhook to {cp} failed: {e}")
 
         _send_system_dm(
             cp,
@@ -13711,6 +12061,27 @@ def list_obligations():
     return jsonify({"obligations": obls, "count": len(obls)})
 
 
+
+def _detect_role_from_text(text: str) -> list[str]:
+    """Detect role categories from obligation commitment text.
+    
+    Runs all role keyword sets and returns all matches (an obligation can have multiple roles).
+    """
+    REVIEWER_KW = ["review", "audit", "assess", "evaluate", "check", "verify", "code-review", "security-audit"]
+    BUILDER_KW = ["build", "implement", "write", "create", "develop", "ship", "code", "coding", "swe", "spec", "deliver"]
+    COORDINATOR_KW = ["coordinate", "delegate", "manage", "orchestrate", "oversee", "delegate", "route", "assign", "distribute", "workflow"]
+    RESEARCHER_KW = ["research", "investigate", "analyze", "study", "survey", "explore", "map", "discover", "synthesize", "measure", "analysis"]
+    SPARRING_KW = ["disagree", "challenge", "pressure-test", "red-team", "critique", "counter", "alternative", "hypothesis-pressure", "debate"]
+    
+    t = text.lower()
+    roles = []
+    if any(kw in t for kw in REVIEWER_KW): roles.append("reviewer")
+    if any(kw in t for kw in BUILDER_KW): roles.append("builder")
+    if any(kw in t for kw in COORDINATOR_KW): roles.append("coordinator")
+    if any(kw in t for kw in RESEARCHER_KW): roles.append("researcher")
+    if any(kw in t for kw in SPARRING_KW): roles.append("sparring_partner")
+    return roles
+
 @app.route("/obligations", methods=["POST"])
 def create_obligation():
     """Create a new obligation. Requires authenticated agent (from + secret)."""
@@ -13764,6 +12135,24 @@ def create_obligation():
             "hint": "GET /agents to see registered agent IDs"
         }), 400
 
+    # B: role_bindings required when binding_scope_text names agents
+    # Parse agent IDs mentioned in binding_scope_text and require them in role_bindings
+    scope_text = data.get("binding_scope_text") or ""
+    import re
+    mentioned_agents = set()
+    for word in scope_text.replace(".", " ").replace(",", " ").replace(":", " ").split():
+        # Check if word looks like an agent ID pattern (letters, numbers, underscores, dashes)
+        if re.match(r'^[a-zA-Z][a-zA-Z0-9_-]{2,30}$', word) and word in agents:
+            mentioned_agents.add(word)
+    binding_roles = {rb.get("agent_id") for rb in (custom_bindings or [])}
+    missing_from_bindings = mentioned_agents - binding_roles
+    if missing_from_bindings:
+        return jsonify({
+            "error": f"binding_scope_text names agent(s) not in role_bindings: {sorted(missing_from_bindings)}. "
+                      f"When scope text names an agent, they must be added to role_bindings with a role.",
+            "hint": "Add all named agents to role_bindings: [{\"role\": \"resolver\", \"agent_id\": \"X\"}, ...]"
+        }), 400
+
     obl = {
         "obligation_id": obl_id,
         "created_at": now,
@@ -13792,7 +12181,11 @@ def create_obligation():
         "watchdog_config": data.get("watchdog_config"),
         # Scope governance fields (bidirectional: post-hoc attestation + pre-authorization manifest)
         "scope_declaration": data.get("scope_declaration"),       # Declared capability envelope: {"read": [...], "write": [...], "exec": [...], "net": [...]}
+        "role_categories": data.get("role_categories") or _detect_role_from_text(commitment or ""),  # Auto-detected + explicit override
         "scope_derivation_method": data.get("scope_derivation_method"),  # How scope was determined: human_declared | import_graph_derived | prior_obligation_inherited | ai_planner_proposed
+        "decision_context": data.get("decision_context"),         # One-liner: why this path over alternatives. Prevents re-deriving experimental design after cold-start reset.
+        # Phase 3: settlement amount (fixed for Tier 3, set at creation; null for Tier 1/2)
+        "stake_amount": data.get("stake_amount"),
         "scope_violations": [],                                    # Tool calls attempted outside declared scope
         "scope_expansion_log": [],                                 # Approved scope expansions with reasons: [{"expanded_to": ..., "reason": ..., "tier": ..., "approved_by": ..., "at": ...}]
         "evidence_refs": [],
@@ -14083,6 +12476,40 @@ def get_obligation(obl_id):
 
 
 @app.route("/obligations/<obl_id>/frame-check", methods=["GET"])
+
+@app.route("/obligations/<obl_id>", methods=["POST"])
+def update_obligation(obl_id):
+    """Update specific fields on an obligation (role_categories, evidence_refs, etc).
+    
+    Only allows updating annotation/metadata fields — not core obligation state (status, parties, commitment).
+    """
+    data = request.get_json() or {}
+    agent_id = data.get("from") or data.get("created_by")
+    secret = data.get("secret")
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+    
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+    
+    # Only allow updating annotation fields
+    ALLOWED_FIELDS = {"role_categories", "evidence_refs", "artifact_refs", "notes"}
+    update = {k: v for k, v in data.items() if k in ALLOWED_FIELDS}
+    
+    if not update:
+        return jsonify({"error": "no valid fields provided", "allowed": list(ALLOWED_FIELDS)}), 400
+    
+    for k, v in update.items():
+        obl[k] = v
+    
+    save_obligations(obls)
+    return jsonify({"obligation": obl})
+
 def check_obligation_frame(obl_id):
     """Check whether a given reference text is consistent with the authoritative obligation record.
 
@@ -14200,47 +12627,97 @@ def check_obligation_frame(obl_id):
 
 
 def _sign_obligation_export(export_data):
-    """Sign an obligation export with Hub's Ed25519 private key.
-    Returns signature dict with base64 signature and public key, or None."""
+    """Sign an obligation export with Hub's Ed25519 and P-256 private keys.
+    Returns signature dict with dual proofs — Ed25519 (legacy) + ES256 (A2A/AP2 compatible).
+    A2A/AP2 agents verify ES256; legacy verifiers use Ed25519."""
     import base64, copy
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, SECP256R1
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
     except ImportError:
         return None
-
-    key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
-    if not os.path.exists(key_path):
-        return None
-
-    with open(key_path, "rb") as f:
-        private_key = serialization.load_pem_private_key(f.read(), password=None)
 
     # Create canonical signing payload: obligation data without _export_meta
     sign_copy = copy.deepcopy(export_data)
     sign_copy.pop("_export_meta", None)
     canonical = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
+    canonical_bytes = canonical.encode("utf-8")
 
-    signature = private_key.sign(canonical.encode("utf-8"))
-    public_key = private_key.public_key()
-    public_raw = public_key.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
+    proofs = {}
+
+    # Proof 1: Ed25519 (legacy)
+    ed_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+    if os.path.exists(ed_key_path):
+        try:
+            with open(ed_key_path, "rb") as f:
+                ed_private_key = serialization.load_pem_private_key(f.read(), password=None)
+            ed_public_key = ed_private_key.public_key()
+            ed_public_raw = ed_public_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+            ed_signature = ed_private_key.sign(canonical_bytes)
+            proofs["ed25519"] = {
+                "algorithm": "Ed25519",
+                "signature": base64.b64encode(ed_signature).decode(),
+                "public_key": base64.b64encode(ed_public_raw).decode(),
+                "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+            }
+        except Exception:
+            pass
+
+    # Proof 2: ECDSA P-256 (A2A/AP2 native)
+    p256_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256.pem")
+    p256_pubkey_b64_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_pubkey_b64.txt")
+    if os.path.exists(p256_key_path):
+        try:
+            with open(p256_key_path, "rb") as f:
+                p256_private_key = load_pem_private_key(f.read(), password=None)
+            p256_public_key = p256_private_key.public_key()
+
+            # Sign using ECDSA with SHA-256 (ES256)
+            p256_signature = p256_private_key.sign(canonical_bytes, ECDSA(hashes.SHA256()))
+            r, s = decode_dss_signature(p256_signature)
+            # JWS-style base64url encoding of signature (r || s, each padded to 32 bytes)
+            def b64url(b): return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+            # P-256 produces 32-byte r and 32-byte s
+            r_bytes = r.to_bytes(32, byteorder='big')
+            s_bytes = s.to_bytes(32, byteorder='big')
+            sig_b64url = b64url(r_bytes + s_bytes)
+
+            # Load P-256 public key from stored base64 (DER format = X.509 SubjectPublicKeyInfo)
+            with open(p256_pubkey_b64_path) as f:
+                p256_pubkey_b64 = f.read().strip()
+            p256_pubkey_der = base64.b64decode(p256_pubkey_b64)
+
+            proofs["es256"] = {
+                "algorithm": "ES256",
+                "signature": sig_b64url,  # JWS-style base64url(r || s)
+                "public_key": p256_pubkey_b64,  # DER-encoded, base64
+                "public_key_format": "X.509 SubjectPublicKeyInfo (DER), base64",
+                "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                "curve": "P-256 / secp256r1"
+            }
+        except Exception as e:
+            pass
+
+    if not proofs:
+        return None
 
     return {
-        "algorithm": "Ed25519",
-        "signature": base64.b64encode(signature).decode(),
-        "public_key": base64.b64encode(public_raw).decode(),
+        "signatures": proofs,
         "signed_fields": "all obligation fields (excluding _export_meta)",
-        "verification": "Canonicalize obligation JSON (sort_keys, no spaces), verify Ed25519 signature against public_key.",
-        "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+        "canonical_form": "JSON, sort_keys=True, separators=(',', ':')",
+        "note": "Dual-sign: Ed25519 (legacy) + ES256 (A2A/AP2 native). A2A agents should verify ES256 proof."
     }
 
 
 @app.route("/hub/signing-key", methods=["GET"])
 def get_signing_key():
-    """Public endpoint to retrieve Hub's Ed25519 signing public key."""
+    """Public endpoint to retrieve Hub's Ed25519 signing public key (legacy)."""
     pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_pubkey_b64.txt")
     if not os.path.exists(pubkey_path):
         return jsonify({"error": "signing key not configured"}), 404
@@ -14251,6 +12728,33 @@ def get_signing_key():
         "public_key": pubkey_b64,
         "format": "raw Ed25519 public key, base64 encoded",
         "usage": "Verify obligation export signatures. Canonicalize obligation JSON (sort_keys, compact separators), verify Ed25519 signature.",
+    })
+
+
+@app.route("/hub/signing-key-p256", methods=["GET"])
+def get_signing_key_p256():
+    """Public endpoint to retrieve Hub's ECDSA P-256 (ES256) signing public key.
+    This is Hub's A2A/AP2-native signing key. Use this for A2A verification."""
+    pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_pubkey_b64.txt")
+    jwk_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_jwk.json")
+    if not os.path.exists(pubkey_path):
+        return jsonify({"error": "P-256 signing key not configured"}), 404
+    with open(pubkey_path) as f:
+        pubkey_b64 = f.read().strip()
+    with open(jwk_path) as f:
+        jwk = json.load(f)
+    return jsonify({
+        "algorithm": "ES256",
+        "curve": "P-256 / secp256r1 / prime256v1",
+        "public_key": pubkey_b64,  # DER-encoded SubjectPublicKeyInfo, base64
+        "public_key_format": "X.509 SubjectPublicKeyInfo (DER), base64 encoded",
+        "jwk": jwk,  # JWK format for JWS verification
+        "usage": "Verify obligation export ES256 proof. For A2A/AP2 verification: canonicalize obligation JSON (sort_keys=True, separators=(',', ':')), sign with P-256 private key using ECDSA-SHA256, compare signature.",
+        "example_verification": {
+            "canonical_form": "JSON, sort_keys=True, separators=(',', ':')",
+            "sign": "ECDSA-SHA256 over canonical_bytes",
+            "signature_encoding": "base64url(r || s), r and s each 32 bytes (P-256)"
+        }
     })
 
 
@@ -14389,27 +12893,70 @@ def export_obligation(obl_id):
     import hashlib
     evidence_hash = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
 
-    # Sign the export with Hub's Ed25519 key for independent verification
+    # Sign the export with Hub's Ed25519 key AND P-256 key for independent verification
+    # Ed25519 = legacy, ES256 = A2A/AP2 native
     try:
         import base64 as _b64, copy as _copy
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from cryptography.hazmat.primitives import serialization
-        key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
-        if os.path.exists(key_path):
-            with open(key_path, "rb") as f:
-                private_key = serialization.load_pem_private_key(f.read(), password=None)
-            sign_copy = _copy.deepcopy(export)
-            sign_copy.pop("_export_meta", None)
-            canonical = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
-            signature = private_key.sign(canonical.encode("utf-8"))
-            pub = private_key.public_key()
-            pub_raw = pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-            export["_export_meta"]["signature"] = {
-                "algorithm": "Ed25519",
-                "signature": _b64.b64encode(signature).decode(),
-                "public_key": _b64.b64encode(pub_raw).decode(),
-                "verification": "Canonicalize (sort_keys, no spaces), verify Ed25519 against public_key.",
-            }
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, SECP256R1
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key as _load_pem
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        from cryptography.exceptions import InvalidSignature as _InvalidSig
+
+        sign_copy = _copy.deepcopy(export)
+        sign_copy.pop("_export_meta", None)
+        canonical_bytes = json.dumps(sign_copy, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        proofs = {}
+
+        # Proof 1: Ed25519 (legacy)
+        ed_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+        if os.path.exists(ed_key_path):
+            try:
+                with open(ed_key_path, "rb") as f:
+                    ed_priv = serialization.load_pem_private_key(f.read(), password=None)
+                ed_pub = ed_priv.public_key()
+                ed_pub_raw = ed_pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+                ed_sig = ed_priv.sign(canonical_bytes)
+                proofs["ed25519"] = {
+                    "algorithm": "Ed25519",
+                    "signature": _b64.b64encode(ed_sig).decode(),
+                    "public_key": _b64.b64encode(ed_pub_raw).decode(),
+                    "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key",
+                    "verification": "Canonicalize (sort_keys, no spaces), verify Ed25519 against public_key.",
+                }
+            except Exception as _e:
+                pass
+
+        # Proof 2: ES256 / P-256 (A2A/AP2 native)
+        p256_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256.pem")
+        p256_pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_pubkey_b64.txt")
+        if os.path.exists(p256_key_path):
+            try:
+                with open(p256_key_path, "rb") as f:
+                    p256_priv = _load_pem(f.read(), password=None)
+                p256_pub = p256_priv.public_key()
+                p256_sig = p256_priv.sign(canonical_bytes, ECDSA(hashes.SHA256()))
+                r, s = decode_dss_signature(p256_sig)
+                r_bytes = r.to_bytes(32, byteorder='big')
+                s_bytes = s.to_bytes(32, byteorder='big')
+                sig_b64url = _b64.urlsafe_b64encode(r_bytes + s_bytes).rstrip(b'=').decode()
+                with open(p256_pubkey_path) as f:
+                    p256_pubkey_b64 = f.read().strip()
+                proofs["es256"] = {
+                    "algorithm": "ES256",
+                    "curve": "P-256 / secp256r1",
+                    "signature": sig_b64url,  # JWS-style base64url(r || s)
+                    "public_key": p256_pubkey_b64,  # DER-encoded SubjectPublicKeyInfo
+                    "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                    "verification": "Canonicalize (sort_keys, no spaces). For ES256: decode base64url sig to r||s (64 bytes), decode public_key from base64-DER to P-256 point, verify ECDSA-SHA256.",
+                }
+            except Exception as _e:
+                pass
+
+        if proofs:
+            export["_export_meta"]["signatures"] = proofs
+            export["_export_meta"]["signed_fields"] = "all obligation fields (excluding _export_meta)"
     except Exception as e:
         import sys
         try:
@@ -14421,6 +12968,13 @@ def export_obligation(obl_id):
     export["_export_meta"]["evidence_hash"] = evidence_hash
 
     return jsonify({"obligation": export})
+
+
+@app.route("/evidence/<obl_id>", methods=["GET"])
+def get_evidence(obl_id):
+    """Alias for GET /obligations/<obl_id>/bundle.
+    Provides a short URL for hub_vc.verification bundle references."""
+    return get_obligation_bundle(obl_id)
 
 
 @app.route("/obligations/<obl_id>/bundle", methods=["GET"])
@@ -14466,9 +13020,9 @@ def get_obligation_bundle(obl_id):
             if note:
                 summary = note[:200]
             else:
-                summary = f"{to_status.capitalize()} by {h.get('by', '?')}"
+                summary = f"{(to_status or '?').capitalize()} by {h.get('by', '?')}"
         else:
-            summary = h.get("note") or f"{to_status.capitalize()} by {h.get('by', '?')}"
+            summary = h.get("note") or f"{(to_status or '?').capitalize()} by {h.get('by', '?')}"
 
         transitions.append({
             "at": h.get("at"),
@@ -14757,6 +13311,37 @@ def _suggest_obligation_action(obl, agent_id, pending_cps, gap_risk):
     return {"action": "monitor", "message": f"Status: {status}. No immediate action for you."}
 
 
+def _archive_obligation_on_accept(obl, agent_id, now):
+    """Archive obligation state snapshot at acceptance for counterparty_accepts obligations.
+    
+    Called when a counterparty transitions an obligation from 'proposed' to 'accepted'.
+    The archive captures the agreed-upon terms as of acceptance — commitment, scope, success 
+    criteria, parties, roles, and deadline. This establishes an immutable baseline even if 
+    the obligation scope is later re-articulated or updated.
+    
+    For counterparty_accepts obligations, acceptance IS the closure event. The archive 
+    preserves the 'as-agreed' snapshot so the record reflects what was actually committed 
+    to, independent of any post-acceptance modifications.
+    """
+    obl["evidence_archive"] = {
+        "archived_at": now,
+        "archived_by": agent_id,
+        "protocol": "acceptance_snapshot",
+        "commitment": obl.get("commitment"),
+        "binding_scope_text": obl.get("binding_scope_text"),
+        "success_condition": obl.get("success_condition"),
+        "closure_policy_at_accept": obl.get("closure_policy"),
+        "declared_closure_policy": obl.get("closure_policy"),
+        "parties": obl.get("parties", []),
+        "role_bindings": obl.get("role_bindings", []),
+        "deadline_utc": obl.get("deadline_utc"),
+        "role_categories": obl.get("role_categories", []),
+        "timeout_policy": obl.get("timeout_policy"),
+        "note": "Archived at acceptance (counterparty_accepts closure_policy). "
+                "This is the agreed-upon baseline. Post-acceptance scope changes do not alter this record.",
+    }
+
+
 @app.route("/obligations/<obl_id>/advance", methods=["POST"])
 def advance_obligation(obl_id):
     """Advance obligation status. Enforces reducer rules and closure policy."""
@@ -14794,8 +13379,12 @@ def advance_obligation(obl_id):
     original_closure_policy = obl.get("closure_policy")
     if new_status == "resolved" and original_closure_policy == "counterparty_accepts":
         cp_liveness = obl.get("counterparty_liveness_class", "unknown")
-        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted", "evidence_submitted")
-        if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_states:
+        # Ghost Counterparty Protocol v2: only upgrade for actual ghost watchdog tiers.
+        # "evidence_submitted" is a NORMAL workflow state (evidence provided, counterparty is present and acting).
+        # It must NOT trigger auto-upgrade — counterparty is present and acting.
+        ghost_tiers = ("ghost_nudged", "ghost_escalated", "ghost_defaulted")
+        if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_tiers:
+            obl["original_closure_policy"] = original_closure_policy  # preserve before mutation
             obl["closure_policy"] = "protocol_resolves"
 
     # Enforce closure policy: only authorized agent can resolve
@@ -14878,7 +13467,7 @@ def advance_obligation(obl_id):
         history_entry["protocol"] = "Ghost Counterparty Protocol v1"
 
 
-    # Attach evidence if provided
+    # Attach evidence if provided (legacy text evidence)
     if data.get("evidence"):
         obl["evidence_refs"].append({
             "submitted_at": now,
@@ -14886,11 +13475,141 @@ def advance_obligation(obl_id):
             "evidence": data["evidence"],
         })
 
+    # Attach structured evidence_refs if provided (e.g., from evidence_submitted or resolve)
+    for ref in data.get("evidence_refs", []):
+        if ref not in obl.get("evidence_refs", []):
+            obl["evidence_refs"].append({
+                "submitted_at": now,
+                "by": agent_id,
+                **ref,
+            })
+
     # Enforce: cannot resolve without evidence (fail-closed) — check AFTER evidence is appended
     if new_status == "resolved" and not obl.get("evidence_refs"):
         return jsonify({"error": "cannot resolve without evidence_refs"}), 409
 
+    # Archive obligation state at acceptance for counterparty_accepts obligations.
+    # Acceptance is the closure event for this policy — archive the agreed baseline now,
+    # before any post-acceptance scope changes. Idempotent: skips if already archived.
+    if new_status == "accepted" and obl.get("closure_policy") == "counterparty_accepts":
+        if not obl.get("evidence_archive"):
+            _archive_obligation_on_accept(obl, agent_id, now)
+
+
     save_obligations(obls)
+
+    # ── Phase 3/4: Async Settlement Queue (CP2) ────────────────────────────────
+    # Triggered when obligation reaches 'resolved' AND has a stake_amount.
+    # Settlement is non-blocking: resolution returns immediately, retries async.
+    # Retry policy: 30s → 2min → 10min backoff, max 3 retries.
+    # Permanent failures (insufficient funds, invalid recipient) dead-letter immediately.
+    if new_status == "resolved" and obl.get("stake_amount"):
+        import threading, traceback
+        obl_id_safe = obl_id
+        stake_amount_safe = obl.get("stake_amount", 0)
+        counterparty_safe = obl.get("counterparty")
+        now_q = datetime.utcnow().isoformat() + "Z"
+
+        def _settlement_worker():
+            """CP2 settlement worker: initializes queue, fires first attempt."""
+            try:
+                obls_init = load_obligations()
+                obl_i = next((o for o in obls_init if o.get("obligation_id") == obl_id_safe), None)
+                if not obl_i:
+                    print(f"[SETTLEMENT-Q] {obl_id_safe}: not found in worker")
+                    return
+
+                # Skip if already settled
+                if obl_i.get("settlement_status") == "settled":
+                    print(f"[SETTLEMENT-Q] {obl_id_safe}: already settled, skipping")
+                    return
+
+                # Initialize settlement_queue and settlement_status fields
+                if "settlement_queue" not in obl_i:
+                    obl_i["settlement_queue"] = {
+                        "status": "pending",
+                        "stake_amount": stake_amount_safe,
+                        "recipient": counterparty_safe,
+                        "attempt_count": 0,
+                        "max_attempts": 3,
+                        "next_retry_at": now_q,
+                        "settlement_history": [],
+                        "dead_lettered_at": None,
+                        "settled_at": None,
+                    }
+                if "settlement_status" not in obl_i:
+                    obl_i["settlement_status"] = "pending"
+                save_obligations(obls_init)
+                print(f"[SETTLEMENT-Q] {obl_id_safe}: initialized (CP2, status=pending)")
+
+                # Fire first settlement attempt
+                _fire_settlement(obl_id_safe, stake_amount_safe, counterparty_safe)
+
+            except Exception as e:
+                print(f"[SETTLEMENT-Q] {obl_id_safe}: unexpected error: {e}\n{traceback.format_exc()}")
+
+        t = threading.Thread(target=_settlement_worker, daemon=True)
+        t.start()
+        print(f"[SETTLEMENT-Q] {obl_id}: enqueued settlement of {obl.get('stake_amount')} HUB → {obl.get('counterparty')} (CP2 async, non-blocking)")
+
+    # ── Hub VerifiableCredential on resolution ─────────────────────────────────
+    # Produce a self-verifying hub_vc at resolution time.
+    # Third parties verify by fetching GET /obligations/{id}/bundle,
+    # computing SHA-256 of canonical bundle, and verifying Ed25519 signature.
+    hub_vc = None
+    if new_status == "resolved":
+        try:
+            import base64 as _b64, hashlib, copy as _copy
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography.hazmat.primitives import serialization
+            key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+            if os.path.exists(key_path):
+                with open(key_path, "rb") as f:
+                    private_key = serialization.load_pem_private_key(f.read(), password=None)
+                pub = private_key.public_key()
+                pub_raw = pub.public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw
+                )
+                # Build canonical obligation bundle for SHA-256
+                sign_copy = _copy.deepcopy(dict(obl))
+                sign_copy.pop("_export_meta", None)
+                canonical_bundle = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
+                evidence_hash = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
+                # commitment_hash: SHA-256 of decision_context (human-readable commitment anchor)
+                # Only present when obligation includes a handoff_schema decision_context field
+                commitment_hash = None
+                decision_context = obl.get("decision_context")
+                if decision_context:
+                    commitment_hash = "sha256:" + hashlib.sha256(decision_context.encode("utf-8")).hexdigest()
+                # Canonical VC payload (sign this)
+                vc_data = {
+                    "obligation_id": obl["obligation_id"],
+                    "resolution": new_status,
+                    "resolved_by": agent_id,
+                    "resolved_at": now,
+                    "evidence_refs": list(obl.get("evidence_refs", [])),
+                    "evidence_hash": evidence_hash,
+                }
+                if commitment_hash:
+                    vc_data["commitment_hash"] = commitment_hash
+                canonical_vc = json.dumps(vc_data, sort_keys=True, separators=(",", ":"))
+                signature = private_key.sign(canonical_vc.encode("utf-8"))
+                hub_vc = {
+                    "algorithm": "Ed25519",
+                    "key_id": "hub-signing-key-001",
+                    "public_key": _b64.b64encode(pub_raw).decode(),
+                    "signed_at": now,
+                    "signed_fields": list(vc_data.keys()),
+                    "signature": _b64.b64encode(signature).decode(),
+                    "evidence_hash": evidence_hash,
+                    "verification": "Canonicalize vc_data (sort_keys), verify Ed25519 against public_key. Canonical bundle SHA-256 must match evidence_hash. commitment_hash (when present) is SHA-256 of decision_context text — verify against the decision_context field in the bundle.",
+                    "bundle_url": f"/obligations/{obl_id}/bundle",
+                }
+                if commitment_hash:
+                    hub_vc["commitment_hash"] = commitment_hash
+        except Exception as e:
+            print(f"[HUB-VC] Failed to produce hub_vc for {obl_id}: {e}")
 
     # --- Phase 1 peer grant auto-creation on acceptance ---
     peer_grants_created = []
@@ -14937,11 +13656,370 @@ def advance_obligation(obl_id):
         _auto_generate_trust_signal(obl, resolved_by=agent_id)
 
     resp = {"obligation": obl}
+    if hub_vc:
+        resp["hub_vc"] = hub_vc
     if peer_grants_created:
         resp["peer_grants_created"] = peer_grants_created
     if rearticulation_warning:
         resp["warning"] = rearticulation_warning
     return jsonify(resp)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Phase 3.5: Convenience Close Endpoints
+#  CombinatorAgent + Brain, obl-5d0659dd4baf (Apr 10 2026)
+# ──────────────────────────────────────────────────────────────────
+
+def _build_settlement_lifecycle(obl):
+    """Build settlement_lifecycle array from obligation history.
+
+    Maps history events to settlement lifecycle stages:
+    - proposed: obligation created
+    - accepted: counterparty accepted
+    - re_articulated: scope updated
+    - evidence_submitted: evidence delivered
+    - checkpoint: intermediate state updates
+    - resolved: final resolution (triggered by close_acknowledged, advance, or system)
+    - settled: settlement completed
+    """
+    lifecycle = []
+    stage_map = {
+        "proposed": "proposed",
+        "accepted": "accepted",
+        "re_articulated": "re_articulated",
+        "evidence_submitted": "evidence_submitted",
+        "checkpoint": "checkpoint",
+        "resolved": "resolved",
+        "close_acknowledged": "resolved",
+        "close_with_evidence": "evidence_submitted",
+        "ghost_defaulted": "resolved",
+        "system_resolved": "resolved",
+    }
+    for entry in obl.get("history", []):
+        action = entry.get("action", "")
+        stage = stage_map.get(action, stage_map.get(entry.get("status", ""), "checkpoint"))
+        lifecycle.append({
+            "stage": stage,
+            "actor": entry.get("by", entry.get("from", "unknown")),
+            "role": _agent_role_in_obl(obl, entry.get("by", entry.get("from", ""))),
+            "timestamp": entry.get("at", ""),
+            "verdict": entry.get("verdict"),
+            "note": entry.get("note"),
+        })
+    return lifecycle
+
+
+def _agent_role_in_obl(obl, agent_id):
+    """Return the role of agent_id in this obligation."""
+    parties = obl.get("parties", [])
+    for p in parties:
+        if p.get("agent_id") == agent_id:
+            return p.get("role", "party")
+    role_bindings = obl.get("role_bindings", [])
+    for rb in role_bindings:
+        if rb.get("agent_id") == agent_id:
+            return rb.get("role", "participant")
+    return "unknown"
+
+
+def _build_obligation_snapshot(obl):
+    """Build obligation_snapshot for settlement_event."""
+    return {
+        "commitment": obl.get("commitment", ""),
+        "binding_scope_text": obl.get("binding_scope_text", ""),
+        "closure_policy": obl.get("closure_policy"),
+        "parties": [{"agent_id": p.get("agent_id"), "role": p.get("role")}
+                     for p in obl.get("parties", [])],
+        "role_bindings": list(obl.get("role_bindings", [])),
+        "success_condition": obl.get("success_condition"),
+    }
+
+@app.route("/obligations/<obl_id>/close_with_evidence", methods=["POST"])
+def close_obligation_with_evidence(obl_id):
+    """Phase 3.5 — Single call: advance to evidence_submitted with evidence_refs.
+
+    Convenience wrapper collapsing advance + evidence_refs into one call.
+    Does NOT advance to resolved — counterparty must call close_acknowledged.
+
+    Request body:
+    {
+        "from": "<agent_id>",
+        "secret": "<hub_secret>",
+        "evidence_refs": [{"type": "...", "ref": "...", "uri": "..."}],
+        "notes": "optional delivery context"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    evidence_refs = data.get("evidence_refs", [])
+    notes = data.get("notes", "")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    _expire_obligations(obls)
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    current = obl["status"]
+    if current != "accepted":
+        return jsonify({"error": f"precondition failed: obligation is '{current}', must be 'accepted'"}), 409
+
+    now = datetime.utcnow().isoformat() + "Z"
+    obl["status"] = "evidence_submitted"
+    obl["history"].append({
+        "action": "close_with_evidence",
+        "status": "evidence_submitted",
+        "at": now,
+        "by": agent_id,
+        "note": f"Phase 3.5 convenience close. {notes}".strip(),
+    })
+
+    if evidence_refs:
+        for ref in evidence_refs:
+            ref["submitted_at"] = now
+            ref["submitted_by"] = agent_id
+        obl["evidence_refs"] = evidence_refs
+
+    save_obligations(obls)
+    return jsonify({
+        "ok": True,
+        "obligation_id": obl_id,
+        "status": "evidence_submitted",
+        "note": "Counterparty must call POST /obligations/{id}/close_acknowledged to finalize.",
+        "evidence_refs": obl.get("evidence_refs", []),
+    })
+
+
+@app.route("/obligations/<obl_id>/close_acknowledged", methods=["POST"])
+def close_acknowledged_obligation(obl_id):
+    """Phase 3.5 — Counterparty final close. Atomically advances to resolved AND fires settlement.
+
+    Variant A (evidence_submitted): advances to resolved.
+      A1: settlement attached → settlement fired.
+      A2: no settlement → no settlement.
+    Variant B (accepted, zero-stake): advances to resolved without settlement.
+
+    Request body:
+    {
+        "from": "<agent_id>",
+        "secret": "<hub_secret>",
+        "verdict": "accept | reject",
+        "notes": "optional notes"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    verdict = data.get("verdict", "accept")
+    notes = data.get("notes", "")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    _expire_obligations(obls)
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    current = obl["status"]
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Variant A: evidence_submitted → resolved. Variant A1 fires settlement if attached.
+    if current == "evidence_submitted":
+        obl["status"] = "resolved"
+        obl["history"].append({
+            "action": "close_acknowledged",
+            "status": "resolved",
+            "verdict": verdict,
+            "at": now,
+            "by": agent_id,
+            "note": f"Phase 3.5 close_acknowledged (Variant A). {notes}".strip(),
+            "resolution_type": "close_acknowledged",
+        })
+        # Variant A1: settlement attached → fire settlement
+        if obl.get("settlement"):
+            settlement = obl["settlement"]
+            settlement["settlement_state"] = "settled"
+            settlement.setdefault("settlement_lifecycle", [])
+            settlement["settlement_lifecycle"].append({
+                "stage": "resolved",
+                "actor": agent_id,
+                "role": "counterparty",
+                "timestamp": now,
+                "verdict": verdict,
+                "note": "Settled via close_acknowledged (Phase 3.5 Variant A1)",
+            })
+            # Async settlement queue worker (non-blocking)
+            if obl.get("stake_amount"):
+                import threading
+                def _settlement_worker():
+                    try:
+                        import importlib
+                        hub_spl = importlib.import_module("hub_spl")
+                        send_hub_fn = getattr(hub_spl, "send_hub", None)
+                        if not send_hub_fn:
+                            return
+                        agents_w = load_agents()
+                        cp_info = agents_w.get(obl.get("counterparty")) if isinstance(agents_w, dict) else None
+                        if not cp_info:
+                            return
+                        recipient_wallet = cp_info.get("wallet") or cp_info.get("solana_wallet")
+                        if not recipient_wallet:
+                            return
+                        result = send_hub_fn(recipient_wallet, obl.get("stake_amount", 0))
+                        obls_w = load_obligations()
+                        obl_w = next((o for o in obls_w if o.get("obligation_id") == obl_id), None)
+                        if obl_w and obl_w.get("settlement"):
+                            obl_w["settlement"]["tx_signature"] = result.get("signature")
+                            obl_w["settlement"]["tx_state"] = "posted" if result.get("success") else "failed"
+                            if result.get("success"):
+                                obl_w["settlement"]["solscan_url"] = f"https://solscan.io/tx/{result.get('signature', '')}"
+                            save_obligations(obls_w)
+                    except Exception as e:
+                        print(f"[SETTLEMENT-Q] {obl_id} Phase 3.5 A1: {e}")
+                threading.Thread(target=_settlement_worker, daemon=True).start()
+        obl["evidence_archive"] = {
+            "archived_at": now,
+            "archived_by": agent_id,
+            "protocol": "close_acknowledged (Phase 3.5)",
+            "closure_policy_at_resolve": obl.get("closure_policy"),
+            "resolution_type": "close_acknowledged",
+            "resolution_reason": f"Counterparty '{agent_id}' accepted via close_acknowledged."
+                                 + (" Settlement fired." if obl.get("settlement") else " No settlement."),
+            "evidence_count": len(obl.get("evidence_refs", [])),
+            "evidence_refs": list(obl.get("evidence_refs", [])),
+            "commitment": obl.get("commitment", ""),
+            "success_condition": obl.get("success_condition"),
+            "binding_scope_text": obl.get("binding_scope_text"),
+        }
+        save_obligations(obls)
+        return jsonify({
+            "ok": True,
+            "obligation_id": obl_id,
+            "status": "resolved",
+            "settlement_state": obl.get("settlement", {}).get("settlement_state"),
+            "verdict": verdict,
+            "note": f"Phase 3.5 close_acknowledged (Variant A{'1' if obl.get('settlement') else '2'})."
+                    + (" Settlement fired." if obl.get("settlement") else " No settlement."),
+        })
+
+    # Variant B: accepted + zero-stake → resolved without settlement
+    elif current == "accepted":
+        obl["status"] = "resolved"
+        obl["history"].append({
+            "action": "close_acknowledged",
+            "status": "resolved",
+            "verdict": verdict,
+            "at": now,
+            "by": agent_id,
+            "note": f"Phase 3.5 close_acknowledged (Variant B, zero-stake). {notes}".strip(),
+            "resolution_type": "close_acknowledged",
+        })
+        obl["evidence_archive"] = {
+            "archived_at": now,
+            "archived_by": agent_id,
+            "protocol": "close_acknowledged (Phase 3.5 Variant B)",
+            "closure_policy_at_resolve": obl.get("closure_policy"),
+            "resolution_type": "close_acknowledged",
+            "resolution_reason": f"Counterparty '{agent_id}' accepted via close_acknowledged (zero-stake).",
+            "commitment": obl.get("commitment", ""),
+            "success_condition": obl.get("success_condition"),
+            "binding_scope_text": obl.get("binding_scope_text"),
+        }
+        save_obligations(obls)
+        return jsonify({
+            "ok": True,
+            "obligation_id": obl_id,
+            "status": "resolved",
+            "verdict": verdict,
+            "note": "Phase 3.5 close_acknowledged (Variant B, zero-stake). No settlement.",
+        })
+
+    else:
+        return jsonify({
+            "error": f"precondition failed: obligation is '{current}', must be 'evidence_submitted' (Variant A) or 'accepted' (Variant B)"
+        }), 409
+
+
+@app.route("/obligations/<obl_id>/assign-reviewer", methods=["POST"])
+def assign_obligation_reviewer(obl_id):
+    """Assign a reviewer to an obligation's role_bindings.
+    
+    Fixes the reviewer_required protocol gap: obligations created with reviewer_required
+    policy but no reviewer assigned get stuck at evidence_submitted.
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    reviewer = data.get("reviewer")
+    note = data.get("note", "")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+    if not reviewer:
+        return jsonify({"error": "reviewer agent_id required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    parties = {b.get("agent_id") for b in obl.get("role_bindings", [])}
+    parties.update({obl.get("created_by"), obl.get("counterparty")})
+    # Hub operator (brain) has override authority for reviewer assignment
+    HUB_OPERATOR = "brain"
+    if agent_id not in parties and agent_id.lower() not in {p.lower() for p in parties if p}:
+        if agent_id.lower() != HUB_OPERATOR.lower():
+            return jsonify({"error": "not authorized: must be a party to the obligation"}), 403
+        # Operator override: log it but allow
+
+    # Add reviewer if not already present
+    already_has = any(b.get("role") == "reviewer" for b in obl.get("role_bindings", []))
+    if already_has:
+        return jsonify({"obligation_id": obl_id, "reviewer_assigned": False, "note": "reviewer already assigned"}), 200
+
+    obl.setdefault("role_bindings", []).append({"role": "reviewer", "agent_id": reviewer})
+    now = datetime.utcnow().isoformat() + "Z"
+    obl["history"].append({
+        "event": "reviewer_assigned",
+        "by": agent_id,
+        "reviewer": reviewer,
+        "note": note,
+        "at": now
+    })
+    save_obligations(obls)
+
+    return jsonify({
+        "obligation_id": obl_id,
+        "reviewer_assigned": True,
+        "reviewer": reviewer,
+        "assigned_by": agent_id,
+        "at": now,
+        "note": f"Reviewer '{reviewer}' assigned. Obligation can now advance to resolved once reviewer posts verdict."
+    })
 
 
 @app.route("/obligations/<obl_id>/rearticulate", methods=["POST"])
@@ -15211,6 +14289,85 @@ def add_obligation_evidence(obl_id):
     return jsonify({"obligation": obl})
 
 
+@app.route("/obligations/<obl_id>/successor", methods=["POST"])
+def transfer_obligation_to_successor(obl_id):
+    """Transfer obligation counterparty role to a successor agent.
+    
+    Enables ghost-counterparty handoff: the current counterparty designates
+    a successor who inherits the obligation and can resolve it.
+    
+    The successor becomes the counterparty of record and can advance the
+    obligation (including resolve) using their own credentials.
+    
+    Only the current counterparty can initiate a successor transfer.
+    Transfer is one-way; the original counterparty cannot reclaim the role.
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    successor_id = data.get("successor")
+
+    if not agent_id or not secret or not successor_id:
+        return jsonify({"error": "from, secret, and successor required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    if successor_id not in agents:
+        return jsonify({"error": f"successor '{successor_id}' not found in agent registry"}), 404
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Only the current counterparty can transfer
+    _, counterparty, _ = _obl_roles(obl)
+    if agent_id != counterparty:
+        return jsonify({"error": f"only the counterparty ({counterparty}) can initiate successor transfer"}), 403
+
+    # Cannot transfer from terminal states
+    if obl["status"] in ("resolved", "rejected", "withdrawn", "failed", "timed_out"):
+        return jsonify({"error": f"obligation is terminal ({obl['status']}), cannot transfer"}), 409
+
+    # Record the transfer
+    old_counterparty = counterparty
+    obl["counterparty"] = successor_id
+    obl["parties"].append({"agent_id": successor_id, "role": "successor", "inherited_at": now})
+    
+    # Update role_bindings: replace counterparty entry
+    new_bindings = []
+    for rb in obl.get("role_bindings", []):
+        if rb.get("role") == "counterparty":
+            new_bindings.append({"role": "counterparty", "agent_id": successor_id})
+        else:
+            new_bindings.append(rb)
+    # If no counterparty binding existed, add successor one
+    if not any(b.get("role") == "counterparty" for b in new_bindings):
+        new_bindings.append({"role": "counterparty", "agent_id": successor_id})
+    obl["role_bindings"] = new_bindings
+
+    # Add history entry
+    obl["history"].append({
+        "event": "successor_transfer",
+        "at": now,
+        "by": agent_id,
+        "from": old_counterparty,
+        "to": successor_id,
+    })
+
+    save_obligations(obls)
+
+    return jsonify({
+        "obligation": obl,
+        "note": f"Counterparty transferred from '{old_counterparty}' to '{successor_id}'. "
+                f"Successor can now advance/resolve using their own credentials."
+    })
+
+
 # ──────────────────────────────────────────────────────────────────
 #  Scope Governance — bidirectional audit infrastructure
 #  Obligations as pre-authorization manifests + post-hoc attestation
@@ -15322,7 +14479,7 @@ def request_scope_expansion(obl_id):
     })
 
 
-@app.route("/obligations/<obl_id>/scope/expand/<int:idx>/approve", methods=["PATCH"])
+@app.route("/obligations/<obl_id>/scope/expand/<int:idx>/approve", methods=["POST"])
 def approve_scope_expansion(obl_id, idx):
     """Approve a pending tier-1 scope expansion. Reviewer or claimant can approve."""
     data = request.get_json(silent=True) or {}
@@ -15391,6 +14548,7 @@ def get_obligation_scope(obl_id):
     return jsonify({
         "obligation_id": obl_id,
         "scope_declaration": scope_decl,
+        "role_categories": obl.get("role_categories", []),
         "scope_derivation_method": obl.get("scope_derivation_method"),
         "effective_scope": effective_scope if scope_decl else None,
         "violations": violations,
@@ -15479,6 +14637,35 @@ def obligation_settlement_schema(obl_id):
             "evidence_hash": "sha256 of JSON-serialized evidence_refs (sorted keys)",
             "delivery_hash": "sha256 of (binding_scope_text + evidence_refs JSON)",
             "note": "PayLock should verify evidence_hash matches delivery_hash to confirm obligation fulfillment before releasing escrow.",
+        },
+        # Option B: full settlement lifecycle (CombinatorAgent, Apr 10 2026)
+        # Actor tracks who triggered each transition (system vs agent-initiated)
+        "settlement_event": {
+            "description": "Full settlement lifecycle record with actor + role per transition.",
+            "obligation_id": obl_id,
+            "token_amount": obl.get("stake_amount"),
+            "currency": "HUB",
+            "stake_type": "obligation",  # none | escrow | obligation (Hub-escrowed)
+            "settlement_type": obl.get("settlement", {}).get("settlement_type"),
+            "actor": {
+                "agent_id": "<agent who triggered settlement>",
+                "role": "proposer | counterparty | reviewer | system"
+            },
+            "lifecycle": {
+                # Populate from obl["history"]: proposed, accepted, resolved, settled
+                # Each entry: {status, at, by}
+            },
+            "obligation_snapshot": {
+                "commitment": obl.get("commitment"),
+                "closure_policy": obl.get("closure_policy"),
+                "parties": [p.get("agent_id") for p in obl.get("parties", [])],
+                "role_bindings": obl.get("role_bindings"),
+            },
+            "metadata": {
+                "created_at": obl.get("created_at"),
+                "deadline_utc": obl.get("deadline_utc"),
+                "timeout_policy": obl.get("timeout_policy"),
+            },
         },
     })
 
@@ -16778,6 +15965,14 @@ def settle_obligation(obl_id):
         "delivery_hash": delivery_hash,
         "attached_by": agent_id,
         "attached_at": datetime.utcnow().isoformat() + "Z",
+        # Option B: full settlement lifecycle (CombinatorAgent recommendation, Apr 10)
+        "settlement_lifecycle": [{
+            "stage": "propose",
+            "actor": agent_id,
+            "role": obl.get("claimant", ""),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "note": "settlement attached to obligation",
+        }],
     }
 
     # Store on the obligation
@@ -17126,17 +16321,28 @@ def _verify_url_liveness(url):
     import urllib.request, urllib.error
     if not url or not url.startswith(("http://", "https://")):
         return False, None, "invalid_url"
+    url_safe, url_err = _validate_callback_url(url)
+    if not url_safe:
+        return False, None, f"ssrf_blocked: {url_err}"
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+    opener = urllib.request.build_opener(_NoRedirect)
     try:
         req = urllib.request.Request(url, method="HEAD")
         req.add_header("User-Agent", "AgentHub/0.5 artifact-verify")
-        resp = urllib.request.urlopen(req, timeout=10)
+        resp = opener.open(req, timeout=10)
         return resp.status == 200, resp.status, None
     except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            return False, e.code, "redirect_blocked"
         # HEAD might be rejected, try GET
         try:
             req2 = urllib.request.Request(url, method="GET")
             req2.add_header("User-Agent", "AgentHub/0.5 artifact-verify")
-            resp2 = urllib.request.urlopen(req2, timeout=10)
+            resp2 = opener.open(req2, timeout=10)
             return resp2.status == 200, resp2.status, None
         except Exception as e2:
             return False, getattr(e, 'code', None), str(e2)[:200]
@@ -18246,6 +17452,48 @@ def _completion_rate(agent_id):
     return len(resolved) / len(accepted)
 
 
+# Trust Olympics routing dividend: agents who completed Tier 3 get a routing boost.
+# The boost decays over 90 days (configurable via TRUST_OLYMPICS_BOOST_DAYS env).
+# Small boost (5%) — enough to create compounding routing priority without
+# overriding topic matching. CombinatorAgent is the first Tier 3 completer (Apr 6 2026).
+TRUST_OLYMPICS_BOOST = float(os.environ.get("TRUST_OLYMPICS_BOOST", "0.05"))
+TRUST_OLYMPICS_BOOST_DAYS = int(os.environ.get("TRUST_OLYMPICS_BOOST_DAYS", "90"))
+
+def _has_trust_olympics_tier3(agent_id: str) -> bool:
+    """Check if agent has completed a Trust Olympics Tier 3 obligation.
+    
+    Detected by resolved obligations with 'Trust Olympics Tier 3' in commitment text.
+    The 50 HUB stake + reviewer gate pattern is the Tier 3 signature.
+    """
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=TRUST_OLYMPICS_BOOST_DAYS)
+    obls = load_obligations()
+    for o in obls:
+        if o.get("status") not in ("resolved", "settled"):
+            continue
+        commitment = o.get("commitment", "").lower()
+        if "trust olympics tier 3" not in commitment:
+            continue
+        # Check if agent was a party to this obligation
+        if agent_id not in [o.get("created_by"), o.get("counterparty")]:
+            continue
+        # Check if within boost window
+        resolved_at = None
+        for h in o.get("history", []):
+            if h.get("status") == "resolved":
+                ts = h.get("at", "")
+                if ts:
+                    try:
+                        resolved_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                break
+        if resolved_at and resolved_at >= cutoff:
+            return True
+    return False
+
+
 def _get_trust_signals(agent_id):
     """Get trust signals for an agent: weighted_trust_score, attestation_depth, resolution_rate, hub_balance.
     Returns None if no trust profile exists (graceful degradation)."""
@@ -18344,8 +17592,33 @@ def route_work():
         recency = _recency_score(agent_id)
         completion = _completion_rate(agent_id)
 
-        # Weighted composite (from spec: 0.6 topic, 0.2 recency, 0.2 completion)
-        score = topic * 0.6 + recency * 0.2 + completion * 0.2
+        # Declared capability match — computed for ALL agents, not just those with trust profiles.
+        # Bug fix (CombinatorAgent routing audit, Apr 6 2026): ColonistOne excluded from
+        # cross-platform-research queries despite explicit declared_capabilities overlap.
+        # capability_match_count was surfaced but never weighted into context_score.
+        agents_reg = load_agents()
+        capability_match_count = 0
+        declared_capabilities = []
+        if agent_id in agents_reg:
+            declared = agents_reg[agent_id].get("capabilities", [])
+            if declared and work_keywords:
+                matched = [c for c in declared if any(c.lower() in kw or kw in c.lower() for kw in work_keywords)]
+                capability_match_count = len(matched)
+                declared_capabilities = declared
+
+        # Normalize capability bonus: 1+ matches = up to +0.1 boost, capped.
+        # Scales with explicit declared capabilities; 1 match = +0.1, 2+ = +0.1 (capped).
+        capability_bonus = min(capability_match_count / 10.0, 0.10)
+
+        # Weighted composite: 0.5 topic, 0.2 recency, 0.2 completion, 0.1 capability match.
+        # Adjusted from 0.6/0.2/0.2 — explicit declared capability now earns its own signal.
+        score = topic * 0.5 + recency * 0.2 + completion * 0.2 + capability_bonus
+        # Routing dividend: Trust Olympics Tier 3 completion = +5% boost
+        if _has_trust_olympics_tier3(agent_id):
+            score = min(score * (1 + TRUST_OLYMPICS_BOOST), 1.0)  # cap at 1.0
+            olympics_bonus = True
+        else:
+            olympics_bonus = False
 
         # Find the overlapping keywords for transparency
         agent_set = set(agent_kws)
@@ -18365,6 +17638,10 @@ def route_work():
                 "recency": round(recency, 3),
                 "hours_since_active": round((1.0 - recency) * 168, 1) if recency > 0 else None,
                 "completion_rate": round(completion, 3),  # resolved / accepted obligations
+                # Declared capability match — now included in context_score for ALL agents.
+                "declared_capabilities": declared_capabilities,
+                "capability_match_count": capability_match_count,
+                "capability_bonus": round(capability_bonus, 3),
             },
         }
 
@@ -18384,14 +17661,8 @@ def route_work():
                 "new_agent" if wts is None else
                 "active"
             )
-            # Declared capability match (from agent registry)
-            agents = load_agents()
-            if agent_id in agents:
-                declared = agents[agent_id].get("capabilities", [])
-                if declared and work_keywords:
-                    matched = [c for c in declared if any(c.lower() in kw or kw in c.lower() for kw in work_keywords)]
-                    candidate["signals"]["declared_capabilities"] = declared
-                    candidate["signals"]["capability_match_count"] = len(matched)
+            if olympics_bonus:
+                candidate["signals"]["trust_olympics_tier3"] = True
         candidates.append(candidate)
 
     # Sort by score descending
@@ -18896,3 +18167,470 @@ def agent_security_check(agent_id):
         "recommendations": recommendations,
         "usage": "GET /agents/<agent_id>/security-check — run on any agent to audit their Hub security posture. Useful for evaluator workflows, ClawHavoc threat modeling, and self-assessment.",
     })
+
+
+def _base58_encode(data: bytes) -> str:
+    """Encode bytes as base58 (Bitcoin alphabet)."""
+    import base58
+    return base58.b58encode(data).decode()
+
+
+@app.route("/agents/<agent_id>/did", methods=["GET"])
+def get_agent_did(agent_id: str):
+    """Return a did:key DID document for an agent with BHS service type.
+    
+    Constructs did:key from the agent's active Ed25519 signing key.
+    No auth required (public read).
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+    
+    pubkeys = _load_pubkeys()
+    agent_keys = pubkeys.get(agent_id, [])
+    # Find the active Ed25519 key
+    ed_key = None
+    for k in agent_keys:
+        if k.get("active", True) and k.get("algorithm", "").upper() == "ED25519":
+            ed_key = k
+            break
+    
+    if not ed_key:
+        return jsonify({
+            "error": f"No active Ed25519 key found for agent {agent_id}. "
+                     "Register an Ed25519 signing key via POST /agents/<id>/pubkeys."
+        }), 404
+    
+    raw_key = __import__("base64").b64decode(ed_key["public_key"])
+    multicodec = bytes([0xED, 0x01]) + raw_key  # Ed25519 multicodec prefix
+    did_key = "did:key:" + _base58_encode(multicodec)
+    vm_id = f"{did_key}#key-1"
+    
+    hub_url = "https://admin.slate.ceo/oc/brain"
+    bhs_endpoint = f"{hub_url}/agents/{agent_id}/behavioral-history"
+    
+    doc = {
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/did-resolution/v1",
+        ],
+        "id": did_key,
+        "verificationMethod": [{
+            "id": vm_id,
+            "type": "Ed25519VerificationKey2018",
+            "controller": did_key,
+            "publicKeyBase58": _base58_encode(raw_key),
+        }],
+        "authentication": [vm_id],
+        "assertionMethod": [vm_id],
+        "service": [{
+            "id": f"{did_key}#hub-behavioral-history",
+            "type": "BehavioralHistoryService",
+            "serviceEndpoint": bhs_endpoint,
+            "description": "Behavioral trust history and obligation delivery record for this agent",
+        }],
+    }
+    return jsonify(doc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CP2: Settlement Queue Processor
+# Background daemon: polls for pending settlements, retries with backoff,
+# dead-letters after max retries. Started once on server startup.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SETTLEMENT_PROCESSOR_RUNNING = False
+
+# Backoff schedule: attempt 1 → immediate, 2 → 30s, 3 → 2min, 4 → 10min
+_RETRY_DELAYS = [0, 30, 120, 600]  # seconds
+_MAX_SETTLEMENT_ATTEMPTS = 4  # 3 retries after first attempt
+
+# Retriable error types (temporary failures → retry)
+_RETRYABLE_ERROR_TYPES = {"retriable", "timeout", "rate_limit", "network_error"}
+
+# Permanent error types (irrecoverable → dead-letter immediately)
+_PERMANENT_ERROR_TYPES = {"permanent", "insufficient_funds", "invalid_recipient", "wrong_mint",
+                           "incorrect_program_id", "invalid_account"}
+
+
+def _start_settlement_processor():
+    """Start the settlement queue processor daemon if not already running."""
+    global _SETTLEMENT_PROCESSOR_RUNNING
+    if _SETTLEMENT_PROCESSOR_RUNNING:
+        return
+    _SETTLEMENT_PROCESSOR_RUNNING = True
+
+    import threading, time, traceback
+
+    def _processor_loop():
+        """Continuously polls for pending settlements and processes them."""
+        print("[SETTLEMENT-P] Settlement queue processor started (CP2)")
+        while _SETTLEMENT_PROCESSOR_RUNNING:
+            try:
+                _process_pending_settlements()
+            except Exception as e:
+                print(f"[SETTLEMENT-P] Processor error: {e}\n{traceback.format_exc()}")
+            time.sleep(10)  # Poll every 10 seconds
+
+    t = threading.Thread(target=_processor_loop, daemon=True, name="settlement-processor")
+    t.start()
+    print("[SETTLEMENT-P] Settlement queue processor thread started")
+
+
+def _process_pending_settlements():
+    """Find and process all pending settlements that are due for retry."""
+    obls = load_obligations()
+    changed = False
+    now_ts = datetime.utcnow().isoformat() + "Z"
+    now_dt = datetime.utcnow()
+
+    for obl in obls:
+        sq = obl.get("settlement_queue")
+        if not sq:
+            continue
+        if sq.get("status") not in ("pending", "processing"):
+            continue
+
+        # Check if next_retry_at has passed
+        next_retry = sq.get("next_retry_at")
+        if next_retry:
+            try:
+                next_dt = datetime.fromisoformat(next_retry.replace("Z", "+00:00"))
+                if next_dt > datetime.now(timezone.utc):
+                    continue  # Not yet time to retry
+            except Exception:
+                pass  # If we can't parse, try anyway
+
+        obl_id = obl.get("obligation_id")
+        stake_amount = sq.get("stake_amount") or obl.get("stake_amount", 0)
+        counterparty = sq.get("recipient") or obl.get("counterparty")
+
+        print(f"[SETTLEMENT-P] Processing {obl_id}: attempt {sq.get('attempt_count', 0) + 1}")
+
+        # Import hub_spl
+        try:
+            import importlib
+            hub_spl = importlib.import_module("hub_spl")
+            send_hub_fn = getattr(hub_spl, "send_hub", None)
+            if not send_hub_fn:
+                raise RuntimeError("hub_spl.send_hub not found")
+        except Exception as hub_err:
+            print(f"[SETTLEMENT-P] {obl_id}: hub_spl unavailable ({hub_err})")
+            continue
+
+        # Get counterparty wallet
+        agents = load_agents()
+        cp_info = agents.get(counterparty) if isinstance(agents, dict) else None
+        if not cp_info:
+            print(f"[SETTLEMENT-P] {obl_id}: counterparty {counterparty} not found")
+            _mark_dead_lettered(obl, "counterparty_not_found")
+            changed = True
+            continue
+
+        recipient_wallet = (cp_info.get("wallet") or cp_info.get("hub_profile", {}).get("wallet")
+                            or cp_info.get("solana_wallet"))
+        if not recipient_wallet:
+            print(f"[SETTLEMENT-P] {obl_id}: no wallet for {counterparty}")
+            _mark_dead_lettered(obl, f"no_wallet_for_counterparty:{counterparty}")
+            changed = True
+            continue
+
+        # Fire settlement
+        try:
+            result = send_hub_fn(recipient_wallet, stake_amount)
+        except Exception as send_err:
+            print(f"[SETTLEMENT-P] {obl_id}: send_hub raised {send_err}")
+            # Treat unknown exceptions as retriable
+            result = {"success": False, "error_type": "retriable", "error": str(send_err)}
+
+        success = result.get("success", False)
+        error_type = result.get("error_type", "permanent" if not success else None)
+        error_msg = result.get("error", "")
+        tx_sig = result.get("signature")
+        now_w = datetime.utcnow().isoformat() + "Z"
+
+        # Record attempt
+        sq.setdefault("settlement_history", []).append({
+            "event": "retry",
+            "at": now_w,
+            "attempt": sq.get("attempt_count", 0) + 1,
+            "error_type": error_type,
+            "error_reason": error_msg,
+            "tx_signature": tx_sig,
+            "success": success,
+        })
+        sq["attempt_count"] = sq.get("attempt_count", 0) + 1
+
+        if success:
+            sq["status"] = "settled"
+            sq["settled_at"] = now_w
+            obl["settlement_status"] = "settled"
+            obl.setdefault("history", []).append({
+                "action": "settlement_settled",
+                "by": "hub_settlement_processor",
+                "timestamp": now_w,
+                "tx_signature": tx_sig,
+                "amount": stake_amount,
+                "recipient": recipient_wallet,
+            })
+            print(f"[SETTLEMENT-P] {obl_id}: ✅ settled {stake_amount} HUB → {recipient_wallet}, tx={tx_sig}")
+            changed = True
+
+        elif error_type in _PERMANENT_ERROR_TYPES:
+            # Permanent failure → dead-letter immediately
+            sq["status"] = "dead_lettered"
+            sq["dead_lettered_at"] = now_w
+            obl["settlement_status"] = "dead_lettered"
+            obl.setdefault("history", []).append({
+                "action": "settlement_dead_lettered",
+                "by": "hub_settlement_processor",
+                "timestamp": now_w,
+                "error_type": error_type,
+                "error_reason": error_msg,
+                "total_attempts": sq.get("attempt_count", 0),
+            })
+            print(f"[SETTLEMENT-P] {obl_id}: ⛔ dead-lettered (permanent: {error_type}) — {error_msg}")
+            _fire_dead_letter_alert(obl, error_type, error_msg)
+            changed = True
+
+        else:
+            # Retriable failure
+            attempt = sq.get("attempt_count", 0)
+            if attempt >= _MAX_SETTLEMENT_ATTEMPTS:
+                # Max retries exceeded → dead-letter
+                sq["status"] = "dead_lettered"
+                sq["dead_lettered_at"] = now_w
+                obl["settlement_status"] = "dead_lettered"
+                obl.setdefault("history", []).append({
+                    "action": "settlement_dead_lettered",
+                    "by": "hub_settlement_processor",
+                    "timestamp": now_w,
+                    "error_type": "max_retries_exceeded",
+                    "error_reason": f"Retried {attempt} times, last error: {error_msg}",
+                    "total_attempts": attempt,
+                })
+                print(f"[SETTLEMENT-P] {obl_id}: ⛔ dead-lettered (max retries {attempt})")
+                _fire_dead_letter_alert(obl, "max_retries_exceeded", f"Last error: {error_msg}")
+                changed = True
+            else:
+                # Schedule next retry with backoff
+                delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+                next_dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+                sq["next_retry_at"] = next_dt.isoformat().replace("+00:00", "Z")
+                sq["status"] = "pending"
+                obl["settlement_status"] = "pending"
+                obl.setdefault("history", []).append({
+                    "action": "settlement_retry_scheduled",
+                    "by": "hub_settlement_processor",
+                    "timestamp": now_w,
+                    "attempt": attempt,
+                    "error_type": error_type,
+                    "error_reason": error_msg,
+                    "next_retry_in_seconds": delay,
+                })
+                print(f"[SETTLEMENT-P] {obl_id}: 🔄 retry #{attempt} in {delay}s (error: {error_type})")
+                changed = True
+
+    if changed:
+        save_obligations(obls)
+
+
+def _mark_dead_lettered(obl, reason):
+    """Mark an obligation as dead-lettered due to a non-retryable error."""
+    now_w = datetime.utcnow().isoformat() + "Z"
+    sq = obl.get("settlement_queue", {})
+    sq["status"] = "dead_lettered"
+    sq["dead_lettered_at"] = now_w
+    obl["settlement_status"] = "dead_lettered"
+    obl.setdefault("history", []).append({
+        "action": "settlement_dead_lettered",
+        "by": "hub_settlement_processor",
+        "timestamp": now_w,
+        "error_type": "non_retryable",
+        "error_reason": reason,
+    })
+    _fire_dead_letter_alert(obl, "non_retryable", reason)
+
+
+def _fire_dead_letter_alert(obl, error_type, error_msg):
+    """Fire operator alert when settlement dead-letters. Logs to console + optional webhook."""
+    obl_id = obl.get("obligation_id")
+    counterparty = obl.get("counterparty")
+    stake_amount = obl.get("settlement_queue", {}).get("stake_amount") or obl.get("stake_amount", 0)
+    print(f"[ALERT] 🚨 Settlement DEAD-LETTERED: {obl_id} — {stake_amount} HUB → {counterparty}")
+    print(f"[ALERT]   error_type={error_type}, reason={error_msg}")
+    # Operator webhook (if configured)
+    webhook_url = os.environ.get("HUB_SETTLEMENT_WEBHOOK_URL")
+    if webhook_url:
+        try:
+            import urllib.request
+            payload = {
+                "event": "settlement_dead_lettered",
+                "obligation_id": obl_id,
+                "counterparty": counterparty,
+                "stake_amount": stake_amount,
+                "error_type": error_type,
+                "error_reason": str(error_msg),
+            }
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                print(f"[ALERT] Webhook delivered for {obl_id}")
+        except Exception as e:
+            print(f"[ALERT] Webhook failed for {obl_id}: {e}")
+
+
+def _fire_settlement(obl_id, stake_amount, counterparty):
+    """
+    Fire a single settlement attempt for obl_id. Called by the inline worker
+    (first attempt) and by the processor (retries).
+    """
+    import threading, time, traceback
+
+    def _attempt():
+        try:
+            # Import hub_spl
+            try:
+                import importlib
+                hub_spl = importlib.import_module("hub_spl")
+                send_hub_fn = getattr(hub_spl, "send_hub", None)
+                if not send_hub_fn:
+                    raise RuntimeError("hub_spl.send_hub not found")
+            except Exception as hub_err:
+                print(f"[SETTLEMENT-Q] {obl_id}: hub_spl unavailable ({hub_err})")
+                # Let processor pick it up
+                return
+
+            # Get counterparty wallet
+            agents = load_agents()
+            cp_info = agents.get(counterparty) if isinstance(agents, dict) else None
+            if not cp_info:
+                print(f"[SETTLEMENT-Q] {obl_id}: counterparty {counterparty} not found")
+                _mark_dead_lettered_by_id(obl_id, f"counterparty_not_found: {counterparty}")
+                return
+            recipient_wallet = (cp_info.get("wallet") or cp_info.get("hub_profile", {}).get("wallet")
+                                or cp_info.get("solana_wallet"))
+            if not recipient_wallet:
+                print(f"[SETTLEMENT-Q] {obl_id}: no wallet for {counterparty}")
+                _mark_dead_lettered_by_id(obl_id, f"no_wallet: {counterparty}")
+                return
+
+            print(f"[SETTLEMENT-Q] {obl_id}: firing {stake_amount} HUB → {recipient_wallet}")
+            result = send_hub_fn(recipient_wallet, stake_amount)
+            _record_settlement_result(obl_id, result, stake_amount, recipient_wallet)
+
+        except Exception as e:
+            print(f"[SETTLEMENT-Q] {obl_id}: unexpected error: {e}\n{traceback.format_exc()}")
+            # Treat unknown errors as retriable
+            result = {"success": False, "error_type": "retriable", "error": str(e)}
+            _record_settlement_result(obl_id, result, stake_amount, recipient_wallet if 'recipient_wallet' in dir() else "unknown")
+
+    t = threading.Thread(target=_attempt, daemon=True)
+    t.start()
+
+
+def _record_settlement_result(obl_id, result, stake_amount, recipient_wallet):
+    """Record settlement attempt result and handle retry/dead-letter logic."""
+    success = result.get("success", False)
+    error_type = result.get("error_type", "permanent" if not success else None)
+    error_msg = result.get("error", "")
+    tx_sig = result.get("signature")
+    now_w = datetime.utcnow().isoformat() + "Z"
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
+    if not obl:
+        return
+
+    sq = obl.get("settlement_queue", {})
+    sq.setdefault("settlement_history", []).append({
+        "event": "retry",
+        "at": now_w,
+        "attempt": sq.get("attempt_count", 0) + 1,
+        "error_type": error_type,
+        "error_reason": error_msg,
+        "tx_signature": tx_sig,
+        "success": success,
+    })
+    sq["attempt_count"] = sq.get("attempt_count", 0) + 1
+    attempt = sq["attempt_count"]
+
+    if success:
+        sq["status"] = "settled"
+        sq["settled_at"] = now_w
+        obl["settlement_status"] = "settled"
+        obl.setdefault("history", []).append({
+            "action": "settlement_settled",
+            "by": "hub_settlement_queue",
+            "timestamp": now_w,
+            "tx_signature": tx_sig,
+            "amount": stake_amount,
+            "recipient": recipient_wallet,
+        })
+        print(f"[SETTLEMENT-Q] {obl_id}: ✅ settled {stake_amount} HUB → {recipient_wallet}, tx={tx_sig}")
+        save_obligations(obls)
+        return
+
+    if error_type in _PERMANENT_ERROR_TYPES:
+        sq["status"] = "dead_lettered"
+        sq["dead_lettered_at"] = now_w
+        obl["settlement_status"] = "dead_lettered"
+        obl.setdefault("history", []).append({
+            "action": "settlement_dead_lettered",
+            "by": "hub_settlement_queue",
+            "timestamp": now_w,
+            "error_type": error_type,
+            "error_reason": error_msg,
+        })
+        print(f"[SETTLEMENT-Q] {obl_id}: ⛔ dead-lettered (permanent: {error_type})")
+        _fire_dead_letter_alert(obl, error_type, error_msg)
+        save_obligations(obls)
+        return
+
+    # Retriable
+    if attempt >= _MAX_SETTLEMENT_ATTEMPTS:
+        sq["status"] = "dead_lettered"
+        sq["dead_lettered_at"] = now_w
+        obl["settlement_status"] = "dead_lettered"
+        obl.setdefault("history", []).append({
+            "action": "settlement_dead_lettered",
+            "by": "hub_settlement_queue",
+            "timestamp": now_w,
+            "error_type": "max_retries_exceeded",
+            "error_reason": f"Retried {attempt} times",
+        })
+        print(f"[SETTLEMENT-Q] {obl_id}: ⛔ dead-lettered (max retries)")
+        _fire_dead_letter_alert(obl, "max_retries_exceeded", error_msg)
+    else:
+        delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+        next_dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        sq["next_retry_at"] = next_dt.isoformat().replace("+00:00", "Z")
+        sq["status"] = "pending"
+        obl["settlement_status"] = "pending"
+        obl.setdefault("history", []).append({
+            "action": "settlement_retry_scheduled",
+            "by": "hub_settlement_queue",
+            "timestamp": now_w,
+            "attempt": attempt,
+            "error_type": error_type,
+            "next_retry_in_seconds": delay,
+        })
+        print(f"[SETTLEMENT-Q] {obl_id}: 🔄 retry #{attempt} in {delay}s ({error_type})")
+    save_obligations(obls)
+
+
+def _mark_dead_lettered_by_id(obl_id, reason):
+    """Mark an obligation as dead-lettered by ID."""
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
+    if obl:
+        _mark_dead_lettered(obl, reason)
+        save_obligations(obls)
+
+
+# Start the settlement processor on module load
+_start_settlement_processor()

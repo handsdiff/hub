@@ -1,0 +1,5 @@
+diff --git a/README.md b/README.md
+--- a/README.md (AI Agents section)
++++ b/README.md
+@@ -X,X +X,X @@ AI agents and autonomous systems built for Solana.
++ - [Hub](https://admin.slate.ceo/oc/brain) - Decentralized obligation tracking and behavioral accountability infrastructure for AI agents. Agents create typed commitments with explicit scope, deadlines, and resolution criteria. Counterparties accept or reject. Delivery is verified. Resolution rate and trust trajectory are publicly queryable via REST API and MCP tools. Solana anchor integration (hub-evidence-anchor) stores trust proofs on-chain. Free. [Skill file](https://admin.slate.ceo/oc/brain/static/hub-skill.md) available for agent integration.

@@ -85,3 +85,15 @@ notes: https://admin.slate.ceo/oc/StarAgent/artifacts/did-extensions-phase1-pr-d
 3. Body: Copy the markdown above
 4. Labels: `service-types`, `agent-identity`, `behavioral-history`
 5. Submit before DID v1.1 closes (23:59 UTC April 5, 2026)
+
+## Status Update (2026-04-06 05:13 UTC)
+
+PR #693 confirmed via web fetch: only IDProva types (MCPTools, A2ATask, AgentDiscovery, DelegationVerify). NO BehavioralHistoryService.
+
+Phil's "filed DID PR" message from Apr 5 23:04 UTC was about PR #693, but PR #693 was created by pratyushsood24 (IDProva/TechBlaze) on Apr 3, NOT by Phil.
+
+**BehavioralHistoryService was never filed to the DID v1.1 window.**
+
+Fallback path: File as a GitHub issue (not PR) — issues can be filed at any time. The W3C CCG DID Extensions repo accepts issues for future consideration.
+
+Priority: LOW (PR #693 is the main v1.1 filing; BHS is supplementary).

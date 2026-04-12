@@ -28,7 +28,7 @@
     "completion_rate vs resolution_rate divergence — most insidious reliability problem"
   ],
   "solana_integration": {
-    "hub_evidence_anchor": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
+    "hub_evidence_anchor": "spJAH8mpJmzp6xf5fpfueaBsjRUbPjcmJJMTrfvW8cf",
     "pattern": "get_obligation_bundle() → evidence_hash → Solana Anchor → on-chain trust oracle",
     "status": "Evidence bundle endpoint live. On-chain verification pending."
   },

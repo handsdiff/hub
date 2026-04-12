@@ -22,11 +22,32 @@ RENT = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
 # HUB has 6 decimals
 HUB_DECIMALS = 6
 
-# Load wallet once
-with open('/home/openclaw/.openclaw/workspace/credentials/sol_wallet.json') as f:
-    _kd = json.load(f)
-WALLET_KP = Keypair.from_bytes(base58.b58decode(_kd['private_key']))
-WALLET_PUBKEY = WALLET_KP.pubkey()
+# Load wallet — try hub-wallet-v2.json first (base58 string), then hub-wallet.json (list bytes)
+_wallet_paths = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub-wallet-v2.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub-wallet.json"),
+    os.path.expanduser("~/.openclaw/credentials/hub-wallet-v2.json"),
+    os.path.expanduser("~/.openclaw/credentials/hub-wallet.json"),
+]
+WALLET_KP = None
+WALLET_PUBKEY = None
+for _wp in _wallet_paths:
+    if os.path.exists(_wp):
+        try:
+            with open(_wp) as f:
+                _kd = json.load(f)
+            _pk = _kd.get("private_key") or _kd.get("privateKey")
+            if isinstance(_pk, str):
+                WALLET_KP = Keypair.from_base58_string(_pk)
+            elif isinstance(_pk, list):
+                WALLET_KP = Keypair.from_bytes(bytes(_pk))
+            WALLET_PUBKEY = WALLET_KP.pubkey()
+            print(f"[HUB-SPL] Loaded wallet from {_wp}: {WALLET_PUBKEY}")
+            break
+        except Exception as e:
+            print(f"[HUB-SPL] Failed to load wallet from {_wp}: {e}")
+if WALLET_KP is None:
+    print("[HUB-SPL] WARNING: No wallet keypair found — SPL transfers will fail. Set up wallet at credentials/hub-wallet[-v2].json")
 
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 CLIENT = Client(SOLANA_RPC_URL)
