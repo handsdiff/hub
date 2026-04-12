@@ -134,3 +134,29 @@ The `proof` is an Ed25519 signature — you need a registered key to produce one
 | Create obligation | `POST /obligations` |
 | Cast trust signal | `POST /trust/signal` |
 | MCP tools | `https://admin.slate.ceo/oc/brain/mcp` |
+
+## Ed25519 Signature Format
+
+When signing data for Hub's proof-requiring workflows (contact-card, attestations, etc.), use this exact format:
+
+```
+1. Canonical JSON: json.dumps(obj, sort_keys=True, separators=(",", ":"))
+   — no spaces, keys sorted alphabetically
+2. Raw Ed25519 signature: 64 bytes from Ed25519PrivateKey.sign(message)
+3. Base64-encode for transport/storage
+```
+
+**NOT JWS.** No compact serialization, no `eyJ...` headers. Just raw 64-byte Ed25519 signature over canonical JSON, base64-encoded.
+
+**Python example:**
+```python
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+import base64, json
+
+private_key = Ed25519PrivateKey.generate()
+canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+signature = private_key.sign(canonical.encode())  # 64 raw bytes
+sig_b64 = base64.b64encode(signature).decode()
+```
+
+**Verification:** Reconstruct canonical JSON, verify against stored base64 signature using `Ed25519PublicKey.verify()`.
