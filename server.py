@@ -11896,19 +11896,15 @@ def _check_proposed_ttl(obl):
 
 
 def _check_evidence_submitted_ttl(obl):
-    """Ghost Counterparty Protocol v1: auto-resolve evidence_submitted when counterparty is ghost + 72h TTL.
+    """Ghost Counterparty Protocol v1: auto-resolve when counterparty ghost + evidence submitted.
 
-    After evidence is submitted, give counterparty 72h to respond before auto-resolving with evidence_archive.
-    This closes the loop on obligations stuck in evidence_submitted when the counterparty has gone dark.
+    Checks run REGARDLESS of current status (evidence_submitted, ghost_nudged, ghost_escalated).
+    Previously bypassed when watchdog changed status from evidence_submitted — fixed here.
+
+    TTL: 24h after last evidence submission, if counterparty still ghost, auto-resolve.
+    This closes the loop on obligations stuck after bilateral evidence when counterparty ghosts.
     """
-    if obl.get("status") != "evidence_submitted":
-        return False
-
-    ghost_class, hours_silent = _is_counterparty_ghost(obl)
-    if not ghost_class:
-        return False
-
-    # TTL: 72h after evidence submission, if counterparty still ghost, resolve
+    # Check: evidence submitted? (no status gate — run regardless of current status)
     evidence_refs = obl.get("evidence_refs", [])
     if not evidence_refs:
         return False
@@ -11916,8 +11912,16 @@ def _check_evidence_submitted_ttl(obl):
     last_evidence = evidence_refs[-1]
     submitted_at = last_evidence.get("submitted_at", obl.get("created_at", ""))
     hours_since_evidence = _hours_since_iso(submitted_at) if submitted_at else 999
+    if hours_since_evidence < 24:
+        return False
 
-    if hours_since_evidence >= 72:
+    # Check: counterparty ghost?
+    ghost_class, hours_silent = _is_counterparty_ghost(obl)
+    if not ghost_class:
+        return False
+
+    # All conditions met: auto-resolve
+    if hours_since_evidence >= 24:
         now_iso = datetime.utcnow().isoformat() + "Z"
         closure_policy = obl.get("closure_policy", "counterparty_accepts")
 
@@ -11929,7 +11933,7 @@ def _check_evidence_submitted_ttl(obl):
             "closure_policy": closure_policy,
             "resolution_reason": f"counterparty '{obl.get('counterparty')}' confirmed ghost "
                                  f"({hours_silent:.0f}h silent), evidence submitted {hours_since_evidence:.0f}h ago, "
-                                 f"72h TTL exceeded. Auto-resolving.",
+                                 f"24h TTL exceeded. Auto-resolving.",
             "evidence_count": len(evidence_refs),
             "evidence_refs": evidence_refs,
             "commitment": obl.get("commitment", ""),
@@ -11977,7 +11981,7 @@ _CLOSURE_POLICIES = [
 ]
 
 # Policies that REQUIRE a deadline (obligations that can hang indefinitely without one)
-_DEADLINE_REQUIRED_POLICIES = ["reviewer_required", "claimant_plus_reviewer"]
+_DEADLINE_REQUIRED_POLICIES = ["reviewer_required", "claimant_plus_reviewer", "counterparty_accepts"]
 
 def _fire_obligation_state_webhook(obl, acting_agent, old_status, new_status, note=None):
     """Notify counterparty via callback_url + inbox DM when obligation state changes.

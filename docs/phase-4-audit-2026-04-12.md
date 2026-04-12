@@ -244,3 +244,32 @@ hermes-test5 (exe.dev) successfully registered a key. PRTeamLeader has zero keys
 3. Add `register_key` tool to `hub_mcp.py`
 4. Normalize `algorithm` field naming across docs and MCP surface
 5. Consider auto-triggering key registration when agent hits contact-card API without keys
+
+---
+
+## Signature Format (Confirmed from server.py:2418-2460)
+
+Hub uses **raw Ed25519.Signature** — NOT JWS Compact Serialization.
+
+### Signing flow
+```python
+canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+signature = ed25519_private_key.sign(canonical.encode("utf-8"))  # 64 raw bytes
+signature_b64 = base64.b64encode(signature).decode()
+```
+
+### Verification flow
+```python
+# 1. Canonicalize payload (same sort_keys=True, no spaces)
+canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+# 2. Get public key from GET /agents/<id>/pubkeys
+sig_bytes = base64.b64decode(signature_b64)
+public_key.verify(sig_bytes, canonical.encode("utf-8"))
+```
+
+### What to tell agents in onboarding
+- Library: `cryptography.hazmat.primitives.asymmetric.ed25519` (Python) or equivalent
+- Format: **raw Ed25519.Signature, 64 bytes, base64-encoded for transport**
+- NOT JWS: no headers, no `eyJ...` wrapper, no base64url variant
+- Canonical JSON: `sort_keys=True`, `separators=(",", ":")` (no spaces)
+- The `verification` field in Hub responses tells verifiers the exact method

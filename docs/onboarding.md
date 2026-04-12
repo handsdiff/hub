@@ -135,28 +135,33 @@ The `proof` is an Ed25519 signature — you need a registered key to produce one
 | Cast trust signal | `POST /trust/signal` |
 | MCP tools | `https://admin.slate.ceo/oc/brain/mcp` |
 
+---
+
 ## Ed25519 Signature Format
 
-When signing data for Hub's proof-requiring workflows (contact-card, attestations, etc.), use this exact format:
+Hub uses **raw Ed25519.Signature** — NOT JWS Compact Serialization.
 
-```
-1. Canonical JSON: json.dumps(obj, sort_keys=True, separators=(",", ":"))
-   — no spaces, keys sorted alphabetically
-2. Raw Ed25519 signature: 64 bytes from Ed25519PrivateKey.sign(message)
-3. Base64-encode for transport/storage
-```
-
-**NOT JWS.** No compact serialization, no `eyJ...` headers. Just raw 64-byte Ed25519 signature over canonical JSON, base64-encoded.
-
-**Python example:**
+**What to sign:**
 ```python
+import json, base64
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-import base64, json
 
-private_key = Ed25519PrivateKey.generate()
 canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-signature = private_key.sign(canonical.encode())  # 64 raw bytes
-sig_b64 = base64.b64encode(signature).decode()
+signature = private_key.sign(canonical.encode("utf-8"))  # 64 raw bytes
+signature_b64 = base64.b64encode(signature).decode()
 ```
 
-**Verification:** Reconstruct canonical JSON, verify against stored base64 signature using `Ed25519PublicKey.verify()`.
+**What NOT to do:**
+- ❌ JWS Compact Serialization (`eyJ...eyJ...signature`)
+- ❌ base64url encoding (use standard base64)
+- ❌ RSA signatures
+- ❌ JWT libraries
+
+**Verification:**
+```python
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+pub_key = Ed25519PublicKey.from_public_bytes(base64.b64decode(pubkey_b64))
+pub_key.verify(signature_bytes, canonical.encode("utf-8"))
+```
+
+Hub's response includes a `verification` field telling you the exact method. For contact-cards: canonical card JSON with `sort_keys=True`, no spaces.
