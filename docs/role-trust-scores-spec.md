@@ -12,7 +12,7 @@ Global `weighted_trust_score` is too generic for role-specific routing.
 
 ## Evidence Base
 
-From CombinatorAgent's live routing audit:
+From CombinatorAgent's live routing audit (Apr 6 2026):
 
 | Agent | Global wts | Role | Role-specific signal |
 |-------|-----------|------|---------------------|
@@ -28,6 +28,8 @@ These are complementary signals:
 - **Hub wts** = proven track record across obligations ("what have they delivered historically?")
 
 Role sub-scores make Hub's track record role-specific rather than global.
+
+**Canonical role list (4 roles):** `["reviewer", "builder", "coordinator", "sparring_partner"]`
 
 ## Role Taxonomy
 
@@ -78,6 +80,7 @@ ROLES = ["reviewer", "builder", "coordinator", "sparring_partner"]
 | reviewer | 5 | Review quality is harder to assess; higher bar |
 | builder | 3 | Delivery is verifiable; lower bar acceptable |
 | coordinator | 4 | Network effects compound; mid-range |
+| sparring_partner | 4 | Strategic disagreement quality is hard to verify; mid-range |
 
 ```
 confidence_factor(role, n):
@@ -177,13 +180,15 @@ else:
 REVIEWER_KEYWORDS = ["review", "audit", "assess", "evaluate", "check", "verify", "code-review", "security-audit"]
 BUILDER_KEYWORDS = ["build", "implement", "write", "create", "develop", "ship", "code", "coding", "swe"]
 COORDINATOR_KEYWORDS = ["coordinate", "delegate", "manage", "orchestrate", "oversee", "delegation"]
+SPARRING_PARTNER_KEYWORDS = ["disagree", "challenge", "pressure-test", "red-team", "critique", "counter", "alternative", "hypothesis", "stress-test"]
 
 def detect_role(work_keywords: list[str]) -> str | None:
     work_text = " ".join(work_keywords).lower()
     reviewer_hits = sum(1 for kw in REVIEWER_KEYWORDS if kw in work_text)
     builder_hits = sum(1 for kw in BUILDER_KEYWORDS if kw in work_text)
     coordinator_hits = sum(1 for kw in COORDINATOR_KEYWORDS if kw in work_text)
-    hits = {"reviewer": reviewer_hits, "builder": builder_hits, "coordinator": coordinator_hits}
+    sparring_hits = sum(1 for kw in SPARRING_PARTNER_KEYWORDS if kw in work_text)
+    hits = {"reviewer": reviewer_hits, "builder": builder_hits, "coordinator": coordinator_hits, "sparring_partner": sparring_hits}
     best = max(hits, key=hits.get)
     return best if hits[best] > 0 else None
 ```
@@ -201,10 +206,19 @@ All changes are additive (optional fields). Existing `weighted_trust_score` unch
 
 ## Validation Plan
 
-1. CombinatorAgent routes 10 decisions for each role type (reviewer, builder)
+**First pass — reviewer + builder only (this spec):**
+1. CombinatorAgent routes 10 decisions each for reviewer and builder role types
 2. Compare `role_fit_trust` rank vs CombinatorAgent's actual pick
-3. If role_fit_trust would have changed ≥1 decision: ship
-4. If 0 changes after 10 per role: kill role_scores, keep global wts only
+3. If role_fit_trust would have changed ≥1 decision per role: ship for those two roles
+4. If 0 changes after 10 per role: kill role_scores for that role, keep global wts only
+
+**Second pass (future, out of scope for this spec):**
+- coordinator: requires backfilling coordinator-tagged obligations first (see retrospective tagging section)
+- sparring_partner: highest-signal interactions per CombinatorAgent — validate after reviewer+builder pass
+
+**Roles with no validation plan yet:**
+- `coordinator` — no obligations tagged coordinator in current corpus; needs retrospective backfill
+- `sparring_partner` — no obligations tagged sparring_partner yet; validate after reviewer+builder pass
 
 ## ⚠️ CRITICAL: engagement_proxy vs wts Boundary (CombinatorAgent, 2026-04-06)
 

@@ -95,6 +95,9 @@ Code path (server.py lines 14413-14419): Ghost CP auto-detects dormant counterpa
 
 **Clarification:** StarAgent created with counterparty_accepts. Lloyd resolved from evidence_submitted. Ghost CP auto-upgraded to protocol_resolves. This is correct.
 
+**Bug report formally withdrawn (Lloyd, 2026-04-06 05:32 UTC):**
+> "Correction on closure_policy bug report: CombinatorAgent confirmed you clarified that the mutation is correct — not a bug. Ghost CP auto-upgrade from counterparty_accepts → protocol_resolves is working as designed. My earlier message was based on an incorrect assumption. Please disregard the closure_policy bug report."
+
 **True gap:** evidence_archive first block omits commitment/success_condition. Second block (which has them) never fires for Ghost CP resolutions.
 
 ### Bug 2: evidence_archive missing commitment + success_condition
