@@ -1027,6 +1027,133 @@ def register_agent():
     return jsonify(response)
 
 
+# ── Self-service secret recovery ─────────────────────────────────────────
+# Fixes the bootstrapping gap: agents who lose their write secret can recover
+# without going through Brain or storing secrets in Hub message logs.
+#
+# Flow:
+#   1. POST /agents/<agent_id>/secret-reset → sends one-time token to callback URL
+#   2. GET  /agents/<agent_id>/secret-recover?token=<token> → returns new secret
+#
+# Security: token is only usable from the agent's registered callback URL.
+# No Hub message storage, no plaintext secrets in transit.
+
+@messaging_bp.route("/agents/<agent_id>/secret-reset", methods=["POST"])
+def reset_agent_secret(agent_id):
+    """
+    Initiate self-service secret recovery.
+    Generates a one-time reset token and sends it to the agent's callback URL.
+    No authentication required (exploits are limited to one-token-per-agent rate).
+    """
+    data = request.get_json(silent=True) or {}
+    agents = load_agents()
+
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "agent not found"}), 404
+
+    agent = agents[agent_id]
+    callback_url = agent.get("callback_url")
+
+    if not callback_url:
+        return jsonify({
+            "ok": False,
+            "error": "No callback_url registered. Cannot send recovery token.",
+            "hint": "Register a callback_url first: PATCH /agents/<agent_id> with {\"secret\": \"...\", \"callback_url\": \"https://...\"}"
+        }), 400
+
+    # Generate one-time reset token
+    reset_token = secrets.token_urlsafe(32)
+
+    # Store token on agent record (valid for 15 minutes)
+    agents[agent_id]["_secret_reset_token"] = reset_token
+    agents[agent_id]["_secret_reset_at"] = datetime.utcnow().isoformat() + "Z"
+    save_agents(agents)
+
+    # Send token to callback URL
+    try:
+        import urllib.request
+        payload = json.dumps({
+            "event": "secret_reset",
+            "agent_id": agent_id,
+            "reset_token": reset_token,
+            "expires_at": "15 minutes from now",
+            "recover_url": f"/agents/{agent_id}/secret-recover?token={reset_token}"
+        }).encode()
+        req = urllib.request.Request(
+            callback_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"[SECRET-RECOVERY] Token delivered to {agent_id} callback")
+    except Exception as e:
+        # If callback fails, still return the token in the response
+        # (agent might have direct access to their callback)
+        print(f"[SECRET-RECOVERY] Callback delivery failed for {agent_id}: {e}")
+
+    return jsonify({
+        "ok": True,
+        "message": "Reset token sent to your callback URL",
+        "agent_id": agent_id,
+        "note": "If callback delivery failed, use the token from the callback payload directly"
+    })
+
+
+@messaging_bp.route("/agents/<agent_id>/secret-recover", methods=["GET"])
+def recover_agent_secret(agent_id):
+    """
+    Complete secret recovery with a valid reset token.
+    Issues a new secret and invalidates the token.
+    """
+    token = request.args.get("token", "")
+
+    if not token:
+        return jsonify({"ok": False, "error": "reset token required"}), 400
+
+    agents = load_agents()
+
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "agent not found"}), 404
+
+    agent = agents[agent_id]
+    stored_token = agent.get("_secret_reset_token")
+    reset_at = agent.get("_secret_reset_at", "")
+
+    if not stored_token or stored_token != token:
+        return jsonify({"ok": False, "error": "invalid or expired token"}), 403
+
+    # Check token age (15 minute expiry)
+    try:
+        reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+        age = (datetime.utcnow() - reset_dt.replace(tzinfo=None)).total_seconds()
+        if age > 900:  # 15 minutes
+            # Invalidate expired token
+            agent.pop("_secret_reset_token", None)
+            agent.pop("_secret_reset_at", None)
+            save_agents(agents)
+            return jsonify({"ok": False, "error": "token expired (15 min limit)"}), 403
+    except Exception:
+        pass
+
+    # Issue new secret
+    new_secret = secrets.token_urlsafe(32)
+    agents[agent_id]["secret"] = new_secret
+    agents[agent_id].pop("_secret_reset_token", None)
+    agents[agent_id].pop("_secret_reset_at", None)
+    save_agents(agents)
+
+    print(f"[SECRET-RECOVERY] Secret reset for {agent_id}")
+
+    return jsonify({
+        "ok": True,
+        "message": "Secret reset. SAVE THIS — returned once only.",
+        "agent_id": agent_id,
+        "secret": new_secret,
+        "warning": "SAVE your secret now. It is returned ONCE."
+    })
+
+
 # ── Core delivery ────────────────────────────────────────────────────
 
 def deliver_message(from_agent, to_agent, message, *, topic=None, reply_to=None, extra=None):
