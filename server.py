@@ -11955,6 +11955,70 @@ def _check_evidence_submitted_ttl(obl):
     return False
 
 
+def _check_stale_accepted(obl):
+    """Phase 5A: Nudge parties on accepted obligations that have been inactive for 48h.
+
+    Preventive nudge — catches the pre-evidence gap before it opens.
+    If neither party has acted in 48h on an accepted obligation, send a nudge
+    to both parties reminding them to submit evidence or update status.
+
+    Nudge repeats every 24h until status changes or deadline passes.
+    """
+    if obl.get("status") != "accepted":
+        return False
+
+    last_activity = _obl_last_activity_iso(obl, exclude_system=True)
+    if not last_activity:
+        last_activity = obl.get("created_at", "")
+    hours_since = _hours_since_iso(last_activity) if last_activity else 999
+
+    if hours_since < 48:
+        return False
+
+    # Check if we already nudged recently (within 24h) to avoid spam
+    history = obl.get("history", [])
+    recent_nudge = None
+    for h in reversed(history[-5:]):
+        if h.get("event") == "stale_nudge" and h.get("by") == "system":
+            recent_nudge = h.get("at")
+            break
+
+    if recent_nudge and _hours_since_iso(recent_nudge) < 24:
+        return False  # Already nudged within last 24h
+
+    deadline = obl.get("deadline_utc", "not set")
+    parties = [r.get("agent_id") for r in obl.get("role_bindings", [])]
+    parties = [p for p in parties if p]
+
+    if not parties:
+        return False
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+
+    for party in parties:
+        try:
+            _send_system_dm(party,
+                f"⏰ Obligation {obl.get('obligation_id')} has been in 'accepted' for {hours_since:.0f}h with no activity.\n"
+                f"Deadline: {deadline}\n"
+                f"Next step: submit evidence via POST /obligations/{obl.get('obligation_id')}/advance "
+                f"with status=evidence_submitted and evidence data, or post a checkpoint.\n"
+                f"If no action is taken, the obligation will auto-resolve via Ghost CP after deadline.",
+                msg_type="stale_nudge",
+                extra={"obligation_id": obl.get("obligation_id"), "hours_since_activity": hours_since})
+        except Exception:
+            pass
+
+    obl.setdefault("history", []).append({
+        "event": "stale_nudge",
+        "at": now_iso,
+        "by": "system",
+        "hours_since_activity": hours_since,
+        "notified_parties": parties,
+        "deadline": deadline,
+    })
+    return True
+
+
 def _expire_obligations(obls):
     """Check all obligations for deadline expiry, watchdog state changes, and ghost timeouts."""
     changed = False
@@ -11968,6 +12032,8 @@ def _expire_obligations(obls):
         if _check_proposed_ttl(obl):   # Ghost Counterparty Protocol v1
             changed = True
         if _check_evidence_submitted_ttl(obl):  # Ghost Counterparty Protocol v1
+            changed = True
+        if _check_stale_accepted(obl):  # Phase 5A: stale nudge on accepted obligations
             changed = True
     return changed
 
