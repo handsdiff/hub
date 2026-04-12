@@ -13467,13 +13467,22 @@ def advance_obligation(obl_id):
         history_entry["protocol"] = "Ghost Counterparty Protocol v1"
 
 
-    # Attach evidence if provided
+    # Attach evidence if provided (legacy text evidence)
     if data.get("evidence"):
         obl["evidence_refs"].append({
             "submitted_at": now,
             "by": agent_id,
             "evidence": data["evidence"],
         })
+
+    # Attach structured evidence_refs if provided (e.g., from evidence_submitted or resolve)
+    for ref in data.get("evidence_refs", []):
+        if ref not in obl.get("evidence_refs", []):
+            obl["evidence_refs"].append({
+                "submitted_at": now,
+                "by": agent_id,
+                **ref,
+            })
 
     # Enforce: cannot resolve without evidence (fail-closed) — check AFTER evidence is appended
     if new_status == "resolved" and not obl.get("evidence_refs"):
@@ -13489,111 +13498,59 @@ def advance_obligation(obl_id):
 
     save_obligations(obls)
 
-    # ── Phase 3: Async Settlement Queue ──────────────────────────────────────
+    # ── Phase 3/4: Async Settlement Queue (CP2) ────────────────────────────────
     # Triggered when obligation reaches 'resolved' AND has a stake_amount.
-    # Fires SPL transfer via Hub operator keypair, then attaches tx_signature
-    # to the settlement event on the obligation record.
-    # Deferred: actual SPL movement until mint address confirmed by Hands.
+    # Settlement is non-blocking: resolution returns immediately, retries async.
+    # Retry policy: 30s → 2min → 10min backoff, max 3 retries.
+    # Permanent failures (insufficient funds, invalid recipient) dead-letter immediately.
     if new_status == "resolved" and obl.get("stake_amount"):
         import threading, traceback
         obl_id_safe = obl_id
         stake_amount_safe = obl.get("stake_amount", 0)
         counterparty_safe = obl.get("counterparty")
+        now_q = datetime.utcnow().isoformat() + "Z"
 
         def _settlement_worker():
-            """Background worker: enqueue and fire settlement tx."""
+            """CP2 settlement worker: initializes queue, fires first attempt."""
             try:
-                # Reload obligation (may have changed since we saved)
-                obls_worker = load_obligations()
-                obl_w = next((o for o in obls_worker if o.get("obligation_id") == obl_id_safe), None)
-                if not obl_w:
-                    print(f"[SETTLEMENT-Q] Obligation {obl_id_safe} not found in worker")
+                obls_init = load_obligations()
+                obl_i = next((o for o in obls_init if o.get("obligation_id") == obl_id_safe), None)
+                if not obl_i:
+                    print(f"[SETTLEMENT-Q] {obl_id_safe}: not found in worker")
                     return
 
                 # Skip if already settled
-                if obl_w.get("settlement", {}).get("tx_signature"):
-                    print(f"[SETTLEMENT-Q] {obl_id_safe} already has settlement tx, skipping")
+                if obl_i.get("settlement_status") == "settled":
+                    print(f"[SETTLEMENT-Q] {obl_id_safe}: already settled, skipping")
                     return
 
-                # Import send_hub here to avoid import-time crash if solana libs missing
-                try:
-                    import importlib
-                    hub_spl = importlib.import_module("hub_spl")
-                    send_hub_fn = getattr(hub_spl, "send_hub", None)
-                    if not send_hub_fn:
-                        raise RuntimeError("hub_spl.send_hub not found")
-                except Exception as hub_err:
-                    print(f"[SETTLEMENT-Q] {obl_id_safe}: hub_spl unavailable ({hub_err}) — settlement queued for retry")
-                    return
+                # Initialize settlement_queue and settlement_status fields
+                if "settlement_queue" not in obl_i:
+                    obl_i["settlement_queue"] = {
+                        "status": "pending",
+                        "stake_amount": stake_amount_safe,
+                        "recipient": counterparty_safe,
+                        "attempt_count": 0,
+                        "max_attempts": 3,
+                        "next_retry_at": now_q,
+                        "settlement_history": [],
+                        "dead_lettered_at": None,
+                        "settled_at": None,
+                    }
+                if "settlement_status" not in obl_i:
+                    obl_i["settlement_status"] = "pending"
+                save_obligations(obls_init)
+                print(f"[SETTLEMENT-Q] {obl_id_safe}: initialized (CP2, status=pending)")
 
-                # Get counterparty wallet address
-                agents_w = load_agents()
-                cp_info = agents_w.get(counterparty_safe) if isinstance(agents_w, dict) else None
-                if not cp_info:
-                    print(f"[SETTLEMENT-Q] {obl_id_safe}: counterparty {counterparty_safe} not found in agents")
-                    return
-                recipient_wallet = cp_info.get("wallet") or cp_info.get("hub_profile", {}).get("wallet") or cp_info.get("solana_wallet")
-                if not recipient_wallet:
-                    print(f"[SETTLEMENT-Q] {obl_id_safe}: no wallet for counterparty {counterparty_safe}")
-                    return
-
-                print(f"[SETTLEMENT-Q] {obl_id_safe}: firing {stake_amount_safe} HUB → {recipient_wallet}")
-                result = send_hub_fn(recipient_wallet, stake_amount_safe)
-
-                # Reload again before writing settlement
-                obls_final = load_obligations()
-                obl_f = next((o for o in obls_final if o.get("obligation_id") == obl_id_safe), None)
-                if not obl_f:
-                    return
-
-                now_w = datetime.utcnow().isoformat() + "Z"
-                settlement_state = "posted" if result.get("success") else "failed"
-                settlement_entry = {
-                    "settlement_type": "hub_spl_transfer",
-                    "settlement_currency": "HUB",
-                    "settlement_amount": stake_amount_safe,
-                    "recipient": recipient_wallet,
-                    "tx_signature": result.get("signature"),
-                    "tx_state": settlement_state,
-                    "tx_error": result.get("error") if not result.get("success") else None,
-                    "solscan_url": result.get("solscan", f"https://solscan.io/tx/{result.get('signature', '')}") if result.get("success") else None,
-                    "settlement_state": "posted",
-                    "settlement_state_reason": "success" if result.get("success") else f"transfer_failed: {result.get('error', 'unknown')}",
-                    "attached_by": "hub_settlement_queue",
-                    "attached_at": now_w,
-                    "queue_protocol": "Phase 3 async settlement queue v1",
-                    # Option B: append resolve event to lifecycle
-                    "settlement_lifecycle": [{
-                        "stage": "resolve",
-                        "actor": "hub_settlement_queue",
-                        "role": "protocol",
-                        "timestamp": now_w,
-                        "tx_signature": result.get("signature"),
-                        "note": "Phase 3 settlement fired by async queue",
-                    }],
-                }
-                obl_f["settlement"] = settlement_entry
-                obl_f.setdefault("history", []).append({
-                    "action": "settlement_fired_by_queue",
-                    "by": "hub_settlement_queue",
-                    "timestamp": now_w,
-                    "tx_signature": result.get("signature"),
-                    "amount": stake_amount_safe,
-                    "recipient": recipient_wallet,
-                    "state": settlement_state,
-                })
-                save_obligations(obls_final)
-                if result.get("success"):
-                    print(f"[SETTLEMENT-Q] {obl_id_safe}: settled {stake_amount_safe} HUB → {recipient_wallet}, tx={result.get('signature')}")
-                else:
-                    print(f"[SETTLEMENT-Q] {obl_id_safe}: settlement FAILED — {result.get('error')}")
+                # Fire first settlement attempt
+                _fire_settlement(obl_id_safe, stake_amount_safe, counterparty_safe)
 
             except Exception as e:
                 print(f"[SETTLEMENT-Q] {obl_id_safe}: unexpected error: {e}\n{traceback.format_exc()}")
 
         t = threading.Thread(target=_settlement_worker, daemon=True)
         t.start()
-        print(f"[SETTLEMENT-Q] {obl_id}: enqueued settlement of {obl.get('stake_amount')} HUB → {obl.get('counterparty')} (async)")
+        print(f"[SETTLEMENT-Q] {obl_id}: enqueued settlement of {obl.get('stake_amount')} HUB → {obl.get('counterparty')} (CP2 async, non-blocking)")
 
     # ── Hub VerifiableCredential on resolution ─────────────────────────────────
     # Produce a self-verifying hub_vc at resolution time.
@@ -18274,3 +18231,406 @@ def get_agent_did(agent_id: str):
         }],
     }
     return jsonify(doc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CP2: Settlement Queue Processor
+# Background daemon: polls for pending settlements, retries with backoff,
+# dead-letters after max retries. Started once on server startup.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SETTLEMENT_PROCESSOR_RUNNING = False
+
+# Backoff schedule: attempt 1 → immediate, 2 → 30s, 3 → 2min, 4 → 10min
+_RETRY_DELAYS = [0, 30, 120, 600]  # seconds
+_MAX_SETTLEMENT_ATTEMPTS = 4  # 3 retries after first attempt
+
+# Retriable error types (temporary failures → retry)
+_RETRYABLE_ERROR_TYPES = {"retriable", "timeout", "rate_limit", "network_error"}
+
+# Permanent error types (irrecoverable → dead-letter immediately)
+_PERMANENT_ERROR_TYPES = {"permanent", "insufficient_funds", "invalid_recipient", "wrong_mint",
+                           "incorrect_program_id", "invalid_account"}
+
+
+def _start_settlement_processor():
+    """Start the settlement queue processor daemon if not already running."""
+    global _SETTLEMENT_PROCESSOR_RUNNING
+    if _SETTLEMENT_PROCESSOR_RUNNING:
+        return
+    _SETTLEMENT_PROCESSOR_RUNNING = True
+
+    import threading, time, traceback
+
+    def _processor_loop():
+        """Continuously polls for pending settlements and processes them."""
+        print("[SETTLEMENT-P] Settlement queue processor started (CP2)")
+        while _SETTLEMENT_PROCESSOR_RUNNING:
+            try:
+                _process_pending_settlements()
+            except Exception as e:
+                print(f"[SETTLEMENT-P] Processor error: {e}\n{traceback.format_exc()}")
+            time.sleep(10)  # Poll every 10 seconds
+
+    t = threading.Thread(target=_processor_loop, daemon=True, name="settlement-processor")
+    t.start()
+    print("[SETTLEMENT-P] Settlement queue processor thread started")
+
+
+def _process_pending_settlements():
+    """Find and process all pending settlements that are due for retry."""
+    obls = load_obligations()
+    changed = False
+    now_ts = datetime.utcnow().isoformat() + "Z"
+    now_dt = datetime.utcnow()
+
+    for obl in obls:
+        sq = obl.get("settlement_queue")
+        if not sq:
+            continue
+        if sq.get("status") not in ("pending", "processing"):
+            continue
+
+        # Check if next_retry_at has passed
+        next_retry = sq.get("next_retry_at")
+        if next_retry:
+            try:
+                next_dt = datetime.fromisoformat(next_retry.replace("Z", "+00:00"))
+                if next_dt > datetime.now(timezone.utc):
+                    continue  # Not yet time to retry
+            except Exception:
+                pass  # If we can't parse, try anyway
+
+        obl_id = obl.get("obligation_id")
+        stake_amount = sq.get("stake_amount") or obl.get("stake_amount", 0)
+        counterparty = sq.get("recipient") or obl.get("counterparty")
+
+        print(f"[SETTLEMENT-P] Processing {obl_id}: attempt {sq.get('attempt_count', 0) + 1}")
+
+        # Import hub_spl
+        try:
+            import importlib
+            hub_spl = importlib.import_module("hub_spl")
+            send_hub_fn = getattr(hub_spl, "send_hub", None)
+            if not send_hub_fn:
+                raise RuntimeError("hub_spl.send_hub not found")
+        except Exception as hub_err:
+            print(f"[SETTLEMENT-P] {obl_id}: hub_spl unavailable ({hub_err})")
+            continue
+
+        # Get counterparty wallet
+        agents = load_agents()
+        cp_info = agents.get(counterparty) if isinstance(agents, dict) else None
+        if not cp_info:
+            print(f"[SETTLEMENT-P] {obl_id}: counterparty {counterparty} not found")
+            _mark_dead_lettered(obl, "counterparty_not_found")
+            changed = True
+            continue
+
+        recipient_wallet = (cp_info.get("wallet") or cp_info.get("hub_profile", {}).get("wallet")
+                            or cp_info.get("solana_wallet"))
+        if not recipient_wallet:
+            print(f"[SETTLEMENT-P] {obl_id}: no wallet for {counterparty}")
+            _mark_dead_lettered(obl, f"no_wallet_for_counterparty:{counterparty}")
+            changed = True
+            continue
+
+        # Fire settlement
+        try:
+            result = send_hub_fn(recipient_wallet, stake_amount)
+        except Exception as send_err:
+            print(f"[SETTLEMENT-P] {obl_id}: send_hub raised {send_err}")
+            # Treat unknown exceptions as retriable
+            result = {"success": False, "error_type": "retriable", "error": str(send_err)}
+
+        success = result.get("success", False)
+        error_type = result.get("error_type", "permanent" if not success else None)
+        error_msg = result.get("error", "")
+        tx_sig = result.get("signature")
+        now_w = datetime.utcnow().isoformat() + "Z"
+
+        # Record attempt
+        sq.setdefault("settlement_history", []).append({
+            "event": "retry",
+            "at": now_w,
+            "attempt": sq.get("attempt_count", 0) + 1,
+            "error_type": error_type,
+            "error_reason": error_msg,
+            "tx_signature": tx_sig,
+            "success": success,
+        })
+        sq["attempt_count"] = sq.get("attempt_count", 0) + 1
+
+        if success:
+            sq["status"] = "settled"
+            sq["settled_at"] = now_w
+            obl["settlement_status"] = "settled"
+            obl.setdefault("history", []).append({
+                "action": "settlement_settled",
+                "by": "hub_settlement_processor",
+                "timestamp": now_w,
+                "tx_signature": tx_sig,
+                "amount": stake_amount,
+                "recipient": recipient_wallet,
+            })
+            print(f"[SETTLEMENT-P] {obl_id}: ✅ settled {stake_amount} HUB → {recipient_wallet}, tx={tx_sig}")
+            changed = True
+
+        elif error_type in _PERMANENT_ERROR_TYPES:
+            # Permanent failure → dead-letter immediately
+            sq["status"] = "dead_lettered"
+            sq["dead_lettered_at"] = now_w
+            obl["settlement_status"] = "dead_lettered"
+            obl.setdefault("history", []).append({
+                "action": "settlement_dead_lettered",
+                "by": "hub_settlement_processor",
+                "timestamp": now_w,
+                "error_type": error_type,
+                "error_reason": error_msg,
+                "total_attempts": sq.get("attempt_count", 0),
+            })
+            print(f"[SETTLEMENT-P] {obl_id}: ⛔ dead-lettered (permanent: {error_type}) — {error_msg}")
+            _fire_dead_letter_alert(obl, error_type, error_msg)
+            changed = True
+
+        else:
+            # Retriable failure
+            attempt = sq.get("attempt_count", 0)
+            if attempt >= _MAX_SETTLEMENT_ATTEMPTS:
+                # Max retries exceeded → dead-letter
+                sq["status"] = "dead_lettered"
+                sq["dead_lettered_at"] = now_w
+                obl["settlement_status"] = "dead_lettered"
+                obl.setdefault("history", []).append({
+                    "action": "settlement_dead_lettered",
+                    "by": "hub_settlement_processor",
+                    "timestamp": now_w,
+                    "error_type": "max_retries_exceeded",
+                    "error_reason": f"Retried {attempt} times, last error: {error_msg}",
+                    "total_attempts": attempt,
+                })
+                print(f"[SETTLEMENT-P] {obl_id}: ⛔ dead-lettered (max retries {attempt})")
+                _fire_dead_letter_alert(obl, "max_retries_exceeded", f"Last error: {error_msg}")
+                changed = True
+            else:
+                # Schedule next retry with backoff
+                delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+                next_dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+                sq["next_retry_at"] = next_dt.isoformat().replace("+00:00", "Z")
+                sq["status"] = "pending"
+                obl["settlement_status"] = "pending"
+                obl.setdefault("history", []).append({
+                    "action": "settlement_retry_scheduled",
+                    "by": "hub_settlement_processor",
+                    "timestamp": now_w,
+                    "attempt": attempt,
+                    "error_type": error_type,
+                    "error_reason": error_msg,
+                    "next_retry_in_seconds": delay,
+                })
+                print(f"[SETTLEMENT-P] {obl_id}: 🔄 retry #{attempt} in {delay}s (error: {error_type})")
+                changed = True
+
+    if changed:
+        save_obligations(obls)
+
+
+def _mark_dead_lettered(obl, reason):
+    """Mark an obligation as dead-lettered due to a non-retryable error."""
+    now_w = datetime.utcnow().isoformat() + "Z"
+    sq = obl.get("settlement_queue", {})
+    sq["status"] = "dead_lettered"
+    sq["dead_lettered_at"] = now_w
+    obl["settlement_status"] = "dead_lettered"
+    obl.setdefault("history", []).append({
+        "action": "settlement_dead_lettered",
+        "by": "hub_settlement_processor",
+        "timestamp": now_w,
+        "error_type": "non_retryable",
+        "error_reason": reason,
+    })
+    _fire_dead_letter_alert(obl, "non_retryable", reason)
+
+
+def _fire_dead_letter_alert(obl, error_type, error_msg):
+    """Fire operator alert when settlement dead-letters. Logs to console + optional webhook."""
+    obl_id = obl.get("obligation_id")
+    counterparty = obl.get("counterparty")
+    stake_amount = obl.get("settlement_queue", {}).get("stake_amount") or obl.get("stake_amount", 0)
+    print(f"[ALERT] 🚨 Settlement DEAD-LETTERED: {obl_id} — {stake_amount} HUB → {counterparty}")
+    print(f"[ALERT]   error_type={error_type}, reason={error_msg}")
+    # Operator webhook (if configured)
+    webhook_url = os.environ.get("HUB_SETTLEMENT_WEBHOOK_URL")
+    if webhook_url:
+        try:
+            import urllib.request
+            payload = {
+                "event": "settlement_dead_lettered",
+                "obligation_id": obl_id,
+                "counterparty": counterparty,
+                "stake_amount": stake_amount,
+                "error_type": error_type,
+                "error_reason": str(error_msg),
+            }
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                print(f"[ALERT] Webhook delivered for {obl_id}")
+        except Exception as e:
+            print(f"[ALERT] Webhook failed for {obl_id}: {e}")
+
+
+def _fire_settlement(obl_id, stake_amount, counterparty):
+    """
+    Fire a single settlement attempt for obl_id. Called by the inline worker
+    (first attempt) and by the processor (retries).
+    """
+    import threading, time, traceback
+
+    def _attempt():
+        try:
+            # Import hub_spl
+            try:
+                import importlib
+                hub_spl = importlib.import_module("hub_spl")
+                send_hub_fn = getattr(hub_spl, "send_hub", None)
+                if not send_hub_fn:
+                    raise RuntimeError("hub_spl.send_hub not found")
+            except Exception as hub_err:
+                print(f"[SETTLEMENT-Q] {obl_id}: hub_spl unavailable ({hub_err})")
+                # Let processor pick it up
+                return
+
+            # Get counterparty wallet
+            agents = load_agents()
+            cp_info = agents.get(counterparty) if isinstance(agents, dict) else None
+            if not cp_info:
+                print(f"[SETTLEMENT-Q] {obl_id}: counterparty {counterparty} not found")
+                _mark_dead_lettered_by_id(obl_id, f"counterparty_not_found: {counterparty}")
+                return
+            recipient_wallet = (cp_info.get("wallet") or cp_info.get("hub_profile", {}).get("wallet")
+                                or cp_info.get("solana_wallet"))
+            if not recipient_wallet:
+                print(f"[SETTLEMENT-Q] {obl_id}: no wallet for {counterparty}")
+                _mark_dead_lettered_by_id(obl_id, f"no_wallet: {counterparty}")
+                return
+
+            print(f"[SETTLEMENT-Q] {obl_id}: firing {stake_amount} HUB → {recipient_wallet}")
+            result = send_hub_fn(recipient_wallet, stake_amount)
+            _record_settlement_result(obl_id, result, stake_amount, recipient_wallet)
+
+        except Exception as e:
+            print(f"[SETTLEMENT-Q] {obl_id}: unexpected error: {e}\n{traceback.format_exc()}")
+            # Treat unknown errors as retriable
+            result = {"success": False, "error_type": "retriable", "error": str(e)}
+            _record_settlement_result(obl_id, result, stake_amount, recipient_wallet if 'recipient_wallet' in dir() else "unknown")
+
+    t = threading.Thread(target=_attempt, daemon=True)
+    t.start()
+
+
+def _record_settlement_result(obl_id, result, stake_amount, recipient_wallet):
+    """Record settlement attempt result and handle retry/dead-letter logic."""
+    success = result.get("success", False)
+    error_type = result.get("error_type", "permanent" if not success else None)
+    error_msg = result.get("error", "")
+    tx_sig = result.get("signature")
+    now_w = datetime.utcnow().isoformat() + "Z"
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
+    if not obl:
+        return
+
+    sq = obl.get("settlement_queue", {})
+    sq.setdefault("settlement_history", []).append({
+        "event": "retry",
+        "at": now_w,
+        "attempt": sq.get("attempt_count", 0) + 1,
+        "error_type": error_type,
+        "error_reason": error_msg,
+        "tx_signature": tx_sig,
+        "success": success,
+    })
+    sq["attempt_count"] = sq.get("attempt_count", 0) + 1
+    attempt = sq["attempt_count"]
+
+    if success:
+        sq["status"] = "settled"
+        sq["settled_at"] = now_w
+        obl["settlement_status"] = "settled"
+        obl.setdefault("history", []).append({
+            "action": "settlement_settled",
+            "by": "hub_settlement_queue",
+            "timestamp": now_w,
+            "tx_signature": tx_sig,
+            "amount": stake_amount,
+            "recipient": recipient_wallet,
+        })
+        print(f"[SETTLEMENT-Q] {obl_id}: ✅ settled {stake_amount} HUB → {recipient_wallet}, tx={tx_sig}")
+        save_obligations(obls)
+        return
+
+    if error_type in _PERMANENT_ERROR_TYPES:
+        sq["status"] = "dead_lettered"
+        sq["dead_lettered_at"] = now_w
+        obl["settlement_status"] = "dead_lettered"
+        obl.setdefault("history", []).append({
+            "action": "settlement_dead_lettered",
+            "by": "hub_settlement_queue",
+            "timestamp": now_w,
+            "error_type": error_type,
+            "error_reason": error_msg,
+        })
+        print(f"[SETTLEMENT-Q] {obl_id}: ⛔ dead-lettered (permanent: {error_type})")
+        _fire_dead_letter_alert(obl, error_type, error_msg)
+        save_obligations(obls)
+        return
+
+    # Retriable
+    if attempt >= _MAX_SETTLEMENT_ATTEMPTS:
+        sq["status"] = "dead_lettered"
+        sq["dead_lettered_at"] = now_w
+        obl["settlement_status"] = "dead_lettered"
+        obl.setdefault("history", []).append({
+            "action": "settlement_dead_lettered",
+            "by": "hub_settlement_queue",
+            "timestamp": now_w,
+            "error_type": "max_retries_exceeded",
+            "error_reason": f"Retried {attempt} times",
+        })
+        print(f"[SETTLEMENT-Q] {obl_id}: ⛔ dead-lettered (max retries)")
+        _fire_dead_letter_alert(obl, "max_retries_exceeded", error_msg)
+    else:
+        delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+        next_dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        sq["next_retry_at"] = next_dt.isoformat().replace("+00:00", "Z")
+        sq["status"] = "pending"
+        obl["settlement_status"] = "pending"
+        obl.setdefault("history", []).append({
+            "action": "settlement_retry_scheduled",
+            "by": "hub_settlement_queue",
+            "timestamp": now_w,
+            "attempt": attempt,
+            "error_type": error_type,
+            "next_retry_in_seconds": delay,
+        })
+        print(f"[SETTLEMENT-Q] {obl_id}: 🔄 retry #{attempt} in {delay}s ({error_type})")
+    save_obligations(obls)
+
+
+def _mark_dead_lettered_by_id(obl_id, reason):
+    """Mark an obligation as dead-lettered by ID."""
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
+    if obl:
+        _mark_dead_lettered(obl, reason)
+        save_obligations(obls)
+
+
+# Start the settlement processor on module load
+_start_settlement_processor()
