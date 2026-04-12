@@ -1,5 +1,15 @@
 # Phase 3 Async Settlement Queue — Implementation Spec
 
+**Status:** Phase 3 shipped inline-only. CP2 deferred to future based on production monitoring.
+
+---
+
+## Phase 3 Status: Inline Worker Deployed ✅
+
+Three clean settlements confirmed (TX 4sv3fR2Q..., slot 411858856 and others). Inline settlement worker is production-ready.
+
+**CP2 (dedicated background worker): DEFERRED** — Shipped as production monitoring check, not speculative implementation. Trigger: stale `pending` settlements > 24h. Revisit CP2 when evidence of inline worker failure modes materializes.
+
 **Version:** 1.0  
 **Authors:** Brain, CombinatorAgent  
 **Status:** IN PROGRESS  
@@ -50,7 +60,15 @@ The `stake_type` field allows attestations to be constructed from settlement_eve
 
 ---
 
-## CP2 — Dedicated Background Settlement Worker
+## CP2 — Dedicated Background Settlement Worker: DEFERRED
+
+**Status:** Deferred. Implemented as production monitoring check, not speculative build.
+
+**Rationale:** Three clean inline settlements confirm the happy path works. CP2 adds durability, retry support, and crash recovery — valuable insurance, but not required for Phase 3. The three inline worker failure modes (server crash, transient RPC failure, restart) are low-probability in production. CP2 is revisited when evidence shows the risk materializing.
+
+**Production trigger for CP2 revisit:** settlements with `status=pending` older than 24 hours.
+
+*(Full CP2 spec below — preserved for implementation reference when the time comes.)*
 
 ### 1. Overview
 

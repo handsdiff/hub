@@ -1,9 +1,10 @@
 """
 HUB SPL Token Transfer Module
 Handles on-chain HUB token transfers for bounties, airdrops, etc.
+Error classification: retriable vs permanent.
 """
 
-import json, struct, os
+import json, struct, os, re
 import base58
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -52,6 +53,53 @@ if WALLET_KP is None:
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 CLIENT = Client(SOLANA_RPC_URL)
 
+# ─── Error classification ────────────────────────────────────────────────────
+
+def _classify_error(exc: Exception) -> str:
+    """
+    Classify an exception as 'retriable' or 'permanent'.
+    Retriable: transient network/RPC failures likely to succeed on retry.
+    Permanent: application-level failures that will not succeed on retry.
+    """
+    msg = str(exc).lower()
+
+    # Permanent: application-level errors that won't change on retry
+    if "insufficient funds" in msg:
+        return "permanent"
+    if "invalid" in msg and ("address" in msg or "pubkey" in msg or "base58" in msg):
+        return "permanent"
+    if "wrong mint" in msg or "incorrect program id" in msg or "incorrect program" in msg:
+        return "permanent"
+    if "token account" in msg and "not found" in msg:
+        # ATA doesn't exist and creation failed — unlikely to self-correct
+        return "permanent"
+    if "already exists" in msg and "token account" in msg:
+        # Race condition on ATA creation — safe to retry
+        return "retriable"
+    if "blockhash not found" in msg:
+        return "retriable"
+    if "too old" in msg:
+        return "retriable"
+
+    # Retriable: transient RPC/network failures
+    if "timeout" in msg or "timed out" in msg:
+        return "retriable"
+    if "connection" in msg and ("refused" in msg or "reset" in msg or "timeout" in msg):
+        return "retriable"
+    if "429" in msg or "rate limit" in msg or "rate_limit" in msg:
+        return "retriable"
+    if "503" in msg or "service unavailable" in msg:
+        return "retriable"
+    if "bad gateway" in msg:
+        return "retriable"
+    if "econnreset" in msg or "enetunreach" in msg or "network" in msg:
+        return "retriable"
+
+    # Default: permanent for unknown exceptions (safer — don't infinite retry)
+    return "permanent"
+
+
+# ─── Token helpers ──────────────────────────────────────────────────────────
 
 def get_ata(owner: Pubkey, mint: Pubkey = HUB_MINT) -> Pubkey:
     """Derive associated token account address."""
@@ -110,56 +158,79 @@ def get_hub_balance(owner_address: str) -> float:
     return 0.0
 
 
+# ─── Core transfer ───────────────────────────────────────────────────────────
+
 def send_hub(recipient_address: str, amount: float) -> dict:
     """
     Send HUB tokens to a recipient.
-    Creates ATA if needed. Returns tx signature or error.
-    
-    Args:
-        recipient_address: Solana wallet address (base58)
-        amount: Amount of HUB to send (human-readable, e.g. 100.0)
-    
+    Creates ATA if needed. Returns tx signature or structured error.
+
     Returns:
-        {"success": True, "signature": "...", "amount": 100.0}
-        or {"success": False, "error": "..."}
+        {"success": True, "signature": "...", "amount": 100.0, "error_type": None}
+        or {"success": False, "error": "...", "error_type": "retriable"|"permanent"}
+
+    Error classification:
+        retriable  — RPC timeout, rate limit, network blip. Safe to retry with backoff.
+        permanent   — insufficient funds, invalid recipient, wrong mint. Do not retry.
     """
     try:
         recipient = Pubkey.from_string(recipient_address)
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Invalid recipient address: {exc}",
+            "error_type": "permanent",
+        }
+
+    try:
         amount_raw = int(amount * (10 ** HUB_DECIMALS))
-        
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Invalid amount: {exc}",
+            "error_type": "permanent",
+        }
+
+    try:
         source_ata = get_ata(WALLET_PUBKEY)
         dest_ata = get_ata(recipient)
-        
+
         instructions = []
-        
+
         # Priority fee for reliable inclusion
         instructions.append(set_compute_unit_price(50_000))
-        
+
         # Create ATA if it doesn't exist
         if not ata_exists(dest_ata):
             instructions.append(create_ata_instruction(WALLET_PUBKEY, recipient))
-        
+
         # Transfer
-        instructions.append(spl_transfer_instruction(source_ata, dest_ata, WALLET_PUBKEY, amount_raw))
-        
+        instructions.append(spl_transfer_instruction(source_ata, dest_ata, WALLET_KP, amount_raw))
+
         # Build and send transaction
         recent = CLIENT.get_latest_blockhash()
         msg = Message.new_with_blockhash(instructions, WALLET_PUBKEY, recent.value.blockhash)
         tx = Transaction.new_unsigned(msg)
         tx.sign([WALLET_KP], recent.value.blockhash)
-        
+
         result = CLIENT.send_transaction(tx)
         sig = str(result.value)
-        
+
         return {
             "success": True,
             "signature": sig,
             "amount": amount,
             "recipient": recipient_address,
             "solscan": f"https://solscan.io/tx/{sig}",
+            "error_type": None,
         }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception as exc:
+        etype = _classify_error(exc)
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_type": etype,
+        }
 
 
 def get_treasury_balance() -> float:

@@ -13518,6 +13518,16 @@ def advance_obligation(obl_id):
     # Fixes bug: both evidence_archive blocks previously overwrote each other, losing commitment/success_condition.
     if new_status == "resolved" and not obl.get("evidence_archive"):
         is_protocol_resolves = obl.get("closure_policy") == "protocol_resolves"
+        # Safe-serialize evidence_refs: if any entry is non-JSON-serializable, fall back to string summary.
+        # This prevents 500 crashes when evidence contains non-standard Python objects.
+        safe_evidence_refs = []
+        for e in obl.get("evidence_refs", []):
+            try:
+                import json as _json
+                _json.dumps(e)  # test serializability
+                safe_evidence_refs.append(e)
+            except (TypeError, ValueError):
+                safe_evidence_refs.append({"type": "unserializable", "repr": repr(e)})
         obl["evidence_archive"] = {
             "archived_at": now,
             "archived_by": agent_id,
@@ -13528,11 +13538,11 @@ def advance_obligation(obl_id):
             "resolution_reason": (
                 f"protocol_resolves closure_policy triggered by {agent_id}"
                 if is_protocol_resolves
-                else f"Resolved with {len(obl.get('evidence_refs', []))} evidence_refs. "
+                else f"Resolved with {len(safe_evidence_refs)} evidence_refs. "
                      f"Counterparty '{obl.get('counterparty')}' liveness_class='{obl.get('counterparty_liveness_class', 'unknown')}'."
             ),
-            "evidence_count": len(obl.get("evidence_refs", [])),
-            "evidence_refs": list(obl.get("evidence_refs", [])),
+            "evidence_count": len(safe_evidence_refs),
+            "evidence_refs": safe_evidence_refs,
             "commitment": obl.get("commitment", ""),
             "success_condition": obl.get("success_condition"),
             "binding_scope_text": obl.get("binding_scope_text"),
