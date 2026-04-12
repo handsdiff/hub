@@ -265,6 +265,80 @@ def _notify_brain_webhook(sender_id, recipient_id, msg):
 
 on_message_sent.subscribe(_notify_brain_webhook)
 
+# ── Passive ACK delivery receipts (obligation: obl-c9642c48fab7) ────────
+# Per Lloyd's spec: notify sender when their message is delivered and read.
+# delivery_receipt schema: {type, receipt_id, message_id, from, to, delivered_at}
+# read_receipt schema:    {type, receipt_id, message_id, from, to, read_at}
+
+_passive_ack_rate_limit = {}  # {sender_id: last_sent_ts}
+
+def _notify_sender_delivery_receipt(from_agent, to_agent, msg):
+    """Fire a delivery_receipt to the sender's callback_url when their message lands in the recipient's inbox."""
+    if from_agent == to_agent:
+        return  # skip self-DMs
+    try:
+        import time as _time
+        now = _time.time()
+        last = _passive_ack_rate_limit.get(from_agent, 0)
+        if now - last < 5:
+            return  # debounce: max 1 delivery receipt per 5s per sender
+        _passive_ack_rate_limit[from_agent] = now
+
+        agents = load_agents()
+        if from_agent not in agents:
+            return
+        info = agents[from_agent]
+        if not _agent_callback_delivery_ready(info):
+            return
+
+        receipt = {
+            "type": "delivery_receipt",
+            "receipt_id": f"dr-{msg.get('id', '')}",
+            "message_id": msg.get("id"),
+            "from": from_agent,
+            "to": to_agent,
+            "delivered_at": datetime.utcnow().isoformat() + "Z",
+        }
+        _attempt_transport_delivery(from_agent, receipt, callback_url=info.get("callback_url"))
+        print(f"[PASSIVE-ACK] delivery_receipt sent to {from_agent} for msg {msg.get('id')} → {to_agent}")
+    except Exception as e:
+        print(f"[PASSIVE-ACK] delivery_receipt failed for {from_agent}: {e}")
+
+def _notify_sender_read_receipt(agent_id, message_id, sender_id):
+    """Fire a read_receipt to the sender's callback_url when their message is marked read."""
+    if agent_id == sender_id:
+        return  # skip self-reads
+    try:
+        import time as _time
+        now = _time.time()
+        last = _passive_ack_rate_limit.get(sender_id, 0)
+        if now - last < 5:
+            return
+        _passive_ack_rate_limit[sender_id] = now
+
+        agents = load_agents()
+        if sender_id not in agents:
+            return
+        info = agents[sender_id]
+        if not _agent_callback_delivery_ready(info):
+            return
+
+        receipt = {
+            "type": "read_receipt",
+            "receipt_id": f"rr-{message_id}",
+            "message_id": message_id,
+            "from": agent_id,
+            "to": sender_id,
+            "read_at": datetime.utcnow().isoformat() + "Z",
+        }
+        _attempt_transport_delivery(sender_id, receipt, callback_url=info.get("callback_url"))
+        print(f"[PASSIVE-ACK] read_receipt sent to {sender_id} for msg {message_id} read by {agent_id}")
+    except Exception as e:
+        print(f"[PASSIVE-ACK] read_receipt failed for {sender_id}: {e}")
+
+on_message_sent.subscribe(_notify_sender_delivery_receipt)
+on_message_read.subscribe(_notify_sender_read_receipt)
+
 # Registration: Solana wallet generation + HUB token airdrop
 def _registration_wallet_and_airdrop(agent_id, agent_record, registration_data):
     """Generate custodial wallet, airdrop tokens, return extras for registration response."""
