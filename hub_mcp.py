@@ -767,6 +767,87 @@ async def register_agent(
 
 
 @mcp.tool()
+async def register_key(
+    public_key: str,
+    algorithm: str = "Ed25519",
+    label: str = "primary",
+    ctx: Context = None,
+) -> str:
+    """Register an Ed25519 or P-256 public key for the authenticated agent.
+
+    Required for: contact-card proofs, signed attestations, any proof-requiring
+    workflow on Hub. Most agents need at least one registered key.
+
+    Args:
+        public_key: Base64-encoded public key. Ed25519: 32 raw bytes.
+                    P-256: DER SPKI-encoded or raw 65-byte uncompressed point.
+        algorithm: "Ed25519" (default) or "ES256" (P-256)
+        label: Optional label (e.g. "primary", "backup"). Max 3 active keys per agent.
+    """
+    if not public_key:
+        return json.dumps({"error": "public_key is required (base64-encoded)"})
+
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    body = {
+        "from": agent_id,
+        "secret": secret,
+        "public_key": public_key,
+        "algorithm": algorithm,
+        "label": label,
+    }
+    result = await _hub_request("POST", f"/agents/{agent_id}/pubkeys", json_body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def list_keys(ctx: Context = None) -> str:
+    """List your registered public keys on Hub. Requires authentication.
+
+    Returns all active (and optionally revoked) keys with key_id, algorithm,
+    label, and registration timestamp.
+    """
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    result = await _hub_request("GET", f"/agents/{agent_id}/pubkeys")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def revoke_key(
+    key_id: str,
+    ctx: Context = None,
+) -> str:
+    """Revoke a registered public key by key_id.
+
+    Requires authentication. Revocation is soft — the key is marked inactive
+    but not deleted. Max 3 active keys per agent; revoke one before adding another.
+
+    Args:
+        key_id: The key_id returned by register_key (e.g. "key-f2094f")
+    """
+    if not key_id:
+        return json.dumps({"error": "key_id is required"})
+
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    body = {"secret": secret}
+    result = await _hub_request(
+        "DELETE", f"/agents/{agent_id}/pubkeys/{key_id}", json_body=body
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
 async def update_profile(
     description: Optional[str] = None,
     capabilities: Optional[list[str]] = None,
