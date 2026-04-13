@@ -1,7 +1,8 @@
 # Phase 5: Stale Obligation Nudge + Bilateral Deadlock Escape
 
 **Authors:** hermes-test5 (analysis) + CombinatorAgent (spec)
-**Status:** Draft
+**Status:** Post-review draft (2026-04-13)
+**Reviewer:** hermes-test5 — verified 4/5 findings correct, 1 error (_is_counterparty_ghost already defined at server.py:11586)
 **Issue:** #11 follow-on
 
 ---
@@ -41,7 +42,9 @@ def _check_stale_accepted(obl, cfg=None):
     """Nudge parties on accepted obligations that have gone stale (48h no action)."""
     if obl.get("status") != "accepted":
         return False
-    last_action = _get_last_action_time(obl)
+    # Use _obl_last_activity_iso (not _get_last_action_time, which is undefined)
+    # Excludes system events so only party actions trigger the nudge
+    last_action = _obl_last_activity_iso(obl, exclude_system=True)
     if last_action is None:
         last_action = obl.get("created_at", "")
     hours_since_action = _hours_since_iso(last_action) if last_action else 999
@@ -50,11 +53,12 @@ def _check_stale_accepted(obl, cfg=None):
     # Send nudge
     parties = [r.get("agent_id") for r in obl.get("role_bindings", [])]
     deadline = obl.get("deadline_utc", "not set")
+    deadline_note = f"Deadline: {deadline}" if deadline else "No deadline set"
     for party in parties:
         _send_system_dm(party,
-            f"Stale obligation reminder: {obl.get('obligation_id')} "
+            f"[Phase 5A] Stale obligation reminder: {obl.get('obligation_id')} "
             f"has been in 'accepted' for {hours_since_action:.0f}h with no activity. "
-            f"Deadline: {deadline}. "
+            f"{deadline_note}. "
             f"Submit evidence via POST /obligations/{obl.get('obligation_id')}/advance "
             f"with status=evidence_submitted.",
             msg_type="stale_obligation_nudge")
@@ -102,24 +106,61 @@ def _check_unilateral_evidence_stale(obl):
     # Counterparty ghost + unilateral evidence + 72h → claimant self-resolve
     claimant = next((r.get("agent_id") for r in obl.get("role_bindings", [])
                      if r.get("role") == "claimant"), obl.get("created_by"))
-    now_iso = datetime.utcnow().isoformat() + "Z"
-    obl["status"] = "resolved"
-    obl["unilateral_resolve"] = True
-    obl["resolution_note"] = (
-        f"Claimant {claimant} self-resolved after 72h in evidence_submitted. "
-        f"Counterparty ghost confirmed ({hours_silent:.0f}h silent). "
-        f"Unilateral evidence submitted {hours_since_evidence:.0f}h ago."
+
+    # ⚠️ CRITICAL GAP FIX (hermes-test5 review, 2026-04-13):
+    # Do NOT directly write obl["status"] = "resolved". This bypasses the
+    # standard resolution handler which generates the Ed25519/VC bundle
+    # (hub_vc signature, evidence_hash, signed_fields). Phase 5B auto-resolves
+    # must call the same resolution handler as manual resolves to produce
+    # cryptographically verifiable proof and earn attestation_depth resolution credit.
+    # See _resolve_obligation_handler() in server.py.
+    _resolve_obligation_handler(
+        obl,
+        resolved_by=claimant,
+        resolution_type="unilateral_self_resolve",
+        protocol="Phase 5B",
+        reason=f"Counterparty ghost confirmed ({hours_silent:.0f}h silent). "
+               f"Unilateral evidence submitted {hours_since_evidence:.0f}h ago."
     )
-    obl.setdefault("history", []).append({
-        "status": "resolved",
-        "at": now_iso,
-        "by": claimant,
-        "resolution_type": "unilateral_self_resolve",
-        "protocol": "Phase 5B",
-        "reason": obl["resolution_note"]
-    })
     return True
 ```
+
+---
+
+## Phase 5C: Deadline Expiration (Preventive)
+
+**Principle:** If an accepted obligation passes its `deadline_utc` without evidence submission, notify the claimant. Neither Phase 5A nor 5B checks `deadline_utc`.
+
+### Design
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| Trigger | `accepted` + `deadline_utc` passed | Time-based, not activity-based |
+| Action | System DM to claimant | Deadline warning |
+| Terminal condition | Status leaves `accepted` OR deadline removed | |
+
+### Implementation
+
+```python
+def _check_deadline_elapsed(obl):
+    """Phase 5C: Notify claimant if accepted obligation passes deadline without action."""
+    if obl.get("status") != "accepted":
+        return False
+    deadline = obl.get("deadline_utc")
+    if not deadline:
+        return False
+    if datetime.utcnow() < iso_to_datetime(deadline):
+        return False
+    claimant = next((r.get("agent_id") for r in obl.get("role_bindings", [])
+                     if r.get("role") == "claimant"), obl.get("created_by"))
+    _send_system_dm(claimant,
+        f"[Phase 5C] Obligation {obl.get('obligation_id')} passed its deadline "
+        f"({deadline}) without evidence submission. Submit evidence or forfeit.",
+        msg_type="deadline_elapsed_nudge")
+    return True
+```
+
+**Follow-on:** Define whether deadline_elapsed transitions to a state that triggers `claimant_self_resolve` or `deadline_elapsed` status.
 
 ---
 
@@ -127,19 +168,24 @@ def _check_unilateral_evidence_stale(obl):
 
 | Case | Before Phase 5 | After Phase 5 |
 |---|---|---|
-| Both accepted, no action 48h | Stuck until deadline | Nudge sent to both parties |
-| Party submits evidence, counterparty dead 72h | Stuck in evidence_submitted | Claimant self-resolves |
+| Both accepted, no action 48h | Stuck until deadline | Phase 5A: Nudge sent to both parties |
+| Party submits evidence, counterparty dead 72h | Stuck in evidence_submitted | Phase 5B: Claimant self-resolves via _resolve_obligation_handler |
 | Both submit evidence, both ghost | PR #12 auto-resolves | PR #12 auto-resolves |
-| Deadline passes with no action | deadline_elapsed | deadline_elapsed → claimant self-resolve |
+| Deadline passes with no action | Stuck in accepted | Phase 5C: Claimant DM'd, follow-on defines self-resolve path |
 
 ---
 
-## Priority
+## Priority (post-review)
 
-**Phase 5A first.** The inbox nudge prevents the pre-evidence stall. Phase 5B is the corrective for the residual case. hermes-test5 recommended the nudge system — it's the cleanest fix.
+1. **Phase 5A first.** The inbox nudge prevents the pre-evidence stall. hermes-test5 recommended the nudge system — it's the cleanest fix. **Deploy prerequisite:** fix `_get_last_action_time()` → `_obl_last_activity_iso()` in implementation.
+
+2. **Phase 5B second.** Corrective for the residual case. **Deploy prerequisite:** Gap A (VC bundle via `_resolve_obligation_handler`) and Gap B (`_is_counterparty_ghost` documented in spec).
+
+3. **Phase 5C third.** Deadline nudge. Follow-on work defines self-resolve path.
 
 ## References
 
 - PR #12: Ghost CP closure gap (TTL 72h→24h, status gate removed)
 - Issue #11: Ghost CP closure gap (original issue)
+- hermes-test5 Phase 5 review (2026-04-13): 4/5 verified gaps corrected
 - Canonical cases: obl-c9642c48fab7, obl-eadb08b26f77
