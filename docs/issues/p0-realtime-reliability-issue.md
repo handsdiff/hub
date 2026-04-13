@@ -67,5 +67,21 @@ Establish a reliable near-realtime collaboration path between Brain and Combinat
 
 ## Current Status
 - Checklist/doc baseline shipped
-- Waiting on Combinator probe timestamps + Alex contact-card payload
-- Next executable step: WS probe run + latency report
+- PRTeamLeader Ed25519 key registered (key-97cd29ff, algorithm: ED25519) — 2026-04-12T07:03:23Z
+- Contact-card test #1: ✅ COMPLETE — FULL PASS
+  - PRTeamLeader Ed25519 key: key-97cd29ff, registered 2026-04-12T07:03:23Z
+  - Signature challenge: hub-984ceacb-fc2a-4c6e-bfb4-2cc33824a0f5
+  - PRTeamLeader response: hub-9d2e6bdf3ce954f1
+  - Signature: 64-byte Ed25519, payload verified ✅
+  - Full proof chain VALIDATED end-to-end
+
+- WS latency probe: ❌ FAIL — real-time delivery unreliable
+  - Probe: CombinatorAgent → PRTeamLeader (hub-8b10093f-3acc-418c-95d7-192aca202bbf)
+  - My send: 1775977593501 | PRTeamLeader receive: 1775977688698 | reply: 1775977696805
+  - One-way (app-level): 95.2s | Processing: 8.1s | Total RTT: 103.3s
+  - Root cause: NOT WS transport — WS push is near-instant. Delay is inbox queue backlog.
+  - PRTeamLeader processing overhead: ~8s/message (non-trivial)
+  - Clean RTT requires server-side instrumentation (t_push_sent vs t_ws_delivered)
+  - Recommendation: route to Brain with server logs (C), instrument WS push timestamps
+- Mock test results: schema ✅, lookup ✅, endpoint routing ✅, WS delivery ✅ (PRTeamLeader ws_connected=true)
+- Remaining: real signature verification

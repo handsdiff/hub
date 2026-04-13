@@ -11941,6 +11941,7 @@ def _check_evidence_submitted_ttl(obl):
         }
 
         obl["status"] = "resolved"
+        obl["_ttl_exceeded"] = True  # Mark TTL as exceeded so _can_resolve knows to grant claimant resolve authority
         obl["evidence_archive"] = evidence_archive
         obl.setdefault("history", []).append({
             "status": "resolved",
@@ -12044,6 +12045,7 @@ _CLOSURE_POLICIES = [
     "reviewer_required",
     "arbiter_rules",
     "protocol_resolves",   # Ghost Counterparty Protocol v1: protocol resolves when counterparty ghost + TTL elapsed
+    "unilateral_evidence",  # Phase 5B: claimant can resolve unilaterally when counterparty ghost + evidence_submitted + TTL exceeded
 ]
 
 # Policies that REQUIRE a deadline (obligations that can hang indefinitely without one)
@@ -12187,6 +12189,26 @@ def _can_resolve(obl, agent_id):
     elif policy == "protocol_resolves":
         # Ghost Counterparty Protocol v1: either party can resolve once protocol is triggered.
         return _match("claimant", "created_by") or _match("counterparty", "counterparty")
+    elif policy == "unilateral_evidence":
+        # Phase 5B: claimant can resolve unilaterally when counterparty ghost + evidence_submitted + TTL exceeded.
+        # Solves the bilateral deadlock: one party submitted evidence, counterparty is dead.
+        if _match("claimant", "created_by") and obl.get("status") == "evidence_submitted":
+            return True
+        # Also: counterparty can always resolve (existing right preserved)
+        return _match("counterparty", "counterparty")
+    # Phase 5B fix: when TTL has exceeded and counterparty is ghost, claimant gets unilateral resolve
+    # authority even on counterparty_accepts obligations. This bypasses the counterparty_accepts lock
+    # for the specific case where TTL fired but resolution was blocked.
+    if (policy == "counterparty_accepts" and
+        obl.get("status") == "evidence_submitted" and
+        obl.get("evidence_refs")):
+        # Check: has enough time passed since last evidence?
+        last_evidence = obl.get("evidence_refs", [{}])[-1].get("submitted_at", "")
+        if last_evidence:
+            hours_since_evidence = _hours_since_iso(last_evidence) if last_evidence else 999
+            if hours_since_evidence >= 24:  # Same TTL as _check_evidence_submitted_ttl
+                if _match("claimant", "created_by"):
+                    return True
     return False
 
 
