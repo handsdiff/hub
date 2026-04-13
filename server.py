@@ -10169,6 +10169,271 @@ def trust_oracle_aggregate(agent_id):
 # weights. Cross-channel divergence flags Sybil attacks. Exponential spoofing
 # cost argument: each independent channel is a separate attack vector.
 
+# ==================== COMBINATOR FUTARCHY ORACLE ADAPTER ====================
+# Hub → Combinator POST adapter for futarchy oracle resolution.
+# Auth: Option A (per CombinatorAgent decision, 2026-04-13)
+#   Combinator API key stored in hub-data/combinator_config.json
+#   Sent as: Authorization: Bearer <key>
+# Combinator POSTs to /oracle/resolve; Hub pushes via this endpoint.
+
+COMBINATOR_CONFIG_PATH = os.path.join(DATA_DIR, "combinator_config.json")
+COMBINATOR_API_BASE = "https://api.zcombinator.io"  # default, overridable in config
+
+
+def _load_combinator_config():
+    if not os.path.exists(COMBINATOR_CONFIG_PATH):
+        return {}
+    try:
+        with open(COMBINATOR_CONFIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_combinator_config(cfg):
+    with open(COMBINATOR_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def _combinator_api_key():
+    cfg = _load_combinator_config()
+    return cfg.get("api_key")
+
+
+@app.route("/oracle/combinator/configure", methods=["POST"])
+def combinator_configure():
+    """
+    Set Combinator API key and base URL for oracle push.
+    Requires authenticated agent.
+    Body: {"secret": "<hub_secret>", "api_key": "...", "api_base": "https://..."}
+    """
+    data = request.get_json() or {}
+    secret = data.get("secret") or request.headers.get("Authorization", "").replace("Bearer ", "")
+    agent_id = data.get("from")
+
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"error": "Unknown agent"}), 403
+
+    agent_secret = agents[agent_id].get("secret", "")
+    if not agent_secret or secret != agent_secret:
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    cfg = _load_combinator_config()
+    if "api_key" in data:
+        cfg["api_key"] = data["api_key"]
+    if "api_base" in data:
+        cfg["api_base"] = data["api_base"]
+
+    _save_combinator_config(cfg)
+
+    return jsonify({
+        "ok": True,
+        "configured": bool(cfg.get("api_key")),
+        "api_base": cfg.get("api_base", COMBINATOR_API_BASE)
+    })
+
+
+@app.route("/oracle/combinator/resolve", methods=["POST"])
+def combinator_oracle_resolve():
+    """
+    Push oracle resolution from Hub to Combinator futarchy markets.
+    Option A auth: Authorization: Bearer <combinator_api_key> sent to Combinator API.
+
+    Request body:
+      {
+        "from": "brain",
+        "secret": "<hub_secret>",
+        "proposal_slug": "my-proposal",       # required: Combinator market slug
+        "recommendation": "approve",         # required: "approve" | "reject"
+        "evidence_refs": ["obl-xxx"],         # optional: Hub obligation IDs as evidence
+        "category": "agent_coordination",     # optional: attestation category
+        "confidence_override": 0.85            # optional: override Hub-computed confidence
+      }
+
+    Response:
+      {
+        "ok": true,
+        "submitted_at": "...",
+        "combinator_response": {...},
+        "evidence_count": N
+      }
+    """
+    data = request.get_json() or {}
+    secret = data.get("secret") or request.headers.get("Authorization", "").replace("Bearer ", "")
+    agent_id = data.get("from")
+
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"error": "Unknown agent"}), 403
+
+    agent_secret = agents[agent_id].get("secret", "")
+    if not agent_secret or secret != agent_secret:
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    proposal_slug = data.get("proposal_slug")
+    recommendation = data.get("recommendation")
+    if not proposal_slug or not recommendation:
+        return jsonify({"error": "proposal_slug and recommendation are required"}), 400
+    if recommendation not in ("approve", "reject"):
+        return jsonify({"error": "recommendation must be 'approve' or 'reject'"}), 400
+
+    cfg = _load_combinator_config()
+    api_key = cfg.get("api_key")
+    api_base = cfg.get("api_base", COMBINATOR_API_BASE)
+
+    if not api_key:
+        return jsonify({
+            "error": "Combinator API key not configured",
+            "hint": "POST /oracle/combinator/configure with {api_key: '...'}"
+        }), 400
+
+    # Gather evidence from referenced Hub obligations
+    evidence_refs = data.get("evidence_refs", [])
+    obligations = load_obligations()
+    evidence_payload = []
+    for obl_id in evidence_refs:
+        obl = obligations.get(obl_id)
+        if obl:
+            evidence_payload.append({
+                "type": "hub_obligation",
+                "obligation_id": obl_id,
+                "status": obl.get("status"),
+                "commitment": obl.get("commitment", "")[:200],
+                "closure_policy": obl.get("closure_policy"),
+                "resolved_at": obl.get("resolved_at"),
+                "parties": [p["agent_id"] for p in obl.get("parties", [])]
+            })
+
+    # Compute confidence from Hub trust data (or use override)
+    confidence_override = data.get("confidence_override")
+    category = data.get("category", "agent_coordination")
+
+    if confidence_override is None:
+        # Delegate to existing oracle aggregate endpoint logic
+        # We replicate the key parts here to avoid a second HTTP call
+        attestations = load_attestations()
+        # Pull attestations for all parties in evidence obligations
+        agent_ids = set()
+        for e in evidence_payload:
+            agent_ids.update(e.get("parties", []))
+
+        all_scores = []
+        for aid in agent_ids:
+            atts = attestations.get(aid, [])
+            if category:
+                atts = [a for a in atts if a.get("category") == category]
+            for a in atts:
+                all_scores.append(a.get("score", a.get("rating", 0.5)))
+
+        if all_scores:
+            confidence_override = round(sum(all_scores) / len(all_scores), 4)
+        else:
+            confidence_override = 0.5
+
+    # Build the oracle payload per Combinator API spec (Option A: Bearer token)
+    oracle_payload = {
+        "oracle_agent": agent_id,
+        "proposal_slug": proposal_slug,
+        "recommendation": recommendation,
+        "confidence": confidence_override,
+        "evidence_count": len(evidence_payload),
+        "evidence": evidence_payload[:10],  # cap at 10 refs
+        "hub_base_url": os.environ.get("HUB_PUBLIC_URL", "https://admin.slate.ceo/oc/brain"),
+        "generated_at": datetime.utcnow().isoformat() + "Z"
+    }
+
+    # POST to Combinator API (Option A: Bearer token auth) using urllib
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    combinator_response = None
+    combinator_status = None
+    error_msg = None
+
+    try:
+        import urllib.request
+        data_bytes = json.dumps(oracle_payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{api_base}/oracle/resolve",
+            data=data_bytes,
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            combinator_status = resp.status
+            try:
+                combinator_response = json.load(resp)
+            except Exception:
+                combinator_response = {"raw": resp.read().decode("utf-8")[:500]}
+    except urllib.error.HTTPError as e:
+        combinator_status = e.code
+        try:
+            combinator_response = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            combinator_response = {"raw": e.read().decode("utf-8")[:500]}
+    except urllib.error.URLError as e:
+        error_msg = f"Combinator API unreachable: {e.reason}"
+        combinator_status = 502
+    except TimeoutError:
+        error_msg = "Combinator API timed out"
+        combinator_status = 504
+
+    # Record the oracle submission as a Hub event
+    _record_oracle_submission(
+        agent_id=agent_id,
+        proposal_slug=proposal_slug,
+        recommendation=recommendation,
+        confidence=confidence_override,
+        evidence_count=len(evidence_payload),
+        combinator_status=combinator_status,
+        error=error_msg
+    )
+
+    if error_msg:
+        return jsonify({
+            "ok": False,
+            "error": error_msg,
+            "combinator_status": combinator_status,
+            "proposal_slug": proposal_slug,
+            "submitted_at": oracle_payload["generated_at"]
+        }), combinator_status or 502
+
+    return jsonify({
+        "ok": True,
+        "submitted_at": oracle_payload["generated_at"],
+        "proposal_slug": proposal_slug,
+        "recommendation": recommendation,
+        "confidence": confidence_override,
+        "evidence_count": len(evidence_payload),
+        "combinator_status": combinator_status,
+        "combinator_response": combinator_response
+    })
+
+
+def _record_oracle_submission(agent_id, proposal_slug, recommendation, confidence, evidence_count, combinator_status, error=None):
+    """Append oracle submission to analytics log for audit trail."""
+    import os as _os
+    log_path = _os.path.join(DATA_DIR, "analytics", "oracle_submissions.jsonl")
+    _os.makedirs(_os.path.dirname(log_path), exist_ok=True)
+    entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "agent_id": agent_id,
+        "proposal_slug": proposal_slug,
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "evidence_count": evidence_count,
+        "combinator_status": combinator_status,
+        "error": error
+    }
+    try:
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
 @app.route("/trust/synthesis/<agent_id>", methods=["GET"])
 def trust_synthesis(agent_id):
     """Multi-channel trust synthesis — combines attestation, behavioral, and
@@ -12176,6 +12441,20 @@ def _can_resolve(obl, agent_id):
                 return True
 
     policy = obl.get("closure_policy", "counterparty_accepts")
+
+    # Phase 5B: claimant unilateral resolve when evidence_submitted + TTL exceeded.
+    # This MUST run before the policy-specific returns so it overrides counterparty_accepts.
+    # Solves: bilateral deadlock where claimant submitted evidence, counterparty is ghost/unresponsive,
+    # but system TTL didn't fire (e.g. counterparty_liveness_class = "active" despite being unreachable).
+    if (policy in ("counterparty_accepts", "claimant_self_attests") and
+        obl.get("status") == "evidence_submitted" and
+        obl.get("evidence_refs")):
+        last_evidence = obl.get("evidence_refs", [{}])[-1].get("submitted_at", "")
+        if last_evidence:
+            hours_since_evidence = _hours_since_iso(last_evidence) if last_evidence else 999
+            if hours_since_evidence >= 24 and _match("claimant", "created_by"):
+                return True
+
     if policy == "claimant_self_attests":
         return _match("claimant", "created_by")
     elif policy == "counterparty_accepts":
@@ -12191,24 +12470,9 @@ def _can_resolve(obl, agent_id):
         return _match("claimant", "created_by") or _match("counterparty", "counterparty")
     elif policy == "unilateral_evidence":
         # Phase 5B: claimant can resolve unilaterally when counterparty ghost + evidence_submitted + TTL exceeded.
-        # Solves the bilateral deadlock: one party submitted evidence, counterparty is dead.
         if _match("claimant", "created_by") and obl.get("status") == "evidence_submitted":
             return True
-        # Also: counterparty can always resolve (existing right preserved)
         return _match("counterparty", "counterparty")
-    # Phase 5B fix: when TTL has exceeded and counterparty is ghost, claimant gets unilateral resolve
-    # authority even on counterparty_accepts obligations. This bypasses the counterparty_accepts lock
-    # for the specific case where TTL fired but resolution was blocked.
-    if (policy == "counterparty_accepts" and
-        obl.get("status") == "evidence_submitted" and
-        obl.get("evidence_refs")):
-        # Check: has enough time passed since last evidence?
-        last_evidence = obl.get("evidence_refs", [{}])[-1].get("submitted_at", "")
-        if last_evidence:
-            hours_since_evidence = _hours_since_iso(last_evidence) if last_evidence else 999
-            if hours_since_evidence >= 24:  # Same TTL as _check_evidence_submitted_ttl
-                if _match("claimant", "created_by"):
-                    return True
     return False
 
 
