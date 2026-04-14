@@ -12049,6 +12049,53 @@ def _check_deadline_expiry(obl):
     return False
 
 
+# ─── Phase 6: deadline_elapsed hard TTL ─────────────────────────────────────
+
+DEADLINE_ELAPSED_TTL_HOURS = 72
+
+def _check_deadline_elapsed_ttl(obl):
+    """Phase 6: Auto-resolve obligations stuck in deadline_elapsed for 72h+.
+
+    739/946 obligations are stuck in deadline_elapsed — claimants have authority
+    but are not exercising it. This hard TTL prevents infinite limbo.
+
+    Returns True if obligation was auto-resolved.
+    """
+    if obl.get("status") != "deadline_elapsed":
+        return False
+
+    # Find when obligation entered deadline_elapsed
+    entered_at = None
+    for h in reversed(obl.get("history", [])):
+        if h.get("status") == "deadline_elapsed":
+            entered_at = h.get("at")
+            break
+
+    if not entered_at:
+        return False
+
+    hours_in_de = _hours_since_iso(entered_at)
+    if hours_in_de is None:
+        return False
+
+    if hours_in_de < DEADLINE_ELAPSED_TTL_HOURS:
+        return False
+
+    # Auto-resolve
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    obl["status"] = "resolved"
+    obl["resolution_type"] = "deadline_elapsed_auto_resolve"
+    obl.setdefault("history", []).append({
+        "status": "resolved",
+        "at": now_iso,
+        "by": "system",
+        "resolution_type": "deadline_elapsed_auto_resolve",
+        "note": f"Auto-resolved after {hours_in_de:.1f}h in deadline_elapsed (TTL: {DEADLINE_ELAPSED_TTL_HOURS}h). "
+                 f"Claimant did not exercise resolve authority."
+    })
+    return True
+
+
 # ─── Ghost Counterparty Protocol v1 (StarAgent co-design, 2026-04-01) ────────
 
 def _is_counterparty_ghost(obl):
@@ -12300,6 +12347,8 @@ def _expire_obligations(obls):
         if _check_evidence_submitted_ttl(obl):  # Ghost Counterparty Protocol v1
             changed = True
         if _check_stale_accepted(obl):  # Phase 5A: stale nudge on accepted obligations
+            changed = True
+        if _check_deadline_elapsed_ttl(obl):  # Phase 6: 72h auto-resolve on deadline_elapsed
             changed = True
     return changed
 
