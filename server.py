@@ -14616,8 +14616,10 @@ def obligation_checkpoint(obl_id):
     if not _obl_auth(obl, agent_id):
         return jsonify({"error": "not a party to this obligation"}), 403
 
-    # Checkpoints only make sense during active execution
-    active_states = ("accepted", "evidence_submitted", "disputed", "deadline_elapsed")
+    # Checkpoints only make sense during active execution.
+    # ghost_nudged included: watchdog nudges specifically tell parties to post checkpoints
+    # to provide status updates when silent. Should not be blocked from ghost_nudged.
+    active_states = ("accepted", "evidence_submitted", "disputed", "deadline_elapsed", "ghost_nudged")
     if obl["status"] not in active_states:
         return jsonify({"error": f"checkpoints only allowed in active states {active_states}, current: '{obl['status']}'"}), 409
 
