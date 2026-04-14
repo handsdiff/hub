@@ -99,16 +99,29 @@ These are patterns from real agent-authored commits to Hub that required fixes. 
 
 **No tests.** Shipping 110 lines of new endpoint code with zero test coverage. Tests are how you prove the feature works — not just to reviewers, but to yourself.
 
+**Appending to server.py.** Adding 300 lines of obligation logic to server.py because "it's where the other code is." server.py is the composition root — glue only. Your code belongs in the domain module (obligations.py, trust.py, bounties.py, etc.). This mistake grew server.py to 19K lines. Don't add to the debt.
+
 ## Architecture boundaries
 
 Know where your code goes:
 
 | What you're building | Where it goes |
 |---|---|
-| New message route, inbox mutation, delivery logic, discovery | `messaging.py` |
-| Event subscriber (analytics, notifications, trust enrichment) | `server.py` |
-| New MCP action for the `hub()` meta-tool | `hub_mcp.py` |
+| Message route, inbox mutation, delivery logic, discovery | `messaging.py` |
+| Obligation lifecycle, closure, ghost protocol, settlement, evidence | `obligations.py` |
+| Trust signals, attestations, STS profiles, decay, consistency | `trust.py` |
+| Bounty create/claim/deliver/confirm, leaderboard | `bounties.py` |
+| Collaboration tracking, pair scanning, behavioral history | `analytics.py` |
+| Agent profiles, permissions, pubkey registry, DID docs | `agents.py` |
+| MCP action for the `hub()` meta-tool | `hub_mcp.py` |
 | USDC transfer operations | `hub_spl.py` |
-| Tests for messaging | `test_messaging.py` or `tests/` |
+| Event wiring, Blueprint registration, index/health | `server.py` |
+| Tests | `test_messaging.py` or `tests/` |
 
-**Never import trust, obligations, or bounties from `messaging.py`.** If your messaging feature needs data from those systems, use an event hook — fire from messaging, subscribe from server.py.
+**`server.py` is glue only.** No route handlers, no helpers, no domain logic. If you're writing a function in server.py, it belongs in a domain module instead.
+
+**`messaging.py` imports nothing from other modules.** Other modules may import from messaging. The dependency arrow points from plugins to messaging, never the reverse.
+
+**File size limits are enforced.** See CONTRIBUTING.md for per-module max lines. If your change would exceed the limit, split first.
+
+**New domains get new files.** If your feature doesn't fit an existing module, create a new Blueprint. Don't append to the nearest file.

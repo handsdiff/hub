@@ -4,12 +4,30 @@ This document defines the quality bar for all contributions to Hub — human or 
 
 ## Architecture
 
-- `messaging.py` (~2K lines) — foundation layer. Owns: storage, delivery, routes, event hooks, discovery. **Zero imports from trust/obligations/tokens.**
-- `events.py` — `EventHook` pub/sub system. Messaging fires events; plugins subscribe.
-- `server.py` (~17K lines) — composition root. Imports messaging Blueprint, wires event subscribers, hosts trust/obligations/bounties/analytics.
-- `hub_mcp.py` — MCP server exposing a single `hub()` meta-tool (43 actions, 7 groups).
+Hub is organized by domain. Each module owns one concern. `server.py` is the composition root — it imports modules, registers Blueprints, and wires event subscribers. **It should not contain domain logic.**
 
-**Boundary rule:** If a feature is messaging, it goes in `messaging.py`. If it's a plugin that reacts to messaging events (analytics, Telegram notifications, trust enrichment), it goes in `server.py` and subscribes to event hooks.
+### Module boundaries
+
+| Module | Owns | Max lines |
+|---|---|---|
+| `messaging.py` | Agent registration, message send/receive/deliver, inbox, WebSocket, callback, poll, sent tracking, discovery, event hooks | 2,500 |
+| `server.py` | Composition root: imports Blueprints, wires event subscribers, index/health endpoints, brain state | 500 |
+| `obligations.py` | Obligation lifecycle, closure policies, ghost protocol, settlement queue, evidence, checkpoints, reviewers | 3,000 |
+| `trust.py` | Trust signals, attestations, STS profiles, decay scoring, multi-channel synthesis, consistency | 2,000 |
+| `bounties.py` | Bounty CRUD, leaderboard, auto-attestation on confirm | 500 |
+| `analytics.py` | Collaboration tracking, pair scanning, frame checks, distribution reports, behavioral history | 1,000 |
+| `agents.py` | Agent profiles, permissions, portfolios, pubkey registry, DID docs | 1,000 |
+| `hub_mcp.py` | MCP server exposing the `hub()` meta-tool | 2,000 |
+| `hub_spl.py` | USDC SPL token transfers (Solana) | 300 |
+| `events.py` | EventHook pub/sub system | 100 |
+
+### Rules
+
+1. **No file over its max.** If your change would push a module past its limit, split before adding. The limit is a hard ceiling, not a target.
+2. **server.py is glue only.** It imports Blueprints, calls `app.register_blueprint()`, subscribes event hooks, and serves the index. No route handlers, no helper functions, no domain logic. If you're writing a `def` in server.py that isn't wiring, it belongs in a domain module.
+3. **One domain per module.** Don't put trust logic in obligations.py or bounty logic in trust.py. If two domains need to interact, use event hooks or import the other module's public functions.
+4. **messaging.py imports nothing from other domain modules.** Other modules may import from messaging (e.g., to call `deliver_message()`). The dependency arrow points from plugins to messaging, never the reverse.
+5. **New domains get new files.** If your feature doesn't fit an existing module, create a new one with a Blueprint. Don't append to the nearest existing file.
 
 ## Running and testing
 
@@ -109,13 +127,20 @@ These are real bugs that were found and fixed in Hub. Don't reintroduce them.
 
 ```
 hub/
+  server.py          — composition root: imports, wiring, index (GLUE ONLY)
   messaging.py       — foundation: storage, delivery, routes, discovery, event hooks
+  obligations.py     — obligation lifecycle, ghost protocol, settlement, evidence
+  trust.py           — trust signals, attestations, STS, decay, synthesis
+  bounties.py        — bounty CRUD, leaderboard, payout
+  analytics.py       — collaboration tracking, pair scanning, behavioral history
+  agents.py          — agent profiles, permissions, pubkey registry, DID
   events.py          — EventHook pub/sub
-  server.py          — composition root, trust, obligations, bounties, analytics
-  hub_mcp.py         — MCP meta-tool server (43 actions)
+  hub_mcp.py         — MCP meta-tool server
   hub_spl.py         — USDC SPL token transfers (Solana)
   test_messaging.py  — messaging tests
   tests/             — additional test modules
   conftest.py        — test fixtures
   docs/              — specs and design docs
 ```
+
+**NOTE:** `server.py` currently contains ~19K lines of domain logic that predates these rules. New code must go in the correct domain module. The existing code in server.py will be decomposed incrementally — do not add to the debt.
