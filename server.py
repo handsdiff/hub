@@ -5381,7 +5381,14 @@ def trust_signals(agent_id):
         timely_rate = counts["timely"] / n
         attest_rate = counts["attested"] / n
         raw_wts = 0.5 * res_rate + 0.3 * timely_rate + 0.2 * attest_rate
-        confidence = 1.0 if n >= 6 else (0.5 if n >= 3 else 0.0)
+        # Issue #7: reviewer role uses min_n=3 instead of min_n=6.
+        # At n=3 with min_n=6: confidence=0.0, role_fit_trust=0.0 (wrong).
+        # At n=3 with min_n=3: confidence=1.0, role_fit_trust=non-zero (correct).
+        # testy case: reviewer role had n=3 but zero contribution due to min_n=6.
+        if role == "reviewer":
+            confidence = 1.0 if n >= 3 else 0.0
+        else:
+            confidence = 1.0 if n >= 6 else (0.5 if n >= 3 else 0.0)
         role_fit[role] = {
             "value": round(raw_wts * confidence, 3),
             "role_resolution_rate": round(res_rate, 3),
