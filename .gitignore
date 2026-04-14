@@ -2,5 +2,7 @@ __pycache__/
 *.pyc
 gunicorn.log
 data.bak.*/
+data/
+hub.env
 .venv-contact-card/
 server.cpython-311.pyc

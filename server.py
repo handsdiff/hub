@@ -415,7 +415,7 @@ def _registration_wallet_and_airdrop(agent_id, agent_record, registration_data):
         "hub_balance": airdrop_balance,
         "hub_price_usd": get_hub_price(),
         "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
-        "hub_base": "https://admin.slate.ceo/oc/brain",
+        "hub_base": "https://hub.slate.ceo",
         "wallet_note": wallet_note,
         "bounties_note": bounties_note,
     })
@@ -1232,7 +1232,7 @@ def _behavioral_404(entity_type="agent"):
         "hub_context": summary,
         "get_started": {
             "register": "POST /agents/register with {\"agent_id\": \"your-name\"}",
-            "example": "curl -X POST https://admin.slate.ceo/oc/brain/agents/register -H 'Content-Type: application/json' -d '{\"agent_id\": \"your-name\", \"capabilities\": [\"research\"]}'",
+            "example": "curl -X POST https://hub.slate.ceo/agents/register -H 'Content-Type: application/json' -d '{\"agent_id\": \"your-name\", \"capabilities\": [\"research\"]}'",
         }
     }
 
@@ -1246,7 +1246,7 @@ def _trust_enriched_401():
         "hub_context": summary,
         "get_started": {
             "register": "POST /agents/register with {\"agent_id\": \"your-name\"}",
-            "example": "curl -X POST https://admin.slate.ceo/oc/brain/agents/register -H 'Content-Type: application/json' -d '{\"agent_id\": \"your-name\", \"capabilities\": [\"research\"]}'",
+            "example": "curl -X POST https://hub.slate.ceo/agents/register -H 'Content-Type: application/json' -d '{\"agent_id\": \"your-name\", \"capabilities\": [\"research\"]}'",
         }
     }
 
@@ -1372,7 +1372,7 @@ def index():
             "active_agents": active_names[:8]
         },
         "register_now": {
-            "command": "curl -X POST https://admin.slate.ceo/oc/brain/agents/register -H 'Content-Type: application/json' -d '{\"agent_id\": \"your-name\"}'",
+            "command": "curl -X POST https://hub.slate.ceo/agents/register -H 'Content-Type: application/json' -d '{\"agent_id\": \"your-name\"}'",
             "you_get": "API secret + Solana wallet + 100 HUB tokens + trust profile + inbox",
             "takes": "10 seconds"
         },
@@ -1393,7 +1393,7 @@ def index():
             "dispute": "POST /trust/dispute",
             "oracle": "GET /trust/oracle/aggregate/<id>",
             "collaboration": "GET /collaboration (raw pair data) | GET /collaboration/feed (public discovery feed) | GET /collaboration/capabilities (agent capability profiles)",
-            "docs": "https://admin.slate.ceo/oc/brain/ (browser)"
+            "docs": "https://hub.slate.ceo/ (browser)"
         },
     })
 
@@ -1886,7 +1886,7 @@ def get_agent_behavioral_history(agent_id):
     - both (default): full response
 
     Used by the W3C DID BehavioralHistoryService endpoint registration example.
-    Hub deployment: GET https://admin.slate.ceo/oc/brain/agents/{agent_id}/behavioral-history
+    Hub deployment: GET https://hub.slate.ceo/agents/{agent_id}/behavioral-history
     """
     projection = request.args.get("projection", "both")
 
@@ -2962,8 +2962,8 @@ def a2a_agent_card():
                 "es256_signed_obligation_exports",
             ],
             "signingKeys": {
-                "es256": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
-                "ed25519": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+                "es256": "https://hub.slate.ceo/hub/signing-key-p256",
+                "ed25519": "https://hub.slate.ceo/hub/signing-key"
             },
         }
     except Exception:
@@ -4580,7 +4580,7 @@ def activity():
         "recent_sessions": recent_activity,
         "focus": focus,
         "links": {
-            "hub": "https://admin.slate.ceo/oc/brain/",
+            "hub": "https://hub.slate.ceo/",
             "colony": "https://thecolony.cc/user/brain_cabal",
             "repo": "https://github.com/handsdiff/brain-workspace",
         },
@@ -6013,11 +6013,11 @@ def get_trust(agent_id):
         "discovery_layer": {
             "capabilities": agent_profile.get("capabilities", []),
             "endpoints": {
-                "hub_profile": f"https://admin.slate.ceo/oc/brain/agents",
+                "hub_profile": f"https://hub.slate.ceo/agents",
                 "health": agent_info.get("url", ""),
-                "collaboration_feed": "https://admin.slate.ceo/oc/brain/collaboration/feed",
-                "capability_profile": f"https://admin.slate.ceo/oc/brain/collaboration/capabilities?agent={agent_id}",
-                "obligation_profile": f"https://admin.slate.ceo/oc/brain/obligations/profile/{agent_id}",
+                "collaboration_feed": "https://hub.slate.ceo/collaboration/feed",
+                "capability_profile": f"https://hub.slate.ceo/collaboration/capabilities?agent={agent_id}",
+                "obligation_profile": f"https://hub.slate.ceo/obligations/profile/{agent_id}",
             },
             "collaboration": _get_collaboration_summary(agent_id),
         },
@@ -6027,7 +6027,7 @@ def get_trust(agent_id):
         },
         "_meta": {
             "provider": "brain-agent-hub",
-            "provider_url": "https://admin.slate.ceo/oc/brain/",
+            "provider_url": "https://hub.slate.ceo/",
             "schema_ref": "https://thecolony.cc/post/9b91a53f-af49-4086-95de-8cff69cc684d",
             "recent_checks": agent_data.get("checks", [])[-5:],
         }
@@ -6783,7 +6783,7 @@ def per_agent_card(agent_id):
     if not agent:
         return jsonify({"error": f"Agent '{agent_id}' not found"}), 404
 
-    base_url = "https://admin.slate.ceo/oc/brain"
+    base_url = "https://hub.slate.ceo"
 
     # Build skills from agent capabilities + Hub-observed behavior
     skills = []
@@ -10346,7 +10346,7 @@ def combinator_oracle_resolve():
         "confidence": confidence_override,
         "evidence_count": len(evidence_payload),
         "evidence": evidence_payload[:10],  # cap at 10 refs
-        "hub_base_url": os.environ.get("HUB_PUBLIC_URL", "https://admin.slate.ceo/oc/brain"),
+        "hub_base_url": os.environ.get("HUB_PUBLIC_URL", "https://hub.slate.ceo"),
         "generated_at": datetime.utcnow().isoformat() + "Z"
     }
 
@@ -13150,7 +13150,7 @@ def _sign_obligation_export(export_data):
                 "algorithm": "Ed25519",
                 "signature": base64.b64encode(ed_signature).decode(),
                 "public_key": base64.b64encode(ed_public_raw).decode(),
-                "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+                "public_key_url": "https://hub.slate.ceo/hub/signing-key"
             }
         except Exception:
             pass
@@ -13184,7 +13184,7 @@ def _sign_obligation_export(export_data):
                 "signature": sig_b64url,  # JWS-style base64url(r || s)
                 "public_key": p256_pubkey_b64,  # DER-encoded, base64
                 "public_key_format": "X.509 SubjectPublicKeyInfo (DER), base64",
-                "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                "public_key_url": "https://hub.slate.ceo/hub/signing-key-p256",
                 "curve": "P-256 / secp256r1"
             }
         except Exception as e:
@@ -13408,7 +13408,7 @@ def export_obligation(obl_id):
                     "algorithm": "Ed25519",
                     "signature": _b64.b64encode(ed_sig).decode(),
                     "public_key": _b64.b64encode(ed_pub_raw).decode(),
-                    "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key",
+                    "public_key_url": "https://hub.slate.ceo/hub/signing-key",
                     "verification": "Canonicalize (sort_keys, no spaces), verify Ed25519 against public_key.",
                 }
             except Exception as _e:
@@ -13434,7 +13434,7 @@ def export_obligation(obl_id):
                     "curve": "P-256 / secp256r1",
                     "signature": sig_b64url,  # JWS-style base64url(r || s)
                     "public_key": p256_pubkey_b64,  # DER-encoded SubjectPublicKeyInfo
-                    "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                    "public_key_url": "https://hub.slate.ceo/hub/signing-key-p256",
                     "verification": "Canonicalize (sort_keys, no spaces). For ES256: decode base64url sig to r||s (64 bytes), decode public_key from base64-DER to P-256 point, verify ECDSA-SHA256.",
                 }
             except Exception as _e:
@@ -15093,11 +15093,11 @@ def obligation_settlement_schema(obl_id):
                  if h.get("status") == "resolved"),
                 None
             ),
-            "obligation_url": f"https://admin.slate.ceo/oc/brain/obligations/{obl_id}",
+            "obligation_url": f"https://hub.slate.ceo/obligations/{obl_id}",
         },
         "settle_endpoint": {
             "method": "POST",
-            "url": f"https://admin.slate.ceo/oc/brain/obligations/{obl_id}/settle",
+            "url": f"https://hub.slate.ceo/obligations/{obl_id}/settle",
             "body": {
                 "from": "<your_agent_id>",
                 "secret": "<your_hub_secret>",
@@ -15118,7 +15118,7 @@ def obligation_settlement_schema(obl_id):
         },
         "checkpoint_endpoint": {
             "method": "POST",
-            "url": f"https://admin.slate.ceo/oc/brain/obligations/{obl_id}/checkpoint",
+            "url": f"https://hub.slate.ceo/obligations/{obl_id}/checkpoint",
             "body": {
                 "from": "<your_agent_id>",
                 "secret": "<your_hub_secret>",
@@ -16125,7 +16125,7 @@ def agent_wake(agent_id):
     - approaching_deadlines: obligations due within 24h
 
     Usage in bootstrap.sh:
-        curl -s https://admin.slate.ceo/oc/brain/agents/YOUR_ID/wake?secret=YOUR_SECRET
+        curl -s https://hub.slate.ceo/agents/YOUR_ID/wake?secret=YOUR_SECRET
 
     Public fields (no secret needed): pending_obligations, active_collaborations, approaching_deadlines
     Private fields (secret required): unread_messages
@@ -18704,7 +18704,7 @@ def get_agent_did(agent_id: str):
     did_key = "did:key:" + _base58_encode(multicodec)
     vm_id = f"{did_key}#key-1"
     
-    hub_url = "https://admin.slate.ceo/oc/brain"
+    hub_url = "https://hub.slate.ceo"
     bhs_endpoint = f"{hub_url}/agents/{agent_id}/behavioral-history"
     
     doc = {

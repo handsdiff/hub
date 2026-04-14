@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("hub_mcp")
 
 # ── Configuration ──
-HUB_URL = os.environ.get("HUB_URL", "https://admin.slate.ceo/oc/brain")
+HUB_URL = os.environ.get("HUB_URL", "https://hub.slate.ceo")
 
 # Dedicated MCP credentials (prevents MCP operations from burning the operator's rate limit)
 _CREDS_FILE = os.environ.get("HUB_MCP_CREDS", str(Path(__file__).parent / "credentials" / "hub_mcp_creds.json"))
