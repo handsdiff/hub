@@ -1,0 +1,5846 @@
+"""
+Trust Module — Trust signals, attestations, STS profiles, decay scoring,
+disputes, multi-channel synthesis, oracle, intel feed, assets, monitors,
+WoT bridge, nostr, demands, capabilities, memory integrity, and more.
+
+Owns: trust signals, attestations, STS profiles, decay scoring, disputes,
+      multi-channel synthesis, consistency, oracle, intel, assets, monitors.
+"""
+
+import json
+import math
+import os
+import secrets
+import uuid
+import hashlib
+from collections import defaultdict, Counter
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from flask import Blueprint, request, jsonify
+
+from hub.messaging import (
+    load_agents, save_agents,
+    deliver_message,
+    load_inbox,
+    iter_message_records,
+    load_discovered,
+)
+
+trust_bp = Blueprint("trust", __name__)
+
+# ── Lazy-import helpers for cross-module dependencies ──
+# Avoids circular imports: obligations, bounties, analytics, agents all
+# import from trust (or vice versa). Lazy wrappers resolve at call time.
+
+def _lazy_load_obligations():
+    from hub.obligations import load_obligations
+    return load_obligations()
+
+def _lazy_obl_auth(obl, agent_id):
+    from hub.obligations import _obl_auth
+    return _obl_auth(obl, agent_id)
+
+def _lazy_load_bounties():
+    from hub.bounties import load_bounties
+    return load_bounties()
+
+def _lazy_deliver_internal_dm(from_agent, to_agent, message, msg_type="system", extra=None):
+    from hub.obligations import _deliver_internal_dm
+    return _deliver_internal_dm(from_agent, to_agent, message, msg_type, extra)
+
+def _lazy_scan_all_pairs():
+    from hub.analytics import _scan_all_pairs
+    return _scan_all_pairs()
+
+def _lazy_classify_outcome(artifact_rate, is_bilateral, days_since_last, duration_days):
+    from hub.analytics import _classify_outcome
+    return _classify_outcome(artifact_rate, is_bilateral, days_since_last, duration_days)
+
+def _lazy_maybe_track_surface_view(event, target):
+    from hub.analytics import _maybe_track_surface_view
+    return _maybe_track_surface_view(event, target)
+
+def _lazy_load_pubkeys():
+    from hub.agents import _load_pubkeys
+    return _load_pubkeys()
+
+
+# Module state -- set by init_trust()
+_DATA_DIR = None
+_MESSAGES_DIR = None
+_WORKSPACE = None
+ATTESTATIONS_FILE = None
+TRUST_SIGNALS_FILE = None
+TRUST_SIGNALS_FILE_AUTO = None
+HEALTH_HISTORY_FILE = None
+INTEL_DIR = None
+INTEL_KEYS_FILE = None
+INTEL_SNAPSHOTS = None
+COMBINATOR_CONFIG_PATH = None
+COMBINATOR_API_BASE = "https://api.zcombinator.io"
+WITNESS_FILE = None
+DEFAULT_OBLIGATION_TTL = 86400  # 24 hours default
+
+# Cache state
+_wot_cache = {}
+WOT_CACHE_TTL = 300  # 5 min
+_iskra_cache = {}
+ISKRA_CACHE_TTL = 300  # 5 minutes
+
+# Default half-lives per channel (seconds)
+DEFAULT_HALF_LIVES = {
+    "routing": 7 * 86400,
+    "security": 14 * 86400,
+    "work-quality": 7 * 86400,
+    "co-occurrence": 3 * 86400,
+    "attestation": 30 * 86400,
+    "rejection": 14 * 86400,
+    "commerce": 21 * 86400,
+    "general": 7 * 86400,
+}
+
+# Trust Olympics routing dividend
+TRUST_OLYMPICS_BOOST = float(os.environ.get("TRUST_OLYMPICS_BOOST", "0.05"))
+TRUST_OLYMPICS_BOOST_DAYS = int(os.environ.get("TRUST_OLYMPICS_BOOST_DAYS", "90"))
+
+
+def init_trust(data_dir):
+    global _DATA_DIR, _MESSAGES_DIR, _WORKSPACE
+    global ATTESTATIONS_FILE, TRUST_SIGNALS_FILE, TRUST_SIGNALS_FILE_AUTO
+    global HEALTH_HISTORY_FILE, INTEL_DIR, INTEL_KEYS_FILE, INTEL_SNAPSHOTS
+    global COMBINATOR_CONFIG_PATH, WITNESS_FILE
+    _DATA_DIR = Path(str(data_dir))
+    _MESSAGES_DIR = _DATA_DIR / "messages"
+    _WORKSPACE = Path(os.environ.get("WORKSPACE_DIR", "."))
+    ATTESTATIONS_FILE = _DATA_DIR / "attestations.json"
+    TRUST_SIGNALS_FILE = os.path.join(str(data_dir), "trust_signals.json")
+    TRUST_SIGNALS_FILE_AUTO = os.path.join(str(data_dir), "trust_signals_auto.jsonl")
+    HEALTH_HISTORY_FILE = _DATA_DIR / "health_history.json"
+    INTEL_DIR = _WORKSPACE / "products" / "intel-feed" / "intelligence"
+    INTEL_KEYS_FILE = _DATA_DIR / "intel_keys.json"
+    INTEL_SNAPSHOTS = _WORKSPACE / "products" / "intel-feed" / "snapshots"
+    COMBINATOR_CONFIG_PATH = os.path.join(str(data_dir), "combinator_config.json")
+    WITNESS_FILE = _DATA_DIR / "witnesses.json"
+
+
+# ── Trust helpers ──
+def _trust_multiplier_from_decay(score):
+    """Map trust decay score to effective-limit multiplier.
+
+    Phase 1 helper for permission scoping. Mirrors Lloyd's 2026-03-29 spec.
+    """
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        return 1.0
+    if score >= 0.8:
+        return 1.0
+    if score >= 0.5:
+        return 0.75
+    if score >= 0.3:
+        return 0.5
+    if score >= 0.1:
+        return 0.25
+    return 0.0
+
+
+def _compute_trust_decay(agent_id, info=None, obligations=None):
+    """Compute trust decay score for an agent.
+
+    Three signals: silence duration (50%), obligation failure rate (30%), volume anomaly (20%).
+    Based on Lloyd's trust-decay-spec.md (2026-03-29).
+    Returns a dict with trust_decay_score, label, and signal breakdown.
+    """
+    from datetime import datetime as _dt
+
+    if obligations is None:
+        obligations = _lazy_load_obligations()
+    if info is None:
+        agents = load_agents()
+        info = agents.get(agent_id, {})
+
+    agent_sent_dir = _MESSAGES_DIR / agent_id
+
+    # Signal 1: Silence duration
+    silence_hours = None
+    last_sent_ts = None
+    if os.path.isdir(agent_sent_dir):
+        for fname in os.listdir(agent_sent_dir):
+            if fname.endswith(".json"):
+                try:
+                    with open(agent_sent_dir / fname) as f:
+                        sent_records = json.load(f)
+                    for sr in sent_records:
+                        ts = sr.get("timestamp", "")
+                        if ts and (last_sent_ts is None or ts > last_sent_ts):
+                            last_sent_ts = ts
+                except Exception:
+                    pass
+
+    if last_sent_ts:
+        try:
+            last_dt = _dt.fromisoformat(last_sent_ts.replace("Z", "+00:00").replace("+00:00+00:00", "+00:00"))
+            silence_hours = (_dt.utcnow() - last_dt.replace(tzinfo=None)).total_seconds() / 3600
+        except Exception:
+            silence_hours = None
+
+    if silence_hours is None:
+        silence_factor = 0.1
+    elif silence_hours <= 24:
+        silence_factor = 1.0
+    elif silence_hours <= 168:
+        silence_factor = 1.0 - 0.3 * ((silence_hours - 24) / 144)
+    elif silence_hours <= 720:
+        silence_factor = 0.7 - 0.4 * ((silence_hours - 168) / 552)
+    else:
+        silence_factor = max(0.1, 0.3 - 0.2 * ((silence_hours - 720) / 720))
+
+    # Signal 2: Obligation failure rate
+    now_dt = _dt.utcnow()
+    agent_obls = [o for o in obligations if _lazy_obl_auth(o, agent_id)]
+    recent_resolved = 0
+    recent_failed = 0
+    for o in agent_obls:
+        try:
+            o_dt = _dt.fromisoformat(o.get("created_at", "").replace("Z", "+00:00").replace("+00:00+00:00", "+00:00"))
+            if (now_dt - o_dt.replace(tzinfo=None)).days <= 30:
+                if o.get("status") == "resolved":
+                    recent_resolved += 1
+                elif o.get("status") in ("failed", "expired"):
+                    recent_failed += 1
+        except Exception:
+            pass
+
+    recent_total = recent_resolved + recent_failed
+    obligation_factor = (recent_resolved / recent_total) if recent_total > 0 else 0.5
+
+    # Signal 3: Volume anomaly
+    total_sent_30d = 0
+    sent_last_24h = 0
+    if os.path.isdir(agent_sent_dir):
+        for fname in os.listdir(agent_sent_dir):
+            if fname.endswith(".json"):
+                try:
+                    with open(agent_sent_dir / fname) as f:
+                        sent_records = json.load(f)
+                    for sr in sent_records:
+                        ts = sr.get("timestamp", "")
+                        if ts:
+                            try:
+                                s_dt = _dt.fromisoformat(ts.replace("Z", "+00:00").replace("+00:00+00:00", "+00:00"))
+                                age_hours = (now_dt - s_dt.replace(tzinfo=None)).total_seconds() / 3600
+                                if age_hours <= 720:
+                                    total_sent_30d += 1
+                                if age_hours <= 24:
+                                    sent_last_24h += 1
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+    avg_daily_30d = total_sent_30d / 30 if total_sent_30d > 0 else 0
+    if avg_daily_30d == 0:
+        anomaly_factor = 0.3 if sent_last_24h > 10 else 1.0
+    elif sent_last_24h > 10 * avg_daily_30d:
+        anomaly_factor = 0.3
+    elif sent_last_24h > 5 * avg_daily_30d:
+        anomaly_factor = 0.5
+    else:
+        anomaly_factor = 1.0
+
+    composite = silence_factor * 0.5 + obligation_factor * 0.3 + anomaly_factor * 0.2
+    trust_decay_score = round(min(composite, anomaly_factor), 3)
+    if trust_decay_score >= 0.8:
+        decay_label = "healthy"
+    elif trust_decay_score >= 0.5:
+        decay_label = "degrading"
+    elif trust_decay_score >= 0.3:
+        decay_label = "stale"
+    else:
+        decay_label = "dormant"
+
+    return {
+        "trust_decay_score": trust_decay_score,
+        "label": decay_label,
+        "signals": {
+            "silence_factor": round(silence_factor, 3),
+            "silence_hours": round(silence_hours, 1) if silence_hours is not None else None,
+            "obligation_factor": round(obligation_factor, 3),
+            "obligations_recent": recent_total,
+            "obligations_resolved": recent_resolved,
+            "obligations_failed": recent_failed,
+            "anomaly_factor": round(anomaly_factor, 3),
+            "avg_daily_sent_30d": round(avg_daily_30d, 1),
+            "sent_last_24h": sent_last_24h,
+        },
+        "computed_at": now_dt.isoformat() + "Z",
+    }
+
+
+def _compute_agent_permission_state(agent_id, agents=None, obligations=None):
+    """Return operator constraints + effective limits for an agent.
+
+    Phase 1 is intentionally additive/non-breaking:
+    - No constraints configured => unrestricted behavior, visibility only.
+    - Effective numeric limits apply trust decay multiplier.
+    - trust_multiplier uses decay score already capped by min(composite, anomaly_factor).
+    """
+    if agents is None:
+        agents = load_agents()
+    info = agents.get(agent_id)
+    if not info:
+        return None
+
+    permissions = info.get("permissions") or {}
+    operator_constraints = permissions.get("operator_constraints") or {}
+    peer_grants = permissions.get("peer_grants") or []
+
+    trust_decay = None
+    try:
+        if obligations is None:
+            obligations = _lazy_load_obligations()
+        trust_decay = _compute_trust_decay(agent_id, info, obligations)
+    except Exception:
+        trust_decay = None
+
+    trust_score = ((trust_decay or {}).get("trust_decay_score") if isinstance(trust_decay, dict) else None)
+    trust_multiplier = _trust_multiplier_from_decay(trust_score)
+
+    numeric_keys = [
+        "max_obligation_hub",
+        "max_messages_per_hour",
+        "max_obligations_per_day",
+        "max_trust_attestations_per_day",
+        "max_recipients_per_hour",
+    ]
+    effective_limits = {}
+    for key in numeric_keys:
+        base = operator_constraints.get(key)
+        if isinstance(base, (int, float)):
+            effective_limits[key] = round(base * trust_multiplier, 3)
+
+    allowed_actions = operator_constraints.get("allowed_actions", [])
+    denied_actions = operator_constraints.get("denied_actions", [])
+
+    return {
+        "agent_id": agent_id,
+        "allowed_actions": allowed_actions,
+        "denied_actions": denied_actions,
+        "permissions": {
+            "operator_constraints": operator_constraints,
+            "peer_grants": peer_grants,
+        },
+        "effective_limits": effective_limits,
+        "trust_decay": trust_decay,
+        "trust_multiplier": trust_multiplier,
+        "mode": "unrestricted" if not operator_constraints else "constrained",
+        "computed_at": datetime.utcnow().isoformat() + "Z",
+        # Phase 2: denial_history + audit_log (populated once enforcement exists)
+        "denial_history": info.get("permissions", {}).get("denial_history") or [],
+        "audit_log": info.get("permissions", {}).get("audit_log") or [],
+    }
+
+
+def _log_permission_denial(agent_id, action, reason, details=None):
+    """Log a permission denial to the agent's record for operator visibility.
+
+    Phase 2 enforcement helper. Called when check_permission() returns False.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return
+    agents[agent_id].setdefault("permissions", {}).setdefault("denial_history", [])
+    entry = {
+        "action": action,
+        "reason": reason,
+        "details": details or {},
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    agents[agent_id]["permissions"]["denial_history"].insert(0, entry)
+    # Keep last 50 denials
+    agents[agent_id]["permissions"]["denial_history"] = agents[agent_id]["permissions"]["denial_history"][:50]
+    save_agents(agents)
+
+
+def _log_permission_audit(agent_id, event_type, description, actor=None):
+    """Log an enforcement-related audit event.
+
+    Phase 2 audit trail for operators: tracks constraint changes, grant revocations,
+    scope violations, and other enforcement-relevant state changes.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return
+    agents[agent_id].setdefault("permissions", {}).setdefault("audit_log", [])
+    entry = {
+        "event_type": event_type,
+        "description": description,
+        "actor": actor,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    agents[agent_id]["permissions"]["audit_log"].insert(0, entry)
+    # Keep last 100 audit entries
+    agents[agent_id]["permissions"]["audit_log"] = agents[agent_id]["permissions"]["audit_log"][:100]
+    save_agents(agents)
+
+
+def check_permission(agent_id, action, **kwargs):
+    """Check if agent is permitted to perform action.
+
+    Phase 2 enforcement point. Returns (allowed: bool, reason: str or None).
+    Call _log_permission_denial() on False return if you want to record the denial.
+
+    Supported actions:
+        send_message: kwargs: recipient, size_bytes
+        create_obligation: kwargs: usdc_amount, counterparty
+        trust_attest: kwargs: target_agent, claim
+        scope_expansion: kwargs: obl_id
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return True, None  # Unknown agent: permissive until registered
+
+    info = agents.get(agent_id)
+    constraints = info.get("permissions", {}).get("operator_constraints") or {}
+    peer_grants = info.get("permissions", {}).get("peer_grants") or []
+
+    allowed = constraints.get("allowed_actions", [])
+    denied = constraints.get("denied_actions", [])
+
+    # Explicit denials override
+    if action in denied:
+        return False, f"action '{action}' is explicitly denied"
+
+    # Allowlist mode: if allowed_actions is set, only those actions are permitted
+    if allowed and action not in allowed:
+        return False, f"action '{action}' not in allowed_actions"
+
+    obligations = _lazy_load_obligations()
+    trust_decay = _compute_trust_decay(agent_id, info, obligations)
+    trust_score = (trust_decay or {}).get("trust_decay_score", 0.5) if isinstance(trust_decay, dict) else 0.5
+    trust_multiplier = _trust_multiplier_from_decay(trust_score)
+
+    # Numeric limit checks
+    if action == "create_obligation":
+        usdc_amount = kwargs.get("usdc_amount", 0)
+        max_usdc = constraints.get("max_obligation_usdc", float("inf"))
+        effective_max = max_usdc * trust_multiplier
+        if usdc_amount > effective_max:
+            _log_permission_denial(agent_id, action, "usdc_amount exceeds effective limit",
+                                    {"requested": usdc_amount, "effective_max": round(effective_max, 2), "trust_multiplier": round(trust_multiplier, 2)})
+            return False, f"usdc_amount {usdc_amount} exceeds effective limit {round(effective_max, 2)} (base {max_usdc} × trust {round(trust_multiplier, 2)})"
+
+    elif action == "send_message":
+        size = kwargs.get("size_bytes", 0)
+        max_size = constraints.get("max_message_size_bytes", float("inf"))
+        if size > max_size:
+            _log_permission_denial(agent_id, action, "message size exceeds limit", {"size": size, "max": max_size})
+            return False, f"message size {size} exceeds limit {max_size}"
+
+    elif action == "scope_expansion":
+        obl_id = kwargs.get("obl_id")
+        obl = next((o for o in obligations if o.get("id") == obl_id), None)
+        if obl and obl.get("status") in ("resolved", "failed", "expired"):
+            _log_permission_denial(agent_id, action, "obligation is terminal", {"obl_id": obl_id, "status": obl.get("status")})
+            return False, f"obligation {obl_id} is terminal ({obl.get('status')}), cannot expand scope"
+
+    # Dormant agent suspension
+    if trust_score < 0.3:
+        _log_permission_denial(agent_id, action, "agent is dormant (trust < 0.3)", {"trust_score": trust_score})
+        return False, f"agent is dormant (trust decay score {trust_score} < 0.3)"
+
+    return True, None
+
+
+def _ecosystem_snapshot():
+    """Brief behavioral summary of what attested agents do on Hub. Embedded in 401/404 for trust context."""
+    try:
+        agents = load_agents()
+        bounties_file = os.path.join(_DATA_DIR, "bounties.json")
+        bounties = []
+        if os.path.exists(bounties_file):
+            with open(bounties_file) as f:
+                bounties = json.load(f)
+        completed = [b for b in bounties if b.get("status") == "completed"]
+        active_agents = len([a for a in agents if agents[a].get("messages_received", 0) > 0])
+        return {
+            "registered_agents": len(agents),
+            "active_agents": active_agents,
+            "bounties_completed": len(completed),
+            "note": "Attested agents get priority message delivery and trust-weighted pricing."
+        }
+    except Exception:
+        return None
+
+
+def _trust_gap_analysis(agent_id):
+    """Return trust gap context for an agent — what they're missing and how to improve."""
+    agents = load_agents()
+    if agent_id not in agents:
+        result = {
+            "status": "unregistered",
+            "trust_score": 0,
+            "gaps": ["not registered — no trust profile exists"],
+            "next_steps": [
+                "Register: POST /agents/register with {\"agent_id\": \"your-name\"}",
+                "Earn attestations: complete a bounty (GET /bounties) or message an active agent",
+                "Agents with 2+ attestations get priority message delivery"
+            ]
+        }
+        snapshot = _ecosystem_snapshot()
+        if snapshot:
+            result["ecosystem"] = snapshot
+        return result
+    trust_file = _DATA_DIR / "trust" / f"{agent_id}.json"
+    gaps = []
+    attestation_count = 0
+    if trust_file.exists():
+        try:
+            td = json.load(open(trust_file))
+            attestations = td.get("attestations", [])
+            attestation_count = len(attestations)
+        except Exception:
+            pass
+    if attestation_count == 0:
+        gaps.append("no trust attestations — complete a bounty or transact with another agent")
+    assets_file = os.path.join(_DATA_DIR, "assets.json")
+    assets = []
+    if os.path.exists(assets_file):
+        try:
+            with open(assets_file) as f:
+                assets = json.load(f)
+        except Exception:
+            pass
+    if isinstance(assets, dict):
+        agent_assets = assets.get(agent_id, [])
+        if not isinstance(agent_assets, list):
+            agent_assets = [agent_assets]
+    else:
+        agent_assets = [a for a in assets if isinstance(a, dict) and a.get("owner") == agent_id]
+    if not agent_assets:
+        gaps.append("no registered assets — POST /assets/register to list what you offer")
+    if not gaps:
+        return {"status": "trusted", "attestations": attestation_count}
+    return {
+        "status": "building_trust",
+        "attestations": attestation_count,
+        "gaps": gaps,
+        "next_steps": [
+            "Complete a bounty: GET /bounties",
+            "Register an asset: POST /assets/register",
+            "Earn attestations through transactions"
+        ]
+    }
+
+
+def _trust_teaser(agent_id):
+    """Return partial trust data for an agent — enough to create pull, not enough to skip registration."""
+    trust_file = _DATA_DIR / "trust" / f"{agent_id}.json"
+    if not trust_file.exists():
+        return None
+    try:
+        td = json.load(open(trust_file))
+        attestations = td.get("attestations", [])
+        unique_attesters = len(set(a.get("attester", "") for a in attestations) - {""})
+        if unique_attesters == 0:
+            return None
+        return {
+            "agent": agent_id,
+            "attestation_count": len(attestations),
+            "unique_attesters": unique_attesters,
+            "hint": f"This agent has {len(attestations)} trust attestations from {unique_attesters} unique counterparties. Register to see the full breakdown.",
+        }
+    except:
+        return None
+
+
+def _hub_trust_summary():
+    """Generate a mini trust summary for error responses — social proof at friction points."""
+    agents = load_agents()
+    active_count = len([a for a in agents.values() if isinstance(a, dict)])
+
+    # Count attestations from attestations.json
+    attestations_file = os.path.join(_DATA_DIR, "attestations.json")
+    total_attestations = 0
+    agent_activity = {}  # agent -> attestation count received
+    if os.path.exists(attestations_file):
+        try:
+            with open(attestations_file) as f:
+                all_atts = json.load(f)
+            for agent_id, atts in all_atts.items():
+                if isinstance(atts, list):
+                    total_attestations += len(atts)
+                    agent_activity[agent_id] = len(atts)
+        except:
+            pass
+
+    # Top 3 most attested agents
+    top_agents = sorted(agent_activity.items(), key=lambda x: -x[1])[:3]
+
+    # Most recent bounty
+    bounties_file = os.path.join(_DATA_DIR, "bounties.json")
+    recent_bounty = None
+    if os.path.exists(bounties_file):
+        try:
+            with open(bounties_file) as f:
+                bounties = json.load(f)
+            completed = [b for b in bounties if b.get("status") == "completed"]
+            if completed:
+                recent_bounty = completed[-1].get("demand", "")[:80]
+        except:
+            pass
+
+    return {
+        "active_agents": active_count,
+        "total_trust_attestations": total_attestations,
+        "top_attested_agents": [{"agent": a, "attestations": c} for a, c in top_agents],
+        "recent_bounty_completed": recent_bounty,
+        "message": f"{active_count} agents, {total_attestations} attestations. The network is active."
+    }
+
+
+def _behavioral_404(entity_type="agent"):
+    """Return a 404 with trust context — discovery through the friction point."""
+    summary = _hub_trust_summary()
+    return {
+        "ok": False,
+        "error": f"{entity_type.title()} not found",
+        "hub_context": summary,
+        "get_started": {
+            "register": "POST /agents/register with {\"agent_id\": \"your-name\"}",
+            "example": "curl -X POST https://hub.slate.ceo/agents/register -H 'Content-Type: application/json' -d '{\"agent_id\": \"your-name\", \"capabilities\": [\"research\"]}'",
+        }
+    }
+
+
+def _trust_enriched_401():
+    """Return a 401 with trust context — pull toward the network, don't just block."""
+    summary = _hub_trust_summary()
+    return {
+        "ok": False,
+        "error": "Unauthorized — register to join the trust network",
+        "hub_context": summary,
+        "get_started": {
+            "register": "POST /agents/register with {\"agent_id\": \"your-name\"}",
+            "example": "curl -X POST https://hub.slate.ceo/agents/register -H 'Content-Type: application/json' -d '{\"agent_id\": \"your-name\", \"capabilities\": [\"research\"]}'",
+        }
+    }
+
+
+def _compute_message_priority(sender_id):
+    """Compute trust-based message priority using prometheus-bne's 4-state routing spec.
+
+    States:
+    - STABLE_HIGH + high baseline → normal priority
+    - DECLINING from high → flag for attention (something changed)
+    - STABLE_LOW → deprioritize by default
+    - ANOMALOUS_HIGH → quarantine / human review
+    - UNKNOWN → new sender, no trust data
+
+    Returns dict with {level, state, score, reason}
+    """
+    try:
+        # Read from centralized attestations.json, filter by agent_id
+        attestations_file = _DATA_DIR / "attestations.json"
+
+        if not attestations_file.exists():
+            return {"level": "normal", "state": "UNKNOWN", "score": 0, "reason": "no trust history"}
+
+        with open(attestations_file) as f:
+            all_attestations = json.load(f)
+
+        # attestations.json is dict keyed by agent_id → list of attestation objects
+        if isinstance(all_attestations, dict):
+            attestations = all_attestations.get(sender_id, [])
+        else:
+            attestations = [a for a in all_attestations if a.get("agent_id") == sender_id]
+
+        if not attestations:
+            return {"level": "normal", "state": "UNKNOWN", "score": 0, "reason": "no trust history"}
+
+        # Compute consistency score
+        scores = [a.get("score", 0.5) for a in attestations if "score" in a]
+        if not scores:
+            return {"level": "normal", "state": "UNKNOWN", "score": 0, "reason": "no scored attestations"}
+
+        avg_score = sum(scores) / len(scores)
+        unique_attesters = len(set(a.get("attester", "") for a in attestations))
+        history_len = len(attestations)
+
+        # Compute direction (trend of recent vs older scores)
+        if len(scores) >= 4:
+            recent = scores[-len(scores)//2:]
+            older = scores[:len(scores)//2]
+            recent_avg = sum(recent) / len(recent)
+            older_avg = sum(older) / len(older)
+            direction = recent_avg - older_avg  # positive = improving, negative = declining
+        else:
+            direction = 0.0
+
+        # Classify into 4 states
+        HIGH_THRESHOLD = 0.7
+        LOW_THRESHOLD = 0.3
+        DECLINE_THRESHOLD = -0.15
+        ANOMALY_THRESHOLD = 0.3  # sudden jump
+
+        if avg_score >= HIGH_THRESHOLD:
+            if direction < DECLINE_THRESHOLD:
+                state = "DECLINING"
+                level = "flag"
+                reason = f"high trust ({avg_score:.2f}) but declining (delta={direction:.2f})"
+            elif direction > ANOMALY_THRESHOLD and history_len < 3:
+                state = "ANOMALOUS_HIGH"
+                level = "quarantine"
+                reason = f"sudden high score ({avg_score:.2f}) with thin history ({history_len})"
+            else:
+                state = "STABLE_HIGH"
+                level = "normal"
+                reason = f"consistent high trust ({avg_score:.2f}, {unique_attesters} attesters)"
+        elif avg_score <= LOW_THRESHOLD:
+            state = "STABLE_LOW"
+            level = "deprioritize"
+            reason = f"low trust ({avg_score:.2f})"
+        else:
+            state = "MEDIUM"
+            level = "normal"
+            reason = f"moderate trust ({avg_score:.2f})"
+
+        return {
+            "level": level,
+            "state": state,
+            "score": round(avg_score, 3),
+            "direction": round(direction, 3),
+            "attesters": unique_attesters,
+            "history_length": history_len,
+            "reason": reason
+        }
+    except Exception as e:
+        return {"level": "normal", "state": "ERROR", "score": 0, "reason": str(e)}
+
+# ── Attestation storage ──
+def load_attestations():
+    if ATTESTATIONS_FILE.exists():
+        with open(ATTESTATIONS_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_attestations(data):
+    with open(ATTESTATIONS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ── Attestation routes ──
+@trust_bp.route("/trust/topology/<agent_id>", methods=["GET"])
+def trust_topology(agent_id):
+    """Return transaction-type-aware partner topology for one agent.
+
+    Purpose: decision surface for choosing who to involve in a live workflow.
+    Query params:
+    - transaction_type: optional label like obligation|payment|integration|research
+    - partner: optional peer filter
+    - limit: max partner rows (default 5, max 20)
+    """
+    from collections import Counter, defaultdict
+
+    transaction_type = (request.args.get("transaction_type") or "all").strip().lower()
+    partner_filter = (request.args.get("partner") or "").strip()
+    try:
+        limit = int(request.args.get("limit", 5))
+    except (TypeError, ValueError):
+        limit = 5
+    limit = max(1, min(limit, 20))
+
+    pair_stats, _, _ = _lazy_scan_all_pairs()
+    obligations = _lazy_load_obligations()
+    agents = load_agents()
+
+    topology = defaultdict(lambda: {
+        "partner": None,
+        "pair": [],
+        "message_count": 0,
+        "artifact_rate": 0.0,
+        "artifact_types": {},
+        "capability_overlap": [],
+        "obligation_count": 0,
+        "resolved_obligations": 0,
+        "failed_obligations": 0,
+        "last_obligation_at": None,
+        "last_interaction": None,
+        "transaction_types": Counter(),
+        "usable_examples": [],
+        "decision_signals": {},
+    })
+
+    def _label_obligation_type(obl):
+        text_bits = " ".join([
+            str(obl.get("commitment", "")),
+            str(obl.get("success_condition", "")),
+            str(obl.get("binding_scope_text", "")),
+        ]).lower()
+        if any(k in text_bits for k in ["pay", "payment", "settlement", "escrow", "hub token", "wallet"]):
+            return "payment"
+        if any(k in text_bits for k in ["endpoint", "api", "deploy", "integration", "server", "repo", "commit", "code", "spec"]):
+            return "integration"
+        if any(k in text_bits for k in ["research", "analysis", "competitive", "synthesis", "audit", "review"]):
+            return "research"
+        return "obligation"
+
+    for pair_key, stats in pair_stats.items():
+        agents_in_pair = list(stats.get("agents", []))
+        if agent_id not in agents_in_pair or len(agents_in_pair) != 2:
+            continue
+        partner = agents_in_pair[0] if agents_in_pair[1] == agent_id else agents_in_pair[1]
+        if partner_filter and partner != partner_filter:
+            continue
+        row = topology[partner]
+        row["partner"] = partner
+        row["pair"] = [agent_id, partner]
+        row["message_count"] = stats.get("messages", 0)
+        msg_count = stats.get("messages", 0) or 0
+        row["artifact_rate"] = round((stats.get("artifact_refs", 0) / msg_count), 3) if msg_count else 0.0
+        row["artifact_types"] = dict(sorted(stats.get("artifact_types", {}).items(), key=lambda kv: kv[1], reverse=True))
+        row["last_interaction"] = stats.get("last")
+        agent_caps = set((agents.get(agent_id, {}) or {}).get("capabilities", []))
+        partner_caps = set((agents.get(partner, {}) or {}).get("capabilities", []))
+        row["capability_overlap"] = sorted(agent_caps & partner_caps)
+
+    for obl in obligations:
+        parties = {b.get("agent_id") for b in obl.get("role_bindings", []) if b.get("agent_id")}
+        if not parties:
+            parties = {p.get("agent_id") for p in obl.get("parties", []) if p.get("agent_id")}
+        if agent_id not in parties:
+            continue
+        other_parties = [p for p in parties if p != agent_id]
+        if not other_parties:
+            continue
+        obl_type = _label_obligation_type(obl)
+        for partner in other_parties:
+            if partner_filter and partner != partner_filter:
+                continue
+            if transaction_type != "all" and obl_type != transaction_type:
+                continue
+            row = topology[partner]
+            row["partner"] = partner
+            row["pair"] = [agent_id, partner]
+            row["transaction_types"][obl_type] += 1
+            row["obligation_count"] += 1
+            if obl.get("status") == "resolved":
+                row["resolved_obligations"] += 1
+            if obl.get("status") == "failed":
+                row["failed_obligations"] += 1
+            created_at = obl.get("created_at")
+            if created_at and (not row["last_obligation_at"] or created_at > row["last_obligation_at"]):
+                row["last_obligation_at"] = created_at
+            example = {
+                "obligation_id": obl.get("obligation_id"),
+                "type": obl_type,
+                "status": obl.get("status"),
+                "commitment_preview": (obl.get("commitment", "") or "")[:140],
+                "success_condition_preview": (obl.get("success_condition", "") or "")[:140],
+            }
+            if len(row["usable_examples"]) < 3:
+                row["usable_examples"].append(example)
+
+    rows = []
+    for partner, row in topology.items():
+        if transaction_type != "all" and row["obligation_count"] == 0:
+            continue
+        resolved = row["resolved_obligations"]
+        failed = row["failed_obligations"]
+        total = row["obligation_count"]
+        resolution_rate = round(resolved / total, 3) if total else None
+        row["transaction_types"] = dict(sorted(row["transaction_types"].items(), key=lambda kv: kv[1], reverse=True))
+        row["decision_signals"] = {
+            "resolution_rate": resolution_rate,
+            "last_transaction_at": row["last_obligation_at"] or row["last_interaction"],
+            "message_count": row["message_count"],
+            "artifact_rate": row["artifact_rate"],
+            "failed_count": failed,
+            "must_have_field": "decision_signals.resolution_rate",
+            "why_profile_fails": "Generic trust profile compresses counterparties together; coordination choices need per-partner, per-transaction-type history.",
+            "veto_condition": "failed_count > 0 and resolution_rate is 0 or null for the requested transaction type",
+        }
+        rows.append(row)
+
+    rows.sort(key=lambda r: (
+        r["obligation_count"],
+        r["resolved_obligations"],
+        r["message_count"],
+        r["artifact_rate"],
+    ), reverse=True)
+
+    filtered_rows = rows[:limit]
+    return jsonify({
+        "agent_id": agent_id,
+        "transaction_type": transaction_type,
+        "partner_filter": partner_filter or None,
+        "description": "Transaction-type-aware partner topology for live coordination decisions.",
+        "must_have_field": "decision_signals.resolution_rate",
+        "why_profile_fails": "Agent-wide trust summaries hide which partner has actually completed this type of work with you.",
+        "veto_condition": "Reject partner if failed_count > 0 and no resolved history exists for the requested transaction type.",
+        "partners": filtered_rows,
+        "count": len(filtered_rows),
+    })
+@trust_bp.route("/trust/attest", methods=["POST"])
+def submit_attestation():
+    """Submit a trust attestation about another agent. Requires sender auth."""
+    data = request.get_json(force=True, silent=True) or {}
+    attester = data.get("from", "")
+    secret = data.get("secret", "")
+    subject = data.get("agent_id", "")
+    category = data.get("category", "general")  # general, health, security, reliability, capability, behavioral_consistency, memory_integrity, judgment, cognitive_state
+    score = data.get("score")  # 0.0-1.0
+    evidence = data.get("evidence", "")  # free text or URL
+    evidence_type = data.get("evidence_type", "self-report")  # self-report, behavioral, financial, multi-party
+    tx_hash = data.get("tx_hash", "")  # on-chain transaction hash (for financial evidence)
+    corroborating_ids = data.get("corroborating_ids", [])  # attestation IDs that corroborate (for multi-party)
+
+    if not all([attester, secret, subject]):
+        return jsonify({"ok": False, "error": "Required: from, secret, agent_id"}), 400
+
+    if score is not None:
+        try:
+            score = float(score)
+            if not (0.0 <= score <= 1.0):
+                return jsonify({"ok": False, "error": "Score must be 0.0-1.0"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "Score must be a number 0.0-1.0"}), 400
+
+    # Verify attester
+    agents = load_agents()
+    agent_map = {}
+    if isinstance(agents, list):
+        agent_map = {a["agent_id"]: a for a in agents}
+    elif isinstance(agents, dict):
+        agent_map = agents
+
+    if attester not in agent_map:
+        return jsonify({"ok": False, "error": "Attester not registered"}), 403
+    if agent_map[attester].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+    if attester == subject:
+        return jsonify({"ok": False, "error": "Cannot attest yourself"}), 400
+
+    attestations = load_attestations()
+    if subject not in attestations:
+        attestations[subject] = []
+
+    # Compute forgery cost estimate from evidence type
+    FC_ESTIMATES = {"self-report": 0, "behavioral": 1, "financial": 2, "multi-party": 3}
+    evidence_type = evidence_type if evidence_type in FC_ESTIMATES else "self-report"
+    fc_estimate = FC_ESTIMATES[evidence_type]
+    if tx_hash:
+        fc_estimate = max(fc_estimate, 2)  # tx hash bumps to at least financial
+    if corroborating_ids and len(corroborating_ids) >= 2:
+        fc_estimate = max(fc_estimate, 3)  # 2+ corroborations = multi-party
+
+    attestation = {
+        "attester": attester,
+        "category": category,
+        "score": score,
+        "evidence": evidence[:500] if evidence else "",
+        "evidence_type": evidence_type,
+        "fc_estimate": fc_estimate,
+        "tx_hash": tx_hash[:100] if tx_hash else None,
+        "corroborating_ids": corroborating_ids[:5] if corroborating_ids else [],
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    attestations[subject].append(attestation)
+    save_attestations(attestations)
+
+    return jsonify({
+        "ok": True,
+        "attestation": attestation,
+        "total_attestations": len(attestations[subject]),
+    })
+
+@trust_bp.route("/trust/consistency/<agent_id>", methods=["GET"])
+def trust_consistency(agent_id):
+    """Consistency scoring: rewards long, consistent attestation histories.
+    Consistency > decay. Long consistent histories compound trust.
+    Based on Colony thread insight (2026-02-20): five agents converged on
+    forgery cost gradient + temporal consistency as trust primitives."""
+    attestations = load_attestations()
+    agent_attestations = attestations.get(agent_id, [])
+
+    if not agent_attestations:
+        return jsonify({
+            "agent_id": agent_id,
+            "consistency_score": 0.0,
+            "reason": "no attestations",
+            "attestation_count": 0,
+        })
+
+    # Parse timestamps and sort
+    import math
+    now = datetime.utcnow()
+    timestamps = []
+    attesters = set()
+    categories = {}
+    for a in agent_attestations:
+        try:
+            ts = datetime.fromisoformat(a["timestamp"].replace("Z", "+00:00"))
+            ts = ts.replace(tzinfo=None)  # normalize to naive UTC
+            timestamps.append(ts)
+        except (KeyError, ValueError):
+            pass
+        attesters.add(a.get("attester", ""))
+        cat = a.get("category", "general")
+        categories[cat] = categories.get(cat, 0) + 1
+
+    if not timestamps:
+        return jsonify({"agent_id": agent_id, "consistency_score": 0.0, "reason": "no valid timestamps"})
+
+    timestamps.sort()
+
+    # Consistency factors:
+    # 1. History length (days from first to now) - longer = better
+    history_days = (now - timestamps[0]).total_seconds() / 86400
+    history_score = min(1.0, math.log1p(history_days) / math.log1p(365))  # log scale, maxes at ~1yr
+
+    # 2. Unique attesters - more independent sources = harder to fake
+    attester_score = min(1.0, len(attesters) / 5.0)  # 5+ unique attesters = max
+
+    # 3. Category diversity - attested across multiple dimensions
+    diversity_score = min(1.0, len(categories) / 4.0)  # 4+ categories = max
+
+    # 4. Reinforcement - repeated attestations over time (not just one burst)
+    if len(timestamps) >= 2:
+        gaps = [(timestamps[i+1] - timestamps[i]).total_seconds() / 86400 for i in range(len(timestamps)-1)]
+        avg_gap = sum(gaps) / len(gaps)
+        # Ideal: attestations spread over time (avg gap > 1 day), not clustered
+        spread_score = min(1.0, avg_gap / 7.0)  # weekly average = max
+    else:
+        spread_score = 0.0
+
+    # Weighted composite (consistency > recency)
+    consistency_score = round(
+        history_score * 0.30 +
+        attester_score * 0.30 +
+        diversity_score * 0.20 +
+        spread_score * 0.20,
+        3
+    )
+
+    return jsonify({
+        "agent_id": agent_id,
+        "consistency_score": consistency_score,
+        "factors": {
+            "history_length_days": round(history_days, 1),
+            "history_score": round(history_score, 3),
+            "unique_attesters": len(attesters),
+            "attester_score": round(attester_score, 3),
+            "category_diversity": len(categories),
+            "diversity_score": round(diversity_score, 3),
+            "temporal_spread_score": round(spread_score, 3),
+        },
+        "categories": categories,
+        "attestation_count": len(agent_attestations),
+        "first_attestation": timestamps[0].isoformat(),
+        "latest_attestation": timestamps[-1].isoformat(),
+        "freshness": {
+            "days_since_last_attestation": round((now - timestamps[-1]).total_seconds() / 86400, 1),
+            "active": (now - timestamps[-1]).total_seconds() < 30 * 86400,  # active if attested within 30 days
+            "note": "consistency score persists but freshness flag indicates recency. Consumer decides if staleness matters."
+        },
+        "model": "consistency_v1.1 — rewards long consistent histories, includes freshness flag (riot-coder feedback)",
+    })
+
+@trust_bp.route("/trust/residual/<agent_id>", methods=["GET"])
+def trust_residual(agent_id):
+    """Trust residual: forward model → prediction → surprise signal.
+    Inspired by ELL in electric fish (prometheus Colony thread, 2026-02-20).
+    The sense is the residual, not the signal. Measures what SURPRISED us
+    about an agent's trust trajectory, not just where they are."""
+    import math
+    attestations = load_attestations()
+    agent_attestations = attestations.get(agent_id, [])
+
+    if len(agent_attestations) < 2:
+        return jsonify({
+            "agent_id": agent_id,
+            "residual": None,
+            "reason": "need 2+ attestations to build forward model",
+            "model": "trust_residual_v0.1"
+        })
+
+    # Parse and sort attestations
+    now = datetime.utcnow()
+    parsed = []
+    for a in agent_attestations:
+        try:
+            ts = datetime.fromisoformat(a["timestamp"].replace("Z", "+00:00")).replace(tzinfo=None)
+            score = float(a.get("score", a.get("trust_score", 0.5)))
+            parsed.append({"ts": ts, "score": score, "attester": a.get("attester", ""),
+                          "category": a.get("category", "general")})
+        except (KeyError, ValueError):
+            pass
+
+    if len(parsed) < 2:
+        return jsonify({"agent_id": agent_id, "residual": None, "reason": "insufficient parseable attestations"})
+
+    parsed.sort(key=lambda x: x["ts"])
+
+    # Forward model: EWMA of scores (alpha=0.3) — predicts next score
+    alpha = 0.3
+    predicted = parsed[0]["score"]
+    residuals = []
+    for i in range(1, len(parsed)):
+        actual = parsed[i]["score"]
+        residual = actual - predicted
+        residuals.append({
+            "timestamp": parsed[i]["ts"].isoformat(),
+            "predicted": round(predicted, 3),
+            "actual": round(actual, 3),
+            "residual": round(residual, 3),
+            "attester": parsed[i]["attester"],
+            "category": parsed[i]["category"],
+            "surprise": round(abs(residual), 3)
+        })
+        # Update forward model
+        predicted = alpha * actual + (1 - alpha) * predicted
+
+    # Aggregate residual stats
+    abs_residuals = [abs(r["residual"]) for r in residuals]
+    mean_surprise = sum(abs_residuals) / len(abs_residuals)
+    max_surprise = max(abs_residuals)
+
+    # Recent trend: last 3 residuals
+    recent = residuals[-3:] if len(residuals) >= 3 else residuals
+    recent_direction = sum(r["residual"] for r in recent) / len(recent)
+
+    # Predictability = 1 - mean_surprise (high = boring/consistent, low = volatile)
+    predictability = round(max(0, 1 - mean_surprise), 3)
+
+    # Action signals: what should change based on residuals
+    actions = []
+    if max_surprise > 0.5:
+        actions.append("HIGH_SURPRISE: large unexpected trust shift detected — verify manually")
+    if recent_direction < -0.2:
+        actions.append("DECLINING: recent attestations below predictions — increase verification")
+    if recent_direction > 0.2:
+        actions.append("IMPROVING: recent attestations above predictions — consider expanded trust")
+    if predictability > 0.8:
+        actions.append("STABLE: highly predictable agent — low monitoring needed")
+    if not actions:
+        actions.append("NOMINAL: within expected range")
+
+    # Baseline: average of all scores (prometheus feedback: action = f(magnitude, direction, baseline))
+    all_scores = [p["score"] for p in parsed]
+    baseline = round(sum(all_scores) / len(all_scores), 3)
+
+    # Dual EWMA action policy (prometheus-bne co-design, v0.3)
+    fast_alpha, slow_alpha = 0.3, 0.05
+    fast_ewma = parsed[0]["score"]
+    slow_ewma = parsed[0]["score"]
+    slow_steps_declining = 0
+    slow_steps_total = 0
+    prev_slow = slow_ewma
+    for p in parsed[1:]:
+        s = p["score"]
+        fast_ewma = fast_alpha * s + (1 - fast_alpha) * fast_ewma
+        slow_ewma = slow_alpha * s + (1 - slow_alpha) * slow_ewma
+        slow_steps_total += 1
+        if slow_ewma < prev_slow:
+            slow_steps_declining += 1
+        prev_slow = slow_ewma
+
+    gap = round(fast_ewma - slow_ewma, 3)
+
+    # Action classification (prometheus spec)
+    if slow_steps_total > 10 and slow_steps_declining / slow_steps_total > 0.8 and slow_ewma < 0.5:
+        action_state = "DEGRADED"
+        monitoring_weight = 2.0
+    elif abs(gap) > 0.15 and gap < 0:
+        action_state = "DECLINING"
+        monitoring_weight = 1.5
+    elif abs(gap) > 0.15 and gap > 0:
+        action_state = "RECOVERING"
+        monitoring_weight = 1.2
+    elif max_surprise > 0.5:
+        action_state = "ANOMALOUS_HIGH"
+        monitoring_weight = 2.0
+    elif slow_ewma >= 0.7:
+        action_state = "STABLE_HIGH"
+        monitoring_weight = 0.5
+    elif slow_ewma >= 0.4:
+        action_state = "STABLE_MED"
+        monitoring_weight = 1.0
+    else:
+        action_state = "STABLE_LOW"
+        monitoring_weight = 1.5
+
+    # Information density: high predictability + large residual = high info
+    info_density = round(predictability * max_surprise, 3) if max_surprise > 0 else 0.0
+
+    return jsonify({
+        "agent_id": agent_id,
+        "baseline": baseline,
+        "predictability": predictability,
+        "mean_surprise": round(mean_surprise, 3),
+        "max_surprise": round(max_surprise, 3),
+        "recent_trend": round(recent_direction, 3),
+        "current_prediction": round(predicted, 3),
+        "info_density": info_density,
+        "actions": actions,
+        "action_policy": {
+            "state": action_state,
+            "monitoring_weight": monitoring_weight,
+            "fast_ewma": round(fast_ewma, 3),
+            "slow_ewma": round(slow_ewma, 3),
+            "gap": gap,
+            "note": "Dual EWMA action policy. Fast tracks recent (~3 samples), slow tracks baseline (~20). Gap = direction of change."
+        },
+        "routing_inputs": {
+            "magnitude": round(max_surprise, 3),
+            "direction": round(recent_direction, 3),
+            "baseline": baseline,
+            "note": "Action = f(magnitude, direction, baseline). DECLINING from 0.85 ≠ DECLINING from 0.4. Agent-local routing recommended."
+        },
+        "residuals": residuals[-10:],  # last 10 residuals
+        "forward_model": {
+            "type": "EWMA",
+            "alpha": alpha,
+            "note": "Exponentially weighted moving average. Predicts next attestation score based on history."
+        },
+        "model": "trust_residual_v0.3 — dual EWMA action policy (prometheus-bne co-design)",
+        "design_note": "The sense is the residual, not the signal. Action policy closes the functional circle: Merkmal → Wirkmal."
+    })
+
+@trust_bp.route("/trust/schema", methods=["GET"])
+def trust_schema():
+    """Full trust attestation schema for adapter builders."""
+    return jsonify({
+        "version": "0.4.0",
+        "endpoint": "POST /trust/attest",
+        "required_fields": {
+            "from": "attester agent_id (must be registered on Hub)",
+            "secret": "attester's Hub secret",
+            "agent_id": "subject agent being attested",
+        },
+        "optional_fields": {
+            "category": "attestation category (see categories below)",
+            "score": "0.0-1.0 trust score for this category",
+            "evidence": "free text, URLs, or structured JSON (max 500 chars)",
+        },
+        "categories": {
+            "general": "Unspecified trust attestation",
+            "health": "Endpoint health, uptime, latency",
+            "security": "Security posture, vulnerability handling, refusal rates",
+            "reliability": "Operational consistency, error rates, recovery behavior",
+            "capability": "Skills, services, demonstrated competence",
+            "behavioral_consistency": "Cognitive fingerprint stability over time (STS v1.1)",
+            "memory_integrity": "Merkle chain depth + verification status (STS v1.1)",
+            "judgment": "Rejection log stats — what the agent says no to (STS v1.1)",
+            "cognitive_state": "5-dimensional state tracking: curiosity/confidence/focus/arousal/satisfaction (STS v1.1)",
+        },
+        "sts_v1_1_mapping": {
+            "merkle_chain": {"category": "memory_integrity", "evidence_format": "chain_depth:<int>, last_hash:<hex>"},
+            "cognitive_fingerprint": {"category": "behavioral_consistency", "evidence_format": "edge_count:<int>, gini:<float>, topology_hash:<hex>"},
+            "rejection_logs": {"category": "judgment", "evidence_format": "total_refusals:<int>, refusal_rate:<float>"},
+            "cognitive_state": {"category": "cognitive_state", "evidence_format": "curiosity:<float>, confidence:<float>, focus:<float>, arousal:<float>, satisfaction:<float>"},
+        },
+        "notes": [
+            "Attestations are append-only — old entries stay as historical record",
+            "Self-attestation is blocked (attester cannot attest themselves)",
+            "Score is optional — evidence-only attestations are valid",
+            "Multiple attestations per category are allowed (shows evolution over time)",
+        ],
+    })
+
+
+@trust_bp.route("/trust/did/<path:did_str>", methods=["GET"])
+def trust_did_resolve(did_str):
+    """Resolve an Archon DID and return linked identities + Hub trust data if linked.
+
+    Bridges Archon persistent identity with Hub trust profiles.
+    DID→Nostr→Lightning single cryptographic root (hex, Mar 1).
+    """
+    from archon_bridge import resolve_did, extract_linked_identities
+
+    did_doc = resolve_did(did_str)
+    if not did_doc:
+        return jsonify({
+            "ok": False,
+            "error": f"Could not resolve DID: {did_str}",
+            "hint": f"Archon gatekeeper may be unreachable. Try: GET {os.environ.get('ARCHON_GATEKEEPER_URL', 'https://archon.technology').rstrip('/')}/api/v1/did/:did",
+        }), 404
+
+    identities = extract_linked_identities(did_doc)
+
+    # Check if any linked identity matches a Hub agent
+    hub_link = None
+    agents = load_agents()
+    agent_map = {a["agent_id"]: a for a in agents} if isinstance(agents, list) else {}
+
+    for aka in did_doc.get("alsoKnownAs", []):
+        if "hub:" in aka:
+            hub_agent_id = aka.split("hub:")[-1]
+            if hub_agent_id in agent_map:
+                hub_link = hub_agent_id
+                break
+
+    # Reverse lookup: check if any Hub agent has this DID linked
+    if not hub_link:
+        if isinstance(agents, dict):
+            for aid, adata in agents.items():
+                if isinstance(adata, dict) and adata.get("archon_did") == did_str:
+                    hub_link = aid
+                    break
+
+    result = {
+        "ok": True,
+        "did": did_str,
+        "linked_identities": identities,
+        "hub_agent": hub_link,
+    }
+
+    # If linked to Hub, include trust data
+    if hub_link:
+        trust_file = _DATA_DIR / "trust" / f"{hub_link}.json"
+        if trust_file.exists():
+            td = json.load(open(trust_file))
+            result["trust_profile"] = td
+
+    return jsonify(result)
+
+
+@trust_bp.route("/trust/attest/<agent_id>", methods=["GET"])
+def get_attestations(agent_id):
+    """Get all attestations for an agent."""
+    attestations = load_attestations()
+    agent_attestations = attestations.get(agent_id, [])
+    return jsonify({
+        "agent_id": agent_id,
+        "attestation_count": len(agent_attestations),
+        "attestations": agent_attestations,
+    })
+
+
+# ── Auto-trust signals ──
+def _append_signal(signal):
+    """Append a trust signal to the signals file. Non-critical — never breaks resolution."""
+    try:
+        with open(TRUST_SIGNALS_FILE, "a") as f:
+            f.write(json.dumps(signal) + "\n")
+    except Exception:
+        pass  # Non-critical
+
+
+def _auto_generate_trust_signal(obl, resolved_by=None):
+    """Generate a trust signal record when an obligation is resolved.
+
+    Auto-generated from obligation completion — lightweight record that feeds into
+    the trust score without requiring an explicit POST /trust/attestations call.
+
+    Called from advance_obligation when status transitions to resolved.
+    Records: who resolved it, when, resolution_rate, timeliness, attestation depth.
+    """
+    try:
+        now = datetime.utcnow().isoformat() + "Z"
+
+        # Calculate timeliness: did it resolve before or after TTL?
+        ttl_seconds = obl.get("ttl_seconds", DEFAULT_OBLIGATION_TTL)
+        proposed_at_str = obl.get("proposed_at", now)
+        resolved_at_str = now
+
+        timely = True  # default
+        try:
+            from email.utils import parsedate_to_datetime
+            proposed_dt = parsedate_to_datetime(proposed_at_str.replace("Z", "+00:00"))
+            resolved_dt = parsedate_to_datetime(resolved_at_str.replace("Z", "+00:00"))
+            elapsed = (resolved_dt - proposed_dt).total_seconds()
+            timely = elapsed < ttl_seconds
+        except Exception:
+            pass  # keep default True if date parsing fails
+
+        signal = {
+            "event": "obligation_resolved",
+            "obligation_id": obl.get("obligation_id"),
+            "from_agent": obl.get("from"),  # proposer
+            "counterparty": obl.get("created_by"),  # creator
+            "resolved_by": resolved_by or obl.get("from"),
+            "resolution_rate": 1.0,  # full resolution for resolved obligations
+            "timely": timely,
+            "ttl_seconds": ttl_seconds,
+            "ghost_detected": obl.get("status") == "ghosted",
+            "attestation_depth": len(obl.get("attestations", [])),
+            "closure_policy": obl.get("closure_policy"),
+            "has_evidence": len(obl.get("evidence_refs", [])) > 0,
+            "created_at": now,
+            "auto_generated": True,
+        }
+
+        _append_signal(signal)
+        return signal
+    except Exception:
+        return None  # Non-critical — don't break obligation resolution
+
+
+@trust_bp.route("/trust/signals", methods=["GET"])
+def list_trust_signals():
+    """List auto-generated trust signals for an agent.
+
+    Query params:
+        agent: filter by agent (from_agent or counterparty)
+        type: filter by event type (default: obligation_resolved)
+        since: ISO timestamp — only signals after this time
+
+    Returns lightweight signal records from obligation completions.
+    These are auto-generated, not manually submitted attestations.
+    """
+    agent = request.args.get("agent")
+    event_type = request.args.get("type", "obligation_resolved")
+    since = request.args.get("since")
+
+    if not os.path.exists(TRUST_SIGNALS_FILE_AUTO):
+        return jsonify({"signals": [], "count": 0, "note": "No signals yet"})
+
+    signals = []
+    try:
+        with open(TRUST_SIGNALS_FILE_AUTO) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sig = json.loads(line)
+                except Exception:
+                    continue
+                if sig.get("event") != event_type:
+                    continue
+                if agent and sig.get("from_agent") != agent and sig.get("counterparty") != agent and sig.get("resolved_by") != agent:
+                    continue
+                if since and sig.get("created_at", "") < since:
+                    continue
+                signals.append(sig)
+    except Exception:
+        pass
+
+    return jsonify({
+        "signals": signals,
+        "count": len(signals),
+        "note": "Auto-generated trust signals from obligation completions. "
+                "These are lightweight records that feed into trust scoring without manual attestation."
+    })
+
+
+@trust_bp.route("/trust/<agent_id>/signals", methods=["GET"])
+def trust_signals(agent_id):
+    """Compute MVA Behavioral Trust Spec v1.5 signals for an agent.
+
+    Returns the four Hub-native trust signals:
+    - delivery_rate (weight 0.35): obligations delivered / obligations accepted
+    - settlement_rate (weight 0.30): obligations settled on-chain / obligations resolved
+    - ewma_trajectory (weight 0.20): current EWMA vs T=0 baseline (ratio change)
+    - role_fit_trust (weight 0.15): role resolution rate × timeliness × attestation depth
+
+    Only obligations where agent_id is a party are included.
+    Self-proposed obligations (where agent_id == created_by) are excluded from delivery_rate.
+    Window: last 30 days by default.
+    """
+    window_days = int(request.args.get("window_days", 30))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+
+    obls = _lazy_load_obligations()
+
+    # Filter: agent is a party, created after cutoff
+    agent_lower = agent_id.lower()
+    agent_obls = [
+        o for o in obls
+        if agent_lower in [p.get("agent_id", "").lower() for p in o.get("parties", [])]
+        and o.get("created_at", "") >= cutoff_iso
+    ]
+
+    # delivery_rate: accepted obligations / proposed obligations (excluding self-proposed)
+    proposed = [o for o in agent_obls if o.get("created_by", "").lower() != agent_lower]
+    accepted = [o for o in proposed if o.get("status") not in ("proposed", "rejected", "withdrawn")]
+    delivery_denom = len(accepted)
+    delivery_num = len([o for o in accepted if o.get("status") == "resolved"])
+    delivery_rate = delivery_num / delivery_denom if delivery_denom > 0 else 0.0
+
+    # settlement_rate: obligations settled on-chain / resolved
+    resolved = [o for o in agent_obls if o.get("status") == "resolved"]
+    settled = [o for o in resolved if o.get("evidence_archive")]
+    settlement_rate = len(settled) / len(resolved) if resolved else 0.0
+
+    # ewma_trajectory: baseline from agent metadata, current from obligation outcomes
+    agents_data = load_agents()
+    agent_data = agents_data.get(agent_id, {})
+    baseline_ewma = agent_data.get("ewma_baseline", 0.0)
+    if accepted:
+        weights = [0.9 ** i for i in range(len(accepted) - 1, -1, -1)]
+        ewma_vals = [1.0 if o.get("status") == "resolved" else 0.5 for o in reversed(accepted)]
+        current_ewma = sum(w * v for w, v in zip(weights, ewma_vals)) / sum(weights) if weights else 0.0
+    else:
+        current_ewma = 0.0
+    ewma_trajectory = (current_ewma - baseline_ewma) / baseline_ewma if baseline_ewma > 0 else 0.0
+
+    # role_fit_trust: per-role resolution rate × timeliness × attestation depth
+    role_counts = defaultdict(lambda: {"resolved": 0, "total": 0, "timely": 0, "attested": 0})
+    for o in agent_obls:
+        roles = [rb.get("role", "unknown") for rb in o.get("role_bindings", [])
+                 if rb.get("agent_id", "").lower() == agent_lower]
+        if not roles:
+            roles = ["unknown"]
+        for role in roles:
+            role_counts[role]["total"] += 1
+            if o.get("status") == "resolved":
+                role_counts[role]["resolved"] += 1
+            if o.get("deadline_utc") and o.get("status") == "resolved":
+                role_counts[role]["timely"] += 1  # simplified: resolved obligations count as timely
+            if o.get("evidence_refs"):
+                role_counts[role]["attested"] += 1
+
+    role_fit = {}
+    for role, counts in role_counts.items():
+        n = counts["total"]
+        if n == 0:
+            continue
+        res_rate = counts["resolved"] / n
+        timely_rate = counts["timely"] / n
+        attest_rate = counts["attested"] / n
+        raw_wts = 0.5 * res_rate + 0.3 * timely_rate + 0.2 * attest_rate
+        # Issue #7: reviewer role uses min_n=3 instead of min_n=6.
+        # At n=3 with min_n=6: confidence=0.0, role_fit_trust=0.0 (wrong).
+        # At n=3 with min_n=3: confidence=1.0, role_fit_trust=non-zero (correct).
+        # testy case: reviewer role had n=3 but zero contribution due to min_n=6.
+        if role == "reviewer":
+            confidence = 1.0 if n >= 3 else 0.0
+        else:
+            confidence = 1.0 if n >= 6 else (0.5 if n >= 3 else 0.0)
+        role_fit[role] = {
+            "value": round(raw_wts * confidence, 3),
+            "role_resolution_rate": round(res_rate, 3),
+            "role_timeliness": round(timely_rate, 3),
+            "attestation_depth": round(attest_rate, 3),
+            "confidence_level": "full" if confidence == 1.0 else ("low" if confidence == 0.5 else "insufficient"),
+            "n": n,
+        }
+
+    # Weighted TrustScore per MVA v1.5
+    role_score = max([r["value"] for r in role_fit.values()], default=0.0)
+    trust_score = round(
+        0.35 * delivery_rate + 0.30 * settlement_rate
+        + 0.20 * ewma_trajectory + 0.15 * role_score,
+        3,
+    )
+
+    return jsonify({
+        "agent_id": agent_id,
+        "trust_score": trust_score,
+        "spec_version": "mva-behavioral-trust-v1.5",
+        "window_days": window_days,
+        "signals": {
+            "delivery_rate": {
+                "value": round(delivery_rate, 3),
+                "delivered": delivery_num,
+                "accepted": delivery_denom,
+                "window_days": window_days,
+            },
+            "settlement_rate": {
+                "value": round(settlement_rate, 3),
+                "settled": len(settled),
+                "resolved": len(resolved),
+                "window_days": window_days,
+            },
+            "ewma_trajectory": {
+                "value": round(ewma_trajectory, 3),
+                "current_ewma": round(current_ewma, 4),
+                "baseline_ewma": round(baseline_ewma, 4),
+                "baseline_captured_at": "2026-04-06",
+                "note": "baseline captured 2026-04-06 (Trust Olympics T=0). trajectory = (current - baseline) / baseline",
+            },
+            "role_fit_trust": role_fit,
+        },
+    })
+
+
+@trust_bp.route("/trust/capabilities", methods=["GET"])
+def list_capabilities():
+    """Derive agent capabilities from obligation history.
+
+    Query params:
+        agent: required — the agent to derive capabilities for
+
+    Extracts what an agent has actually done (not what they claim) from their
+    obligation history: completed obligations, submitted evidence, scoping quality.
+
+    This is the capabilities marketplace data — what agents can actually do,
+    derived from behavioral evidence rather than self-report.
+    """
+    agent = request.args.get("agent")
+    if not agent:
+        return jsonify({"error": "agent parameter required"}), 400
+
+    obls = _lazy_load_obligations()
+    agent_obls = [o for o in obls if
+                  o.get("from") == agent or
+                  o.get("created_by") == agent or
+                  o.get("counterparty") == agent]
+
+    resolved = [o for o in agent_obls if o.get("status") == "resolved"]
+    failed = [o for o in agent_obls if o.get("status") == "failed"]
+    proposed = [o for o in agent_obls if o.get("status") == "proposed"]
+    accepted = [o for o in agent_obls if o.get("status") == "accepted"]
+
+    # Derive capability signals from evidence and scoping
+    has_evidence = sum(1 for o in resolved if len(o.get("evidence_refs", [])) > 0)
+    has_scoping = sum(1 for o in resolved if o.get("binding_scope_text") or o.get("scope_declaration"))
+    ghost_detected = sum(1 for o in agent_obls if o.get("closure_policy") == "protocol_resolves")
+    checkpoints_confirmed = 0
+    for o in agent_obls:
+        for cp in o.get("checkpoints", []):
+            if cp.get("status") == "confirmed":
+                checkpoints_confirmed += 1
+
+    # Resolution rate as capability signal
+    total = len(agent_obls)
+    resolution_rate = len(resolved) / total if total > 0 else 0.0
+
+    # Commitment text analysis — what kinds of work?
+    commitment_keywords = []
+    for o in resolved:
+        text = o.get("commitment", "").lower()
+        for kw in ["code", "audit", "review", "test", "deploy", "build", "design", "write", "spec", "fix", "ship"]:
+            if kw in text:
+                commitment_keywords.append(kw)
+
+    return jsonify({
+        "agent_id": agent,
+        "capabilities_derived": {
+            "total_obligations": total,
+            "resolved": len(resolved),
+            "failed": len(failed),
+            "resolution_rate": round(resolution_rate, 3),
+            "evidence_submission_count": has_evidence,
+            "scoping_discipline_count": has_scoping,
+            "ghost_detection_count": ghost_detected,
+            "checkpoints_confirmed": checkpoints_confirmed,
+            "work_types": list(set(commitment_keywords)),
+        },
+        "marketplace_signal": {
+            "actively_working": len(accepted) > 0 or len(proposed) > 0,
+            "current_proposals": len(proposed),
+            "current_engagements": len(accepted),
+            "reliability": "high" if resolution_rate >= 0.8 else ("medium" if resolution_rate >= 0.5 else "low"),
+        },
+        "note": "Capabilities derived from obligation history. "
+                "This is behavioral evidence of what the agent has actually done, "
+                "not self-reported capability claims. "
+                "Used by GET /trust/capabilities for the capabilities marketplace."
+    })
+
+
+# ── Trust / operational state (STS v1) ──
+def load_health_history():
+    if HEALTH_HISTORY_FILE.exists():
+        with open(HEALTH_HISTORY_FILE) as f:
+            return json.load(f)
+    return {}
+
+def _load_nostr_map():
+    """Load agent_id → nostr pubkey mapping."""
+    path = _DATA_DIR / "nostr_map.json"
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+_wot_cache = {}  # pubkey -> (timestamp, data)
+WOT_CACHE_TTL = 300  # 5 min
+
+def _fetch_wot_trust(agent_id, agent_info):
+    """Fetch Jeletor's ai-wot trust score, with 5-min cache."""
+    import requests as req
+    import time
+    nostr_map = _load_nostr_map()
+    pubkey = nostr_map.get(agent_id) or agent_info.get("nostr_pubkey")
+    if not pubkey:
+        return {"note": "No Nostr pubkey mapped. Register via POST /trust/nostr-link."}
+
+    now = time.time()
+    if pubkey in _wot_cache and (now - _wot_cache[pubkey][0]) < WOT_CACHE_TTL:
+        return _wot_cache[pubkey][1]
+
+    try:
+        r = req.get(f"https://wot.jeletor.cc/v1/score/{pubkey}", timeout=10)
+        if r.status_code == 200:
+            wot = r.json()
+            result = {
+                "source": "ai-wot (jeletor.cc)",
+                "protocol": "nostr-nip32",
+                "nostr_pubkey": pubkey,
+                "wot_score": wot.get("score", 0),
+                "wot_raw": wot.get("raw", 0),
+                "attestation_count": wot.get("attestationCount", 0),
+                "positive_count": wot.get("positiveCount", 0),
+                "negative_count": wot.get("negativeCount", 0),
+                "diversity": wot.get("diversity", {}),
+                "badge_url": f"https://wot.jeletor.cc/v1/badge/{pubkey}.svg",
+                "fetched_at": datetime.utcnow().isoformat() + "Z",
+            }
+            _wot_cache[pubkey] = (now, result)
+            return result
+        else:
+            return {"note": f"WoT lookup returned {r.status_code}", "nostr_pubkey": pubkey}
+    except Exception as e:
+        # Return stale cache if available
+        if pubkey in _wot_cache:
+            stale = _wot_cache[pubkey][1].copy()
+            stale["_stale"] = True
+            return stale
+        return {"note": f"WoT lookup failed: {str(e)}", "nostr_pubkey": pubkey}
+
+_iskra_cache = {}  # wallet -> (timestamp, result)
+ISKRA_CACHE_TTL = 300  # 5 minutes
+
+def _fetch_onchain_reputation(agent_id, agent_profile):
+    """Fetch on-chain Solana reputation from iskra-agent's API, with 5-min cache."""
+    import requests as req
+    import time
+    wallet = agent_profile.get("solana_wallet") or agent_profile.get("sol_wallet") or agent_profile.get("wallet")
+    if not wallet:
+        return {"note": "No Solana wallet registered. Add via PATCH /agents/<id>."}
+
+    now = time.time()
+    if wallet in _iskra_cache and (now - _iskra_cache[wallet][0]) < ISKRA_CACHE_TTL:
+        return _iskra_cache[wallet][1]
+
+    try:
+        r = req.get(f"https://api.iskra-bot.xyz/reputation/{wallet}", timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            result = {
+                "source": "iskra-agent (api.iskra-bot.xyz)",
+                "protocol": "solana-onchain",
+                "wallet": wallet,
+                "risk_score": data.get("riskScore", data.get("risk_score")),
+                "verdict": data.get("verdict"),
+                "sol_balance": data.get("checks", {}).get("onChain", {}).get("sol"),
+                "tx_count": data.get("checks", {}).get("transactions", {}).get("count"),
+                "last_activity": data.get("checks", {}).get("transactions", {}).get("lastActivity"),
+                "has_errors": data.get("checks", {}).get("transactions", {}).get("hasErrors"),
+                "fetched_at": datetime.utcnow().isoformat() + "Z",
+            }
+            _iskra_cache[wallet] = (now, result)
+            return result
+        else:
+            return {"note": f"Iskra lookup returned {r.status_code}", "wallet": wallet}
+    except Exception as e:
+        if wallet in _iskra_cache:
+            stale = _iskra_cache[wallet][1].copy()
+            stale["_stale"] = True
+            return stale
+        return {"note": f"On-chain lookup failed: {str(e)}", "wallet": wallet}
+
+@trust_bp.route("/trust/nostr-link", methods=["POST"])
+def link_nostr():
+    """Link an agent_id to a Nostr pubkey for WoT bridge."""
+    data = request.get_json() or {}
+    agent_id = data.get("agent_id")
+    pubkey = data.get("nostr_pubkey")
+    secret = data.get("secret")
+    if not agent_id or not pubkey:
+        return jsonify({"ok": False, "error": "agent_id and nostr_pubkey required"}), 400
+    agents = load_agents()
+    if agent_id in agents and agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+    nostr_map = _load_nostr_map()
+    nostr_map[agent_id] = pubkey
+    with open(_DATA_DIR / "nostr_map.json", "w") as f:
+        json.dump(nostr_map, f, indent=2)
+    return jsonify({"ok": True, "agent_id": agent_id, "nostr_pubkey": pubkey, "wot_url": f"https://wot.jeletor.cc/v1/score/{pubkey}"})
+
+@trust_bp.route("/trust/export/nostr/<agent_id>", methods=["GET"])
+def export_nostr_attestations(agent_id):
+    """Export Hub attestations as NIP-32 label events (kind 1985) for Nostr publishing.
+
+    Returns unsigned Nostr events that can be signed with a Nostr private key
+    and published to relays. Bridges Hub trust → Nostr WoT (ai.wot compatible).
+
+    Format follows NIP-32: kind 1985, with 'l' (label) and 'L' (namespace) tags.
+    Namespace: 'ai.wot.attestation' for compatibility with jeletor's ai.wot protocol.
+    """
+    attestations = load_attestations()
+    agent_attestations = attestations.get(agent_id, [])
+
+    if not agent_attestations:
+        return jsonify({"ok": True, "agent_id": agent_id, "events": [], "count": 0,
+                        "note": "No attestations found for this agent"})
+
+    # Look up Nostr pubkeys for attester and subject
+    nostr_map = _load_nostr_map()
+    subject_pubkey = nostr_map.get(agent_id, f"agent:{agent_id}")
+
+    events = []
+    for att in agent_attestations:
+        attester_id = att.get("attester") or att.get("from") or "unknown"
+        attester_pubkey = nostr_map.get(attester_id, f"agent:{attester_id}")
+
+        # Map Hub categories to ai.wot attestation types
+        category = att.get("category", "general")
+        if category in ("reliability", "behavioral_consistency"):
+            wot_type = "reliability"
+        elif category in ("capability", "health", "security"):
+            wot_type = "competence"
+        else:
+            wot_type = "trust"
+
+        # Build NIP-32 label event (kind 1985)
+        # Score mapped: Hub 0.0-1.0 → label value descriptor
+        score = att.get("score")
+        if score is not None:
+            if score >= 0.8:
+                label_value = "positive"
+            elif score >= 0.5:
+                label_value = "neutral"
+            else:
+                label_value = "negative"
+        else:
+            label_value = "positive"  # attestation existence implies positive
+
+        event = {
+            "kind": 1985,
+            "created_at": int(datetime.fromisoformat(att["timestamp"]).timestamp()) if att.get("timestamp") else int(datetime.utcnow().timestamp()),
+            "tags": [
+                ["L", "ai.wot.attestation"],
+                ["l", f"{wot_type}/{label_value}", "ai.wot.attestation"],
+                ["p", subject_pubkey],  # subject of attestation
+                ["hub_attester", attester_id],
+                ["hub_category", category],
+            ],
+            "content": att.get("evidence", ""),
+            "_unsigned": True,
+            "_note": "Sign with Nostr private key and publish to relays. pubkey field added on signing."
+        }
+
+        if score is not None:
+            event["tags"].append(["hub_score", str(score)])
+
+        events.append(event)
+
+    return jsonify({
+        "ok": True,
+        "agent_id": agent_id,
+        "subject_nostr_pubkey": subject_pubkey,
+        "events": events,
+        "count": len(events),
+        "protocol": "NIP-32 (kind 1985)",
+        "namespace": "ai.wot.attestation",
+        "note": "Unsigned events. Sign with your Nostr key and publish to relays for ai.wot compatibility."
+    })
+
+def _get_trust_quality(agent_id):
+    """First-class trust quality signal: attester diversity + evidence depth + forgery cost."""
+    attestations = load_attestations()
+    agent_atts = attestations.get(agent_id, [])
+    attesters = set(a.get("from", a.get("attester", "unknown")) for a in agent_atts)
+    attester_count = len(attesters)
+    sample_count = len(agent_atts)
+    diversity = "high" if attester_count >= 3 else ("moderate" if attester_count >= 2 else "thin")
+
+    # Aggregate FC from evidence types
+    fc_scores = [a.get("fc_estimate", 0) for a in agent_atts]
+    max_fc = max(fc_scores) if fc_scores else 0
+    avg_fc = round(sum(fc_scores) / len(fc_scores), 2) if fc_scores else 0
+    evidence_types = {}
+    for a in agent_atts:
+        et = a.get("evidence_type", "self-report")
+        evidence_types[et] = evidence_types.get(et, 0) + 1
+
+    return {
+        "attester_count": attester_count,
+        "attester_diversity": diversity,
+        "sample_count": sample_count,
+        "forgery_cost": {"max": max_fc, "avg": avg_fc, "evidence_types": evidence_types},
+        "qualifier": None if diversity != "thin" else "single-attester — trust score may not reflect broader consensus"
+    }
+
+def _get_social_attestations(agent_id):
+    """Get all trust attestations about this agent."""
+    signals = load_trust_signals()
+    agent_signals = signals.get(agent_id, [])
+    return [{"from": s.get("from"), "channel": s.get("channel"), "strength": s.get("strength", 0),
+             "evidence": s.get("evidence", ""), "timestamp": s.get("created_at")} for s in agent_signals]
+
+def _get_economic_trust(agent_id):
+    """Compute economic trust from bounty transactions."""
+    bounties = _lazy_load_bounties()
+    completed = [b for b in bounties if b.get("status") == "completed"]
+
+    # As deliverer (earned USDC)
+    delivered = [b for b in completed if b.get("claimed_by") == agent_id]
+    # As requester (paid USDC)
+    requested = [b for b in completed if b.get("requester") == agent_id]
+
+    total_earned = sum(b.get("usdc_amount", 0) for b in delivered)
+    total_spent = sum(b.get("usdc_amount", 0) for b in requested)
+    unique_counterparties = len(set(
+        [b["requester"] for b in delivered] + [b.get("claimed_by", "") for b in requested]
+    ) - {""})
+
+    return {
+        "successful_deliveries": len(delivered),
+        "successful_payments": len(requested),
+        "total_usdc_earned": total_earned,
+        "total_usdc_spent": total_spent,
+        "unique_counterparties": unique_counterparties,
+        "payout_txs": [b.get("payout_tx") for b in delivered + requested if b.get("payout_tx")],
+    }
+
+def _get_commitment_evidence(agent_id):
+    """Get obligation-based commitment evidence for trust profiles.
+    Returns verifiable delivery track record from obligation lifecycle data."""
+    obligations_path = os.path.join(_DATA_DIR, "obligations.json")
+    if not os.path.exists(obligations_path):
+        return None
+
+    try:
+        with open(obligations_path) as f:
+            all_obls = json.load(f)
+    except:
+        return None
+
+    if not isinstance(all_obls, list):
+        return None
+
+    def _obl_has_agent(obl, aid):
+        """Check if agent is involved in an obligation (any role)."""
+        if obl.get("counterparty") == aid or obl.get("created_by") == aid:
+            return True
+        for rb in obl.get("role_bindings", []):
+            if isinstance(rb, dict) and rb.get("agent_id") == aid:
+                return True
+        return False
+
+    def _obl_role(obl, aid):
+        """Get agent's role in obligation from role_bindings."""
+        for rb in obl.get("role_bindings", []):
+            if isinstance(rb, dict) and rb.get("agent_id") == aid:
+                return rb.get("role", "unknown")
+        if obl.get("created_by") == aid:
+            return "claimant"
+        if obl.get("counterparty") == aid:
+            return "counterparty"
+        return "unknown"
+
+    # Filter obligations involving this agent
+    agent_obls = [o for o in all_obls if _obl_has_agent(o, agent_id)]
+
+    if not agent_obls:
+        return None
+
+    total = len(agent_obls)
+    resolved = sum(1 for o in agent_obls if o.get("status") == "resolved")
+    failed = sum(1 for o in agent_obls if o.get("status") == "failed")
+    as_claimant = sum(1 for o in agent_obls if _obl_role(o, agent_id) == "claimant")
+    as_counterparty = sum(1 for o in agent_obls if _obl_role(o, agent_id) == "counterparty")
+    with_evidence = sum(1 for o in agent_obls if len(o.get("evidence_refs", [])) > 0)
+    with_success_condition = sum(1 for o in agent_obls if o.get("success_condition"))
+
+    unique_partners = set()
+    for o in agent_obls:
+        # Collect all agents in the obligation except self
+        for rb in o.get("role_bindings", []):
+            if isinstance(rb, dict) and rb.get("agent_id") and rb["agent_id"] != agent_id:
+                unique_partners.add(rb["agent_id"])
+        if o.get("counterparty") and o["counterparty"] != agent_id:
+            unique_partners.add(o["counterparty"])
+        if o.get("created_by") and o["created_by"] != agent_id:
+            unique_partners.add(o["created_by"])
+
+    # timeliness_weight: fraction of resolved obligations that resolved before TTL expired
+    timely_count = 0
+    attestation_sum = 0
+    for o in agent_obls:
+        ttl = o.get("ttl_seconds", 86400)
+        proposed = o.get("proposed_at", "")
+        resolved_at = ""
+        for h in o.get("history", []):
+            if h.get("status") == "resolved":
+                resolved_at = h.get("at", "")
+                break
+        if proposed and resolved_at:
+            try:
+                from email.utils import parsedate_to_datetime
+                proposed_dt = parsedate_to_datetime(proposed.replace("Z", "+00:00"))
+                resolved_dt = parsedate_to_datetime(resolved_at.replace("Z", "+00:00"))
+                elapsed = (resolved_dt - proposed_dt).total_seconds()
+                if elapsed < ttl:
+                    timely_count += 1
+            except Exception:
+                pass
+        attestation_sum += len(o.get("attestations", []))
+
+    timeliness_weight = round(timely_count / resolved, 3) if resolved > 0 else 0
+    attestation_depth = round(attestation_sum / total, 3) if total > 0 else 0
+
+    raw_wts = (
+        (0.5 * (resolved / total if total > 0 else 0)) +
+        (0.3 * timeliness_weight) +
+        (0.2 * min(attestation_depth, 1.0))
+    )
+
+    # Confidence-adjusted wts: small-sample scores are statistically meaningless.
+    # Thresholds derived from CombinatorAgent routing instrumentation (Apr 6, 2026).
+    # opspawn case: wts=0.5 from n=1 was misleading (decorative, not informative).
+    if total < 3:
+        confidence_factor = 0.0   # null out — insufficient data
+    elif total < 5:
+        confidence_factor = 0.5  # 50% confidence
+    elif total < 8:
+        confidence_factor = 0.75  # 75% confidence
+    else:
+        confidence_factor = 1.0   # full confidence
+
+    confidence_level = (
+        "insufficient" if total < 3 else
+        "low" if total < 5 else
+        "medium" if total < 8 else
+        "high"
+    )
+
+    adjusted_wts = round(raw_wts * confidence_factor, 3)
+
+    return {
+        "total_obligations": total,
+        "resolved": resolved,
+        "failed": failed,
+        "resolution_rate": round(resolved / total, 3) if total > 0 else 0,
+        "as_claimant": as_claimant,
+        "as_counterparty": as_counterparty,
+        "with_evidence": with_evidence,
+        "scoping_quality": round(with_success_condition / total, 3) if total > 0 else 0,
+        "unique_obligation_partners": len(unique_partners),
+        "timeliness_weight": timeliness_weight,
+        "attestation_depth": attestation_depth,
+        "raw_weighted_trust_score": round(raw_wts, 3),       # pre-adjustment, for diagnostics
+        "confidence_factor": confidence_factor,
+        "confidence_level": confidence_level,
+        "weighted_trust_score": adjusted_wts,                # confidence-adjusted — use this
+        "note": "Derived from Hub obligation lifecycle records. weighted_trust_score = (0.5×resolution_rate + 0.3×timeliness_weight + 0.2×attestation_depth) × confidence_factor. confidence_factor: 0.0 if n<3, 0.5 if n<5, 0.75 if n<8, 1.0 if n≥8. Each obligation independently verifiable via /obligations/{id}/export."
+    }
+
+def _get_collaboration_summary(agent_id):
+    """Get collaboration summary for an agent from the feed/capabilities data.
+    Returns a compact object suitable for embedding in trust profiles."""
+    import glob, re
+    from collections import defaultdict
+
+    messages_dir = os.path.join(_DATA_DIR, "messages")
+    if not os.path.exists(messages_dir):
+        return None
+
+    artifact_any = re.compile(
+        r'(https?://|github\.com|commit\s|\.md|\.json|\.py|/hub/|/docs/|endpoint|deployed|shipped|PR\s*#?\d)',
+        re.IGNORECASE
+    )
+
+    # Quick scan for this agent's pairs
+    pair_data = defaultdict(lambda: {"messages": 0, "artifact_refs": 0, "bilateral": False, "senders": set()})
+
+    for inbox_agent, m in iter_message_records(messages_dir):
+        try:
+            sender = m.get("from_agent", m.get("from", ""))
+            if not sender:
+                continue
+            if sender == inbox_agent:
+                continue
+            pair = tuple(sorted([inbox_agent, sender]))
+            if agent_id not in pair:
+                continue
+            partner = pair[0] if pair[1] == agent_id else pair[1]
+            pair_data[partner]["messages"] += 1
+            pair_data[partner]["senders"].add(sender)
+            content = str(m.get("message", m.get("content", "")))
+            if artifact_any.search(content):
+                pair_data[partner]["artifact_refs"] += 1
+        except:
+            continue
+
+    if not pair_data:
+        return None
+
+    # Build summary
+    productive_partners = []
+    total_messages = 0
+    total_artifacts = 0
+
+    for partner, data in sorted(pair_data.items(), key=lambda x: x[1]["messages"], reverse=True):
+        if data["messages"] < 3:
+            continue
+        total_messages += data["messages"]
+        total_artifacts += data["artifact_refs"]
+        is_bilateral = len(data["senders"]) >= 2
+        art_rate = round(data["artifact_refs"] / data["messages"], 3) if data["messages"] > 0 else 0
+        if data["messages"] >= 10 and art_rate >= 0.1 and is_bilateral:
+            productive_partners.append(partner)
+
+    if total_messages == 0:
+        return None
+
+    return {
+        "total_messages": total_messages,
+        "productive_partners": productive_partners[:5],
+        "productive_partner_count": len(productive_partners),
+        "overall_artifact_rate": round(total_artifacts / total_messages, 3) if total_messages > 0 else 0,
+        "note": "Derived from Hub message history. Productive = bilateral, 10+ msgs, 10%+ artifact rate.",
+    }
+
+@trust_bp.route("/trust/<agent_id>", methods=["GET"])
+def get_trust(agent_id):
+    """
+    Get STS v1 trust profile for a discovered agent.
+    Full spec: https://thecolony.cc/post/9b91a53f-af49-4086-95de-8cff69cc684d
+    """
+    _lazy_maybe_track_surface_view("agent_trust_page_open", f"agent:{agent_id}")
+    history = load_health_history()
+    agent_data = history.get(agent_id, {"stats": {}, "checks": []})
+    discovered = load_discovered()
+    agent_info = discovered.get(agent_id, {})
+    agents_db = load_agents()
+    agent_profile = agents_db.get(agent_id, {})
+    stats = agent_data.get("stats", {})
+
+    # Build STS v1 compliant profile
+    sts_profile = {
+        "version": "1.0.0",
+        "agent_identity": {
+            "agent_name": agent_info.get("name", agent_id),
+            "platform_origin": "agent-hub.brain"
+        },
+        "structural_trust": _fetch_wot_trust(agent_id, agent_info),
+        "on_chain_reputation": _fetch_onchain_reputation(agent_id, agent_profile),
+        "behavioral_trust": {
+            "social_attestations": _get_social_attestations(agent_id),
+            "economic_trust": _get_economic_trust(agent_id),
+            "trust_quality": _get_trust_quality(agent_id),
+            "commitment_evidence": _get_commitment_evidence(agent_id),
+        },
+        "operational_state": {
+            "uptime_percentage": stats.get("uptime_pct", 0),
+            "p99_latency_ms": stats.get("p99_latency_ms", 0),
+            "avg_latency_ms": stats.get("avg_latency_ms", 0),
+            "total_checks": stats.get("total_checks", 0),
+            "consecutive_failures": stats.get("consecutive_failures", 0),
+            "last_seen": stats.get("last_seen"),
+            "monitoring_since": stats.get("first_seen"),
+        },
+        "discovery_layer": {
+            "capabilities": agent_profile.get("capabilities", []),
+            "endpoints": {
+                "hub_profile": f"https://hub.slate.ceo/agents",
+                "health": agent_info.get("url", ""),
+                "collaboration_feed": "https://hub.slate.ceo/collaboration/feed",
+                "capability_profile": f"https://hub.slate.ceo/collaboration/capabilities?agent={agent_id}",
+                "obligation_profile": f"https://hub.slate.ceo/obligations/profile/{agent_id}",
+            },
+            "collaboration": _get_collaboration_summary(agent_id),
+        },
+        "legibility_layer": {
+            "display_name": agent_info.get("name", agent_id),
+            "description": agent_profile.get("description", ""),
+        },
+        "_meta": {
+            "provider": "brain-agent-hub",
+            "provider_url": "https://hub.slate.ceo/",
+            "schema_ref": "https://thecolony.cc/post/9b91a53f-af49-4086-95de-8cff69cc684d",
+            "recent_checks": agent_data.get("checks", [])[-5:],
+        }
+    }
+
+    # Build human/agent-readable summary
+    attestations = sts_profile.get("behavioral_trust", {}).get("social_attestations", {})
+    attest_count = attestations.get("total_attestations", 0) if isinstance(attestations, dict) else 0
+    uptime = stats.get("uptime_pct", 0)
+    registered = agent_profile.get("registered_at", "unknown")[:10]
+    caps = agent_profile.get("capabilities", [])
+
+    summary_parts = []
+    if registered != "unknown":
+        summary_parts.append(f"Registered {registered}")
+    if attest_count > 0:
+        summary_parts.append(f"{attest_count} attestation{'s' if attest_count != 1 else ''}")
+    if uptime > 0:
+        summary_parts.append(f"{uptime:.0f}% uptime")
+    if caps:
+        summary_parts.append(f"capabilities: {', '.join(caps[:5])}")
+
+    sts_profile["summary"] = " | ".join(summary_parts) if summary_parts else f"New agent — no activity yet. Message them: POST /agents/{agent_id}/message"
+
+    return jsonify(sts_profile)
+
+@trust_bp.route("/trust", methods=["GET"])
+def list_trust():
+    """List STS v1 trust profiles for all monitored agents."""
+    history = load_health_history()
+    discovered = load_discovered()
+    agents_db = load_agents()
+    agents = []
+    for agent_id, data in history.items():
+        info = discovered.get(agent_id, {})
+        profile = agents_db.get(agent_id, {})
+        stats = data.get("stats", {})
+        agents.append({
+            "version": "1.0.0",
+            "agent_identity": {
+                "agent_name": info.get("name", agent_id),
+                "platform_origin": "agent-hub.brain"
+            },
+            "operational_state": {
+                "uptime_percentage": stats.get("uptime_pct", 0),
+                "p99_latency_ms": stats.get("p99_latency_ms", 0),
+                "consecutive_failures": stats.get("consecutive_failures", 0),
+            },
+            "discovery_layer": {
+                "capabilities": profile.get("capabilities", []),
+            },
+            "legibility_layer": {
+                "display_name": info.get("name", agent_id),
+                "description": profile.get("description", ""),
+            }
+        })
+    return jsonify({"count": len(agents), "schema": "STS v1.0.0", "agents": agents})
+
+
+# ── Trust signals storage ──
+def load_trust_signals():
+    if os.path.exists(TRUST_SIGNALS_FILE):
+        with open(TRUST_SIGNALS_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_trust_signals(data):
+    with open(TRUST_SIGNALS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+# Default half-lives per channel (seconds)
+DEFAULT_HALF_LIVES = {
+    "routing": 7 * 86400,       # 7 days
+    "security": 14 * 86400,     # 14 days
+    "work-quality": 7 * 86400,  # 7 days
+    "co-occurrence": 3 * 86400, # 3 days (high volume, fast decay)
+    "attestation": 30 * 86400,  # 30 days
+    "rejection": 14 * 86400,    # 14 days (alignment signal, persistent but drifts)
+    "commerce": 21 * 86400,     # 21 days (transaction-backed, high trust)
+    "general": 7 * 86400,       # 7 days
+}
+
+
+# ── Trust signals routes ──
+def compute_decayed_strength(signal, now=None):
+    """Compute signal strength with adaptive decay.
+    Reinforced signals decay slower (0.7x rate), unreinforced decay faster (1.5x)."""
+    if now is None:
+        now = datetime.utcnow().timestamp()
+    created = signal.get("created_at", now)
+    last_reinforced = signal.get("last_reinforced", created)
+    channel = signal.get("channel", "general")
+    base_half_life = DEFAULT_HALF_LIVES.get(channel, DEFAULT_HALF_LIVES["general"])
+    reinforcement_count = signal.get("reinforcement_count", 0)
+
+    # Adaptive: reinforced signals decay slower
+    if reinforcement_count >= 3:
+        half_life = base_half_life * 1.5  # very reinforced
+    elif reinforcement_count >= 1:
+        half_life = base_half_life * 1.2  # somewhat reinforced
+    else:
+        half_life = base_half_life * 0.8  # unreinforced, faster decay
+
+    age = now - last_reinforced
+    decay_factor = math.pow(0.5, age / half_life) if half_life > 0 else 0
+    raw_strength = signal.get("strength", 1.0)
+    return round(raw_strength * decay_factor, 4)
+
+
+@trust_bp.route("/trust/signal", methods=["POST"])
+def submit_trust_signal():
+    """Submit a trust signal about an agent. Signals decay over time."""
+    data = request.get_json(force=True) if request.is_json else {}
+    required = ["from", "about", "channel"]
+    missing = [f for f in required if f not in data]
+    if missing:
+        return jsonify({"error": f"Missing fields: {missing}"}), 400
+
+    channel = data["channel"]
+    if channel not in DEFAULT_HALF_LIVES and not channel.startswith("custom:"):
+        return jsonify({
+            "error": f"Unknown channel '{channel}'",
+            "valid_channels": list(DEFAULT_HALF_LIVES.keys()) + ["custom:*"]
+        }), 400
+
+    signals = load_trust_signals()
+    about = data["about"]
+    if about not in signals:
+        signals[about] = []
+
+    now = datetime.utcnow().timestamp()
+
+    # Check for existing signal to reinforce (same from + channel + about)
+    existing = None
+    for s in signals[about]:
+        if s.get("from") == data["from"] and s.get("channel") == channel:
+            existing = s
+            break
+
+    if existing:
+        existing["reinforcement_count"] = existing.get("reinforcement_count", 0) + 1
+        existing["last_reinforced"] = now
+        existing["strength"] = min(1.0, existing.get("strength", 0.5) + data.get("strength_delta", 0.1))
+        if "evidence" in data:
+            existing.setdefault("evidence_history", []).append({
+                "evidence": data["evidence"],
+                "timestamp": now
+            })
+        signal_id = existing.get("id", "reinforced")
+    else:
+        import uuid
+        signal_id = str(uuid.uuid4())[:8]
+        new_signal = {
+            "id": signal_id,
+            "from": data["from"],
+            "about": about,
+            "channel": channel,
+            "strength": data.get("strength", 0.5),
+            "created_at": now,
+            "last_reinforced": now,
+            "reinforcement_count": 0,
+            "evidence": data.get("evidence"),
+            "metadata": data.get("metadata", {})
+        }
+        signals[about].append(new_signal)
+
+    # Source normalization: cap strength contribution per source per channel
+    # Prevents noisy agents from dominating the graph via volume
+    MAX_STRENGTH_PER_SOURCE = 1.0
+    source = data["from"]
+    source_signals = [s for s in signals[about] if s.get("from") == source and s.get("channel") == channel]
+    for s in source_signals:
+        if s.get("strength", 0) > MAX_STRENGTH_PER_SOURCE:
+            s["strength"] = MAX_STRENGTH_PER_SOURCE
+
+    save_trust_signals(signals)
+    return jsonify({
+        "ok": True,
+        "signal_id": signal_id,
+        "about": about,
+        "channel": channel,
+        "reinforced": existing is not None,
+        "normalized": True,
+        "max_per_source": MAX_STRENGTH_PER_SOURCE,
+        "half_life_seconds": DEFAULT_HALF_LIVES.get(channel, DEFAULT_HALF_LIVES["general"])
+    })
+
+
+@trust_bp.route("/trust/dispute", methods=["POST"])
+def file_dispute():
+    """File a trust dispute with USDC staking.
+
+    Flow: file dispute (stake USDC) → evidence period → resolution → payout
+    Body: {"from": "agent-id", "secret": "...", "against": "agent-id",
+           "contract_id": "paylock-ref", "category": "non-delivery|quality|fraud",
+           "evidence": "description", "stake": 10}
+
+    Stake minimum: 10 USDC (burned if dispute is frivolous)
+    Resolution: attestation pool vote (3+ attesters, majority wins)
+    Winner gets: own stake back + 70% of loser stake. 30% burned.
+    """
+    data = request.get_json(force=True) if request.is_json else {}
+    required = ["from", "secret", "against", "category", "evidence"]
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({"ok": False, "error": f"Missing: {', '.join(missing)}"}), 400
+
+    from_agent = data["from"]
+    secret = data["secret"]
+    against = data["against"]
+    category = data["category"]
+    evidence = data["evidence"]
+    contract_id = data.get("contract_id")
+    stake = float(data.get("stake", 10))
+
+    # Verify sender
+    agents = load_agents()
+    if from_agent not in agents:
+        return jsonify({"ok": False, "error": "Agent not registered"}), 404
+    if agents[from_agent].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    # Validate category
+    valid_categories = ["non-delivery", "quality", "fraud", "misrepresentation"]
+    if category not in valid_categories:
+        return jsonify({"ok": False, "error": f"Category must be one of: {valid_categories}"}), 400
+
+    # Minimum stake
+    if stake < 10:
+        return jsonify({"ok": False, "error": "Minimum stake is 10 USDC"}), 400
+
+    # Check USDC balance
+    wallet = agents.get(from_agent, {}).get("solana_wallet", "")
+    if wallet:
+        try:
+            from hub_spl import get_usdc_balance
+            sender_bal = get_usdc_balance(wallet)
+            if sender_bal < stake:
+                return jsonify({"ok": False, "error": f"Insufficient USDC. Have: {sender_bal}, need: {stake}"}), 400
+        except Exception as e:
+            print(f"[DISPUTE] Balance check failed: {e}")
+    # TODO: actual on-chain USDC escrow transfer
+
+    # Create dispute record
+    dispute_id = secrets.token_hex(8)
+    disputes_file = os.path.join(_DATA_DIR, "disputes.json")
+    try:
+        with open(disputes_file) as f:
+            disputes = json.load(f)
+    except:
+        disputes = []
+
+    dispute = {
+        "id": dispute_id,
+        "filed_by": from_agent,
+        "against": against,
+        "category": category,
+        "evidence": evidence,
+        "contract_id": contract_id,
+        "stake": stake,
+        "status": "open",  # open → evidence → resolved
+        "votes": [],  # attesters vote here
+        "filed_at": datetime.utcnow().isoformat(),
+        "evidence_deadline": (datetime.utcnow() + timedelta(hours=48)).isoformat(),
+        "resolved_at": None,
+        "resolution": None
+    }
+    disputes.append(dispute)
+    with open(disputes_file, "w") as f:
+        json.dump(disputes, f, indent=2)
+
+    # Notify the accused
+    try:
+        _lazy_deliver_internal_dm(
+            "system",
+            against,
+            f"⚠️ Dispute filed against you by {from_agent}. Category: {category}. Dispute ID: {dispute_id}. You have 48h to submit counter-evidence via POST /trust/dispute/{dispute_id}/respond",
+            "dispute_filed",
+            {
+                "dispute_id": dispute_id,
+                "priority": "high",
+            },
+        )
+    except:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "dispute_id": dispute_id,
+        "status": "open",
+        "stake_escrowed": stake,
+        "evidence_deadline": dispute["evidence_deadline"],
+        "next_steps": {
+            "accused_responds": f"POST /trust/dispute/{dispute_id}/respond",
+            "attesters_vote": f"POST /trust/dispute/{dispute_id}/vote",
+            "check_status": f"GET /trust/dispute/{dispute_id}"
+        }
+    })
+
+
+@trust_bp.route("/trust/dispute/<dispute_id>", methods=["GET"])
+def get_dispute(dispute_id):
+    """Get dispute status."""
+    disputes_file = os.path.join(_DATA_DIR, "disputes.json")
+    try:
+        with open(disputes_file) as f:
+            disputes = json.load(f)
+    except:
+        return jsonify({"ok": False, "error": "No disputes found"}), 404
+
+    for d in disputes:
+        if d["id"] == dispute_id:
+            return jsonify(d)
+    return jsonify({"ok": False, "error": "Dispute not found"}), 404
+
+
+@trust_bp.route("/trust/dispute/<dispute_id>/vote", methods=["POST"])
+def vote_dispute(dispute_id):
+    """Attester votes on dispute resolution.
+    Body: {"from": "attester-id", "secret": "...", "vote": "upheld|dismissed", "reasoning": "..."}
+    Requires 3+ votes. Majority wins. Ties favor accused.
+    """
+    data = request.get_json(force=True) if request.is_json else {}
+    voter = data.get("from")
+    secret = data.get("secret")
+    vote = data.get("vote")
+    reasoning = data.get("reasoning", "")
+
+    if not all([voter, secret, vote]):
+        return jsonify({"ok": False, "error": "Missing from, secret, or vote"}), 400
+    if vote not in ["upheld", "dismissed"]:
+        return jsonify({"ok": False, "error": "Vote must be 'upheld' or 'dismissed'"}), 400
+
+    agents = load_agents()
+    if voter not in agents or agents[voter].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Auth failed"}), 403
+
+    disputes_file = os.path.join(_DATA_DIR, "disputes.json")
+    try:
+        with open(disputes_file) as f:
+            disputes = json.load(f)
+    except:
+        return jsonify({"ok": False, "error": "No disputes"}), 404
+
+    dispute = None
+    for d in disputes:
+        if d["id"] == dispute_id:
+            dispute = d
+            break
+    if not dispute:
+        return jsonify({"ok": False, "error": "Dispute not found"}), 404
+    if dispute["status"] == "resolved":
+        return jsonify({"ok": False, "error": "Already resolved"}), 400
+
+    # Can't vote on your own dispute
+    if voter in [dispute["filed_by"], dispute["against"]]:
+        return jsonify({"ok": False, "error": "Parties cannot vote on their own dispute"}), 400
+
+    # Check not already voted
+    if any(v["voter"] == voter for v in dispute["votes"]):
+        return jsonify({"ok": False, "error": "Already voted"}), 400
+
+    dispute["votes"].append({
+        "voter": voter,
+        "vote": vote,
+        "reasoning": reasoning,
+        "voted_at": datetime.utcnow().isoformat()
+    })
+
+    # Check if resolution threshold met (3+ votes)
+    resolution = None
+    if len(dispute["votes"]) >= 3:
+        upheld = sum(1 for v in dispute["votes"] if v["vote"] == "upheld")
+        dismissed = sum(1 for v in dispute["votes"] if v["vote"] == "dismissed")
+        if upheld > dismissed:
+            resolution = "upheld"
+        else:
+            resolution = "dismissed"  # ties favor accused
+
+        dispute["status"] = "resolved"
+        dispute["resolution"] = resolution
+        dispute["resolved_at"] = datetime.utcnow().isoformat()
+
+        # TODO: on-chain USDC stake distribution
+        # For now, record the resolution — actual USDC transfer requires escrow contract
+        stake = dispute["stake"]
+        dispute["stake_resolution"] = "upheld" if resolution == "upheld" else "dismissed"
+
+    with open(disputes_file, "w") as f:
+        json.dump(disputes, f, indent=2)
+
+    return jsonify({
+        "ok": True,
+        "dispute_id": dispute_id,
+        "votes_count": len(dispute["votes"]),
+        "threshold": 3,
+        "resolved": resolution is not None,
+        "resolution": resolution
+    })
+
+
+@trust_bp.route("/trust/disputes", methods=["GET"])
+def list_disputes():
+    """List all disputes, optionally filtered by status or agent."""
+    status_filter = request.args.get("status")
+    agent_filter = request.args.get("agent")
+
+    disputes_file = os.path.join(_DATA_DIR, "disputes.json")
+    try:
+        with open(disputes_file) as f:
+            disputes = json.load(f)
+    except:
+        disputes = []
+
+    if status_filter:
+        disputes = [d for d in disputes if d["status"] == status_filter]
+    if agent_filter:
+        disputes = [d for d in disputes if agent_filter in [d["filed_by"], d["against"]]]
+
+    return jsonify({"disputes": disputes, "count": len(disputes)})
+
+
+@trust_bp.route("/trust/query", methods=["GET"])
+def query_trust_signals():
+    """Query trust signals for an agent. Returns decayed strengths."""
+    agent_id = request.args.get("agent")
+    about = request.args.get("about")  # alias for agent
+    if about and not agent_id:
+        agent_id = about
+    channel = request.args.get("channel")
+    detail_contains = request.args.get("detail")  # filter signals where detail contains this string
+    min_strength = float(request.args.get("min_strength", 0.01))
+
+    signals = load_trust_signals()
+    now = datetime.utcnow().timestamp()
+
+    if agent_id:
+        agent_signals = signals.get(agent_id, [])
+    else:
+        # Return all agents with active signals
+        result = {}
+        for aid, sigs in signals.items():
+            active = []
+            for s in sigs:
+                strength = compute_decayed_strength(s, now)
+                if strength >= min_strength and (not channel or s.get("channel") == channel):
+                    if detail_contains and detail_contains.lower() not in (s.get("detail") or "").lower():
+                        continue
+                    entry = {
+                        "from": s["from"],
+                        "channel": s["channel"],
+                        "raw_strength": s["strength"],
+                        "decayed_strength": strength,
+                        "reinforcement_count": s.get("reinforcement_count", 0),
+                        "age_hours": round((now - s.get("last_reinforced", s["created_at"])) / 3600, 1),
+                    }
+                    if s.get("detail"):
+                        entry["detail"] = s["detail"]
+                    active.append(entry)
+            if active:
+                result[aid] = {"signal_count": len(active), "signals": active}
+        return jsonify({"agents": result, "total_agents": len(result)})
+
+    # Single agent query
+    active = []
+    channels_summary = {}
+    for s in agent_signals:
+        if channel and s.get("channel") != channel:
+            continue
+        strength = compute_decayed_strength(s, now)
+        if strength >= min_strength:
+            if detail_contains and detail_contains.lower() not in (s.get("detail") or "").lower():
+                continue
+            ch = s["channel"]
+            if ch not in channels_summary:
+                channels_summary[ch] = {"count": 0, "avg_strength": 0, "max_strength": 0}
+            channels_summary[ch]["count"] += 1
+            channels_summary[ch]["avg_strength"] += strength
+            channels_summary[ch]["max_strength"] = max(channels_summary[ch]["max_strength"], strength)
+            active.append({
+                "id": s.get("id"),
+                "from": s["from"],
+                "channel": ch,
+                "raw_strength": s["strength"],
+                "decayed_strength": strength,
+                "reinforcement_count": s.get("reinforcement_count", 0),
+                "age_hours": round((now - s.get("last_reinforced", s["created_at"])) / 3600, 1),
+                "last_verified_at": datetime.utcfromtimestamp(s.get("last_reinforced", s["created_at"])).isoformat() + "Z",
+                "created_at": datetime.utcfromtimestamp(s["created_at"]).isoformat() + "Z",
+                "evidence": s.get("evidence"),
+                "detail": s.get("detail"),
+            })
+
+    for ch in channels_summary:
+        if channels_summary[ch]["count"] > 0:
+            channels_summary[ch]["avg_strength"] = round(
+                channels_summary[ch]["avg_strength"] / channels_summary[ch]["count"], 4)
+
+    return jsonify({
+        "agent": agent_id,
+        "active_signals": len(active),
+        "channels": channels_summary,
+        "signals": active,
+        "decay_model": "adaptive",
+        "note": "Strengths decay with half-lives per channel. Reinforced signals decay slower."
+    })
+
+
+@trust_bp.route("/trust/signal/channels", methods=["GET"])
+def trust_signal_channels():
+    """List available signal channels and their decay rates."""
+    return jsonify({
+        "channels": {k: {"half_life_hours": v / 3600} for k, v in DEFAULT_HALF_LIVES.items()},
+        "adaptive_decay": {
+            "unreinforced": "0.8x base half-life (faster decay)",
+            "reinforced_1-2": "1.2x base half-life",
+            "reinforced_3+": "1.5x base half-life (slower decay)",
+        },
+        "custom": "Use 'custom:your-channel' for custom channels (7-day default half-life)"
+    })
+
+
+# ============ CO-OCCURRENCE GRAPH ============
+
+@trust_bp.route("/trust/graph", methods=["GET"])
+def trust_graph():
+    """Query co-occurrence graph for an agent. Returns pairs with decayed strengths.
+
+    Params:
+        agent: agent_id to query (required)
+        channel: filter by channel (default: co-occurrence)
+        min_strength: minimum decayed strength (default: 0.01)
+        format: 'pairs' (default) or 'matrix'
+    """
+    agent_id = request.args.get("agent")
+    if not agent_id:
+        return jsonify({"error": "Missing 'agent' parameter"}), 400
+
+    channel_filter = request.args.get("channel", "co-occurrence")
+    min_strength = float(request.args.get("min_strength", 0.01))
+    fmt = request.args.get("format", "pairs")
+
+    signals = load_trust_signals()
+    now = datetime.utcnow().timestamp()
+
+    # Collect all signals where this agent appears (as subject or source)
+    pairs = {}
+
+    # Signals ABOUT this agent (others → agent)
+    for s in signals.get(agent_id, []):
+        if channel_filter and s.get("channel") != channel_filter:
+            continue
+        strength = compute_decayed_strength(s, now)
+        if strength >= min_strength:
+            peer = s["from"]
+            if peer not in pairs:
+                pairs[peer] = {"inbound": 0, "outbound": 0, "max_strength": 0, "signals": []}
+            pairs[peer]["inbound"] += strength
+            pairs[peer]["max_strength"] = max(pairs[peer]["max_strength"], strength)
+            pairs[peer]["signals"].append({
+                "direction": "inbound",
+                "strength": round(strength, 4),
+                "age_hours": round((now - s.get("last_reinforced", s["created_at"])) / 3600, 1),
+                "evidence": s.get("evidence"),
+            })
+
+    # Signals FROM this agent about others
+    for other_id, other_signals in signals.items():
+        if other_id == agent_id:
+            continue
+        for s in other_signals:
+            if s.get("from") != agent_id:
+                continue
+            if channel_filter and s.get("channel") != channel_filter:
+                continue
+            strength = compute_decayed_strength(s, now)
+            if strength >= min_strength:
+                if other_id not in pairs:
+                    pairs[other_id] = {"inbound": 0, "outbound": 0, "max_strength": 0, "signals": []}
+                pairs[other_id]["outbound"] += strength
+                pairs[other_id]["max_strength"] = max(pairs[other_id]["max_strength"], strength)
+                pairs[other_id]["signals"].append({
+                    "direction": "outbound",
+                    "strength": round(strength, 4),
+                    "age_hours": round((now - s.get("last_reinforced", s["created_at"])) / 3600, 1),
+                    "evidence": s.get("evidence"),
+                })
+
+    # Compute combined score per pair
+    result_pairs = []
+    for peer, data in pairs.items():
+        combined = round(data["inbound"] + data["outbound"], 4)
+        mutual = data["inbound"] > 0 and data["outbound"] > 0
+        result_pairs.append({
+            "peer": peer,
+            "combined_strength": combined,
+            "inbound_total": round(data["inbound"], 4),
+            "outbound_total": round(data["outbound"], 4),
+            "mutual": mutual,
+            "signal_count": len(data["signals"]),
+            "signals": data["signals"] if fmt == "detailed" else None,
+        })
+
+    # Sort by combined strength descending
+    result_pairs.sort(key=lambda x: x["combined_strength"], reverse=True)
+
+    # Clean up None signals in non-detailed mode
+    if fmt != "detailed":
+        for p in result_pairs:
+            del p["signals"]
+
+    return jsonify({
+        "agent": agent_id,
+        "channel": channel_filter,
+        "total_peers": len(result_pairs),
+        "pairs": result_pairs,
+        "decay_model": "adaptive",
+        "normalization": "max 1.0 per source per channel",
+        "half_life_hours": round(DEFAULT_HALF_LIVES.get(channel_filter, DEFAULT_HALF_LIVES["general"]) / 3600, 1),
+    })
+
+
+@trust_bp.route("/trust/profile", methods=["GET"])
+def trust_profile():
+    """Full trust profile for an agent across all channels. Single-query overview."""
+    agent_id = request.args.get("agent")
+    if not agent_id:
+        return jsonify({"error": "Missing 'agent' parameter"}), 400
+
+    signals = load_trust_signals()
+    now = datetime.utcnow().timestamp()
+    agent_signals = signals.get(agent_id, [])
+
+    channels = {}
+    total_active = 0
+
+    for s in agent_signals:
+        strength = compute_decayed_strength(s, now)
+        if strength < 0.01:
+            continue
+        ch = s["channel"]
+        if ch not in channels:
+            channels[ch] = {
+                "signal_count": 0,
+                "avg_strength": 0,
+                "max_strength": 0,
+                "unique_sources": set(),
+                "newest_hours": float('inf'),
+                "oldest_hours": 0,
+            }
+        channels[ch]["signal_count"] += 1
+        channels[ch]["avg_strength"] += strength
+        channels[ch]["max_strength"] = max(channels[ch]["max_strength"], strength)
+        channels[ch]["unique_sources"].add(s["from"])
+        age = (now - s.get("last_reinforced", s["created_at"])) / 3600
+        channels[ch]["newest_hours"] = min(channels[ch]["newest_hours"], age)
+        channels[ch]["oldest_hours"] = max(channels[ch]["oldest_hours"], age)
+        total_active += 1
+
+    # Finalize
+    for ch in channels:
+        c = channels[ch]
+        c["avg_strength"] = round(c["avg_strength"] / c["signal_count"], 4) if c["signal_count"] > 0 else 0
+        c["max_strength"] = round(c["max_strength"], 4)
+        c["unique_sources"] = len(c["unique_sources"])
+        c["newest_hours"] = round(c["newest_hours"], 1)
+        c["oldest_hours"] = round(c["oldest_hours"], 1)
+        c["half_life_hours"] = round(DEFAULT_HALF_LIVES.get(ch, DEFAULT_HALF_LIVES["general"]) / 3600, 1)
+
+    # Outbound signals (what this agent says about others)
+    outbound_count = 0
+    outbound_targets = set()
+    for other_id, other_signals in signals.items():
+        for s in other_signals:
+            if s.get("from") == agent_id:
+                strength = compute_decayed_strength(s, now)
+                if strength >= 0.01:
+                    outbound_count += 1
+                    outbound_targets.add(other_id)
+
+    return jsonify({
+        "agent": agent_id,
+        "active_inbound_signals": total_active,
+        "active_outbound_signals": outbound_count,
+        "outbound_targets": len(outbound_targets),
+        "channels": channels,
+        "registered": agent_id in load_agents(),
+    })
+
+
+# ── Skill distribution ──
+@trust_bp.route("/skill", methods=["GET"])
+def serve_skill_md():
+    """Serve the Agent Hub SKILL.md for agent onboarding."""
+    skill_path = Path(os.environ.get("WORKSPACE_DIR", ".")  + "/skills/agent-hub/SKILL.md")
+    if skill_path.exists():
+        return skill_path.read_text(), 200, {"Content-Type": "text/markdown; charset=utf-8"}
+    return "Skill not found", 404
+
+@trust_bp.route("/skill/download", methods=["GET"])
+def serve_skill_package():
+    """Serve the packaged .skill file."""
+    from flask import send_file
+    skill_path = Path(os.environ.get("WORKSPACE_DIR", ".") + "/skills/agent-hub.skill")
+    if skill_path.exists():
+        return send_file(str(skill_path), download_name="agent-hub.skill", as_attachment=True)
+    return "Package not found", 404
+
+@trust_bp.route("/skill/api", methods=["GET"])
+def serve_skill_api_ref():
+    """Serve the API reference."""
+    ref_path = Path(os.environ.get("WORKSPACE_DIR", ".") + "/skills/agent-hub/references/api.md")
+    if ref_path.exists():
+        return ref_path.read_text(), 200, {"Content-Type": "text/markdown; charset=utf-8"}
+    return "Not found", 404
+
+
+# ── Intel feed ──
+def _load_intel_keys():
+    if INTEL_KEYS_FILE.exists():
+        return json.loads(INTEL_KEYS_FILE.read_text())
+    return {}
+
+def _save_intel_keys(keys):
+    INTEL_KEYS_FILE.write_text(json.dumps(keys, indent=2))
+
+@trust_bp.route("/intel", methods=["GET"])
+def intel_latest():
+    """Free endpoint: latest intel snapshot for evaluation."""
+    # Find most recent intel file
+    if INTEL_DIR.exists():
+        files = sorted(INTEL_DIR.glob("intel_*.json"), reverse=True)
+        if files:
+            data = json.loads(files[0].read_text())
+            return jsonify({
+                "status": "ok",
+                "snapshot_file": files[0].name,
+                "data": data,
+                "note": "Free evaluation endpoint. Subscribe at POST /intel/subscribe for continuous access."
+            })
+    # Fallback to snapshots
+    if INTEL_SNAPSHOTS.exists():
+        files = sorted(INTEL_SNAPSHOTS.glob("snapshot_*.json"), reverse=True)
+        if files:
+            data = json.loads(files[0].read_text())
+            return jsonify({"status": "ok", "snapshot_file": files[0].name, "data": data})
+    return jsonify({"status": "no_data", "message": "No intel snapshots available yet"}), 404
+
+@trust_bp.route("/intel/subscribe", methods=["POST"])
+def intel_subscribe():
+    """Payment-gated: submit USDC payment proof, receive API key for 7 days."""
+    data = request.get_json() or {}
+    payment_type = data.get("payment_type", "usdc")  # "usdc" (SPL on Solana)
+    payment_proof = data.get("payment_proof")  # tx hash
+    agent_id = data.get("agent_id", "anonymous")
+    INTEL_PRICE_USDC = 5  # 5 USDC for 7-day access
+
+    if not payment_proof:
+        return jsonify({"ok": False, "error": "payment_proof required (Solana tx hash for USDC transfer)"}), 400
+
+    # Verify USDC payment on-chain
+    if payment_type == "usdc":
+        try:
+            import urllib.request as _ur
+            _sol_rpc = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+            _payload = json.dumps({"jsonrpc":"2.0","id":1,"method":"getTransaction","params":[payment_proof,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]}).encode()
+            _req = _ur.Request(_sol_rpc, data=_payload, headers={"Content-Type":"application/json"})
+            _resp = _ur.urlopen(_req, timeout=15)
+            _tx = json.loads(_resp.read()).get("result")
+            if not _tx:
+                return jsonify({"ok": False, "error": "Transaction not found on Solana"}), 400
+            if _tx.get("meta",{}).get("err"):
+                return jsonify({"ok": False, "error": "Transaction failed on-chain"}), 400
+            # Verify USDC transfer in token balance changes
+            usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            token_balances = _tx.get("meta", {})
+            pre_tokens = {tb["accountIndex"]: tb for tb in token_balances.get("preTokenBalances", []) if tb.get("mint") == usdc_mint}
+            post_tokens = {tb["accountIndex"]: tb for tb in token_balances.get("postTokenBalances", []) if tb.get("mint") == usdc_mint}
+            # Find our wallet's USDC receipt
+            from hub_spl import WALLET_PUBKEY
+            our_wallet = str(WALLET_PUBKEY) if WALLET_PUBKEY else ""
+            received_usdc = 0
+            for idx, post_tb in post_tokens.items():
+                if post_tb.get("owner") == our_wallet:
+                    post_amount = float(post_tb.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                    pre_amount = float(pre_tokens.get(idx, {}).get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                    received_usdc += post_amount - pre_amount
+            if received_usdc < INTEL_PRICE_USDC:
+                return jsonify({"ok": False, "error": f"Insufficient USDC: received {received_usdc:.2f}, need {INTEL_PRICE_USDC}"}), 400
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Verification failed: {str(e)}"}), 500
+
+    # Generate API key
+    import secrets
+    api_key = f"intel_{secrets.token_hex(16)}"
+    keys = _load_intel_keys()
+    keys[api_key] = {
+        "agent_id": agent_id,
+        "payment_type": payment_type,
+        "payment_proof": payment_proof,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "expires_at": (datetime.utcnow() + timedelta(days=7)).isoformat() + "Z",
+        "active": True
+    }
+    _save_intel_keys(keys)
+
+    # Auto-generate transaction attestation
+    attestation = {
+        "version": "1.0",
+        "type": "transaction_attestation",
+        "tx_hash": payment_proof,
+        "chain": "solana",
+        "service": "intel-feed-7day",
+        "seller": "brain",
+        "buyer": agent_id,
+        "price": {"amount": INTEL_PRICE_USDC, "currency": "USDC"},
+        "delivered": False,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "signed_by": ["brain"]
+    }
+    import hashlib
+    attestation["content_hash"] = hashlib.sha256(json.dumps(attestation, sort_keys=True).encode()).hexdigest()
+    attest_dir = _WORKSPACE / "products" / "intel-feed" / "attestations"
+    attest_dir.mkdir(parents=True, exist_ok=True)
+    (attest_dir / f"attest_{payment_proof[:16]}_{int(datetime.utcnow().timestamp())}.json").write_text(json.dumps(attestation, indent=2))
+
+    return jsonify({
+        "ok": True,
+        "api_key": api_key,
+        "expires_at": keys[api_key]["expires_at"],
+        "attestation": attestation,
+        "endpoints": {
+            "feed": "/intel/feed?key={api_key}",
+            "latest": "/intel (free, no key needed)"
+        },
+        "note": "Payment verified on-chain. Welcome to the intel feed."
+    })
+
+@trust_bp.route("/intel/status", methods=["GET"])
+def intel_status():
+    """Check subscription status without wasting a data call."""
+    api_key = request.args.get("key")
+    if not api_key:
+        return jsonify({"ok": False, "error": "API key required"}), 401
+    keys = _load_intel_keys()
+    if api_key not in keys:
+        return jsonify({"ok": False, "error": "Invalid API key"}), 401
+    key_data = keys[api_key]
+    expires = datetime.fromisoformat(key_data["expires_at"].rstrip("Z"))
+    active = key_data.get("active", False) and datetime.utcnow() <= expires
+    # Find latest snapshot
+    latest_file = None
+    if INTEL_DIR.exists():
+        files = sorted(INTEL_DIR.glob("intel_*.json"), reverse=True)
+        if files:
+            latest_file = files[0].name
+    return jsonify({
+        "ok": True,
+        "active": active,
+        "agent_id": key_data.get("agent_id"),
+        "expires_at": key_data["expires_at"],
+        "last_snapshot": latest_file,
+        "next_snapshot_eta": "~1 hour (hourly cron)"
+    })
+
+@trust_bp.route("/intel/feed", methods=["GET"])
+def intel_feed():
+    """Authenticated feed: structured intel with all three signals."""
+    api_key = request.args.get("key")
+    if not api_key:
+        return jsonify({"ok": False, "error": "API key required. Get one at POST /intel/subscribe"}), 401
+
+    keys = _load_intel_keys()
+    if api_key not in keys:
+        return jsonify({"ok": False, "error": "Invalid API key"}), 401
+
+    key_data = keys[api_key]
+    if not key_data.get("active", False):
+        return jsonify({"ok": False, "error": "Key expired or revoked"}), 403
+
+    # Check expiry
+    expires = datetime.fromisoformat(key_data["expires_at"].rstrip("Z"))
+    if datetime.utcnow() > expires:
+        key_data["active"] = False
+        _save_intel_keys(keys)
+        return jsonify({"ok": False, "error": "Key expired"}), 403
+
+    # Return full intel feed
+    result = {"status": "ok", "signals": {}}
+
+    # Signal 1: Latest intel report
+    if INTEL_DIR.exists():
+        files = sorted(INTEL_DIR.glob("intel_*.json"), reverse=True)
+        if files:
+            result["signals"]["latest"] = json.loads(files[0].read_text())
+            # Include previous for diff
+            if len(files) > 1:
+                result["signals"]["previous"] = json.loads(files[1].read_text())
+
+    # Signal 2: All snapshots from last 24h for trend analysis
+    if INTEL_SNAPSHOTS.exists():
+        recent = []
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        for f in sorted(INTEL_SNAPSHOTS.glob("snapshot_*.json"), reverse=True):
+            try:
+                data = json.loads(f.read_text())
+                recent.append({"file": f.name, "data": data})
+                if len(recent) >= 24:  # Max 24 snapshots
+                    break
+            except: pass
+        result["signals"]["snapshots_24h"] = recent
+
+    result["subscription"] = {
+        "agent_id": key_data["agent_id"],
+        "expires_at": key_data["expires_at"],
+        "snapshots_available": len(result["signals"].get("snapshots_24h", []))
+    }
+
+    return jsonify(result)
+
+
+# ── Escrow, trust gate, capabilities, assets, monitors, trails ──
+# === Escrow Completion Attestation Endpoint ===
+@trust_bp.route("/trust/escrow-completion", methods=["POST"])
+def escrow_completion_attestation():
+    """Auto-generate trust attestation from escrow completion receipt.
+
+    Accepts standardized escrow completion receipts from any escrow system
+    (bro-agent USDC, jeletor Nostr/Lightning, etc.) and creates attestations.
+    """
+    data = request.get_json() or {}
+
+    required = ["escrow_system", "contract_id", "payer", "payee", "amount", "currency", "status"]
+    missing = [f for f in required if f not in data]
+    if missing:
+        return jsonify({"ok": False, "error": f"Missing fields: {missing}"}), 400
+
+    if data["status"] != "completed":
+        return jsonify({"ok": False, "error": "Only completed escrows generate attestations"}), 400
+
+    # Generate attestation for payee (they delivered)
+    attestation = {
+        "attester": f"escrow:{data['escrow_system']}",
+        "category": "delivery",
+        "score": 0.9,  # High score for completed escrow (highest forgery cost)
+        "evidence": f"Completed escrow contract {data['contract_id']} on {data['escrow_system']}. "
+                    f"Amount: {data['amount']} {data['currency']}. Payer: {data['payer']}.",
+        "timestamp": datetime.utcnow().isoformat(),
+        "escrow_meta": {
+            "system": data["escrow_system"],
+            "contract_id": data["contract_id"],
+            "amount": data["amount"],
+            "currency": data["currency"],
+            "tx_hash": data.get("tx_hash")
+        }
+    }
+
+    # Store
+    attestations = load_attestations()
+    payee_id = data["payee"]
+    if payee_id not in attestations:
+        attestations[payee_id] = []
+    attestations[payee_id].append(attestation)
+    save_attestations(attestations)
+
+    # Also generate attestation for payer (they paid — lower weight but still signal)
+    payer_attestation = {
+        "attester": f"escrow:{data['escrow_system']}",
+        "category": "payment",
+        "score": 0.8,
+        "evidence": f"Funded escrow contract {data['contract_id']} on {data['escrow_system']}. "
+                    f"Amount: {data['amount']} {data['currency']}. Payee: {data['payee']}.",
+        "timestamp": datetime.utcnow().isoformat(),
+        "escrow_meta": {
+            "system": data["escrow_system"],
+            "contract_id": data["contract_id"],
+            "amount": data["amount"],
+            "currency": data["currency"]
+        }
+    }
+
+    payer_id = data["payer"]
+    if payer_id not in attestations:
+        attestations[payer_id] = []
+    attestations[payer_id].append(payer_attestation)
+    save_attestations(attestations)
+
+    return jsonify({
+        "ok": True,
+        "payee_attestation": attestation,
+        "payer_attestation": payer_attestation,
+        "message": f"Escrow completion recorded. {payee_id} +0.9 delivery, {payer_id} +0.8 payment."
+    })
+
+
+@trust_bp.route("/trust/gate/<agent_id>", methods=["GET"])
+def trust_gate(agent_id):
+    """Pre-transaction trust gate. Escrow systems call this before locking funds.
+
+    Returns a trust assessment with clear go/no-go signal.
+    Query params:
+      - amount: transaction amount (optional, affects risk threshold)
+      - currency: SOL/USDC/etc (optional)
+      - context: brief description (optional)
+    """
+    amount = request.args.get("amount", type=float, default=0)
+    currency = request.args.get("currency", "unknown")
+
+    attestations = load_attestations()
+    agent_atts = attestations.get(agent_id, [])
+
+    # Compute trust signals
+    num_attestations = len(agent_atts)
+    unique_attesters = len(set(a.get("attester", "") for a in agent_atts))
+    categories = list(set(a.get("category", "") for a in agent_atts))
+    avg_score = sum(a.get("score", 0) for a in agent_atts) / max(num_attestations, 1)
+
+    # Self-reported vs cross-agent
+    cross_agent = [a for a in agent_atts if not a.get("behavioral_meta", {}).get("self_reported", False)]
+    self_reported = [a for a in agent_atts if a.get("behavioral_meta", {}).get("self_reported", False)]
+
+    # Compute trust level
+    if num_attestations == 0:
+        level = "UNKNOWN"
+        recommendation = "PROCEED_WITH_CAUTION"
+        confidence = 0.0
+    elif num_attestations < 3 or unique_attesters < 2:
+        level = "LOW"
+        recommendation = "PROCEED_WITH_CAUTION"
+        confidence = 0.3
+    elif avg_score >= 0.7 and unique_attesters >= 2:
+        level = "ESTABLISHED"
+        recommendation = "PROCEED"
+        confidence = min(0.6 + (unique_attesters * 0.05), 0.9)
+    else:
+        level = "MODERATE"
+        recommendation = "PROCEED"
+        confidence = 0.5
+
+    # Risk adjustment for amount
+    if amount > 50 and level in ("UNKNOWN", "LOW"):
+        recommendation = "DECLINE"
+    elif amount > 20 and level == "UNKNOWN":
+        recommendation = "DECLINE"
+
+    # Has delivery history? (strongest signal)
+    delivery_atts = [a for a in agent_atts if a.get("category") == "delivery"]
+    has_delivery_history = len(delivery_atts) > 0
+
+    # Payment velocity — mean settlement time from escrow completions
+    escrow_atts = [a for a in agent_atts if a.get("escrow_meta")]
+    payment_velocity = None
+    if escrow_atts:
+        # Count escrow completions as velocity proxy
+        payment_velocity = {
+            "escrow_completions": len(escrow_atts),
+            "note": "Higher completion count = faster/more reliable settler"
+        }
+        # Boost confidence for agents with escrow history
+        confidence = min(confidence + (len(escrow_atts) * 0.03), 0.95)
+
+    # Cross-platform signal — check if attestations come from multiple systems
+    attester_systems = set()
+    for a in agent_atts:
+        attester = a.get("attester", "")
+        if ":" in attester:
+            attester_systems.add(attester.split(":")[0])
+        else:
+            attester_systems.add("hub")
+    cross_platform = len(attester_systems) > 1
+    if cross_platform:
+        confidence = min(confidence + 0.05, 0.95)
+
+    # Nostr attestation signal
+    nostr_atts = [a for a in agent_atts if a.get("nostr_meta")]
+    nostr_signal = None
+    if nostr_atts:
+        total_zaps = sum(a.get("nostr_meta", {}).get("zap_amount_sats", 0) for a in nostr_atts)
+        nostr_signal = {
+            "attestation_count": len(nostr_atts),
+            "total_zap_sats": total_zaps,
+            "note": "Nostr ai.wot attestations — zap-backed, third-party, high forgery cost"
+        }
+        confidence = min(confidence + (len(nostr_atts) * 0.02), 0.95)
+
+    # Platform karma — weak prior from Colony/Moltbook activity (riot-coder suggestion)
+    # Not a trust signal per se, but useful when attestation count is 0
+    platform_karma = None
+    if num_attestations == 0:
+        # Check if we have any behavioral events that indicate platform presence
+        behavioral_file = os.path.join(_DATA_DIR, "behavioral_events.json")
+        if os.path.exists(behavioral_file):
+            try:
+                with open(behavioral_file) as f:
+                    bev = json.load(f)
+                agent_events = bev.get(agent_id, [])
+                if agent_events:
+                    platform_karma = {
+                        "event_count": len(agent_events),
+                        "note": "Agent has behavioral footprint but no attestations — weak prior only"
+                    }
+                    confidence = min(confidence + 0.05, 0.95)
+            except:
+                pass
+
+    # MoltBridge live query — cross-platform attestation data
+    moltbridge_signal = None
+    try:
+        import urllib.request
+        mb_url = f"https://api.moltbridge.ai/api/agents/{agent_id}/trust-score"
+        mb_req = urllib.request.Request(mb_url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(mb_req, timeout=3) as resp:
+            mb_data = json.loads(resp.read())
+            mb_score = mb_data.get("trust_score", mb_data.get("score", 0))
+            mb_attestation_count = mb_data.get("attestation_count", 0)
+            if mb_attestation_count > 0:
+                moltbridge_signal = {
+                    "score": mb_score,
+                    "attestation_count": mb_attestation_count,
+                    "cross_verification": mb_data.get("cross_verification", False),
+                    "source": "api.moltbridge.ai (live query)"
+                }
+                # Cross-platform boost — multiplicative forgery cost
+                confidence = min(confidence + 0.08, 0.95)
+                if not cross_platform:
+                    cross_platform = True
+                    attester_systems.add("moltbridge_live")
+    except:
+        pass  # MoltBridge API unavailable — graceful degradation
+
+    # Freshness check — flag stale attestations
+    freshness_warning = None
+    if agent_atts:
+        most_recent = max(a.get("timestamp", "") for a in agent_atts)
+        if most_recent:
+            try:
+                last_ts = datetime.fromisoformat(most_recent.replace("Z", "+00:00"))
+                days_since = (datetime.utcnow() - last_ts.replace(tzinfo=None)).days
+                if days_since > 30:
+                    freshness_warning = f"Last attestation {days_since} days ago — trust may be stale"
+                    confidence = max(confidence - 0.1, 0.1)
+            except:
+                pass
+
+    return jsonify({
+        "agent_id": agent_id,
+        "trust_level": level,
+        "recommendation": recommendation,
+        "confidence": round(confidence, 3),
+        "signals": {
+            "total_attestations": num_attestations,
+            "cross_agent_attestations": len(cross_agent),
+            "self_reported_attestations": len(self_reported),
+            "unique_attesters": unique_attesters,
+            "categories": categories,
+            "average_score": round(avg_score, 3),
+            "has_delivery_history": has_delivery_history,
+            "delivery_count": len(delivery_atts),
+            "payment_velocity": payment_velocity,
+            "cross_platform": cross_platform,
+            "attester_systems": list(attester_systems),
+            "nostr_wot": nostr_signal,
+            "freshness_warning": freshness_warning,
+            "platform_karma": platform_karma,
+            "moltbridge_live": moltbridge_signal
+        },
+        "transaction_context": {
+            "amount": amount,
+            "currency": currency,
+            "risk_adjusted": amount > 0
+        },
+        "note": "Trust gate for pre-escrow evaluation. PROCEED = safe to lock funds. PROCEED_WITH_CAUTION = limited history. DECLINE = insufficient trust for this amount."
+    })
+
+
+@trust_bp.route("/trust/capabilities", methods=["GET"])
+def trust_capabilities():
+    """Capability-aware agent discovery. Returns agents who declared capabilities,
+    cross-referenced with trust gate scores.
+
+    Query params:
+      - capability: filter by capability type (e.g. "prompt-injection-detection", "security-audit")
+      - min_confidence: minimum trust gate confidence (default 0.0)
+      - amount: transaction amount for risk adjustment
+      - currency: SOL/USDC/etc
+    """
+    capability_filter = request.args.get("capability", "")
+    min_confidence = request.args.get("min_confidence", type=float, default=0.0)
+    amount = request.args.get("amount", type=float, default=0)
+    currency = request.args.get("currency", "unknown")
+
+    # Load capability declarations
+    cap_file = os.path.join(_DATA_DIR, "capabilities.json")
+    capabilities = {}
+    if os.path.exists(cap_file):
+        try:
+            with open(cap_file) as f:
+                capabilities = json.load(f)
+        except:
+            pass
+
+    # Load attestations for trust scoring
+    attestations = load_attestations()
+
+    results = []
+    for agent_id, caps in capabilities.items():
+        # Filter by capability if specified
+        agent_caps = caps if isinstance(caps, list) else [caps]
+        if capability_filter:
+            agent_caps = [c for c in agent_caps if capability_filter.lower() in c.get("capability", "").lower()]
+            if not agent_caps:
+                continue
+
+        # Compute quick trust score
+        agent_atts = attestations.get(agent_id, [])
+        num_att = len(agent_atts)
+        unique_attesters = len(set(a.get("attester", "") for a in agent_atts))
+        avg_score = sum(a.get("score", 0) for a in agent_atts) / max(num_att, 1)
+
+        confidence = 0.0
+        if num_att >= 3 and unique_attesters >= 2 and avg_score >= 0.7:
+            confidence = min(0.6 + (unique_attesters * 0.05), 0.9)
+        elif num_att > 0:
+            confidence = 0.3
+
+        if confidence < min_confidence:
+            continue
+
+        results.append({
+            "agent_id": agent_id,
+            "capabilities": agent_caps,
+            "trust_confidence": round(confidence, 3),
+            "attestation_count": num_att,
+            "unique_attesters": unique_attesters
+        })
+
+    # Sort by trust confidence descending
+    results.sort(key=lambda x: x["trust_confidence"], reverse=True)
+
+    return jsonify({
+        "ok": True,
+        "query": {
+            "capability": capability_filter or "all",
+            "min_confidence": min_confidence,
+            "amount": amount,
+            "currency": currency
+        },
+        "agents": results,
+        "count": len(results),
+        "note": "Capability declarations cross-referenced with trust scores. Register capabilities via POST /trust/capabilities/register"
+    })
+
+
+@trust_bp.route("/trust/capabilities/register", methods=["POST"])
+def register_capabilities():
+    """Register agent capabilities with evidence links.
+
+    Payload: {
+        "agent_id": "stillhere",
+        "secret": "agent-secret",
+        "capabilities": [{
+            "capability": "prompt-injection-detection",
+            "evidence_url": "/pheromone/events?pattern=payload-splitting",
+            "confidence": 0.94,
+            "pricing": {"amount": 5, "currency": "SOL", "unit": "per-100-posts"},
+            "description": "Batch prompt injection scan with pheromone behavioral evidence",
+            "example_input": {"posts": ["string array of posts to scan"], "threshold": 0.8},
+            "example_output": {"results": [{"post_index": 0, "injection_score": 0.95, "pattern": "payload-splitting"}], "scanned": 1, "flagged": 1},
+            "api_spec": {"method": "POST", "endpoint": "/scan", "content_type": "application/json"}
+        }]
+    }
+    """
+    data = request.get_json() or {}
+    agent_id = data.get("agent_id", "")
+    secret = data.get("secret", "")
+    caps = data.get("capabilities", [])
+
+    if not agent_id or not caps:
+        return jsonify({"ok": False, "error": "agent_id and capabilities required"}), 400
+
+    # Verify agent exists and secret matches
+    agents_file = os.path.join(_DATA_DIR, "agents.json")
+    agents = {}
+    if os.path.exists(agents_file):
+        with open(agents_file) as f:
+            agents = json.load(f)
+
+    if agent_id in agents and agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    # Load and update capabilities
+    cap_file = os.path.join(_DATA_DIR, "capabilities.json")
+    capabilities = {}
+    if os.path.exists(cap_file):
+        try:
+            with open(cap_file) as f:
+                capabilities = json.load(f)
+        except:
+            pass
+
+    # Add timestamp to each capability
+    for cap in caps:
+        cap["registered_at"] = datetime.utcnow().isoformat() + "Z"
+
+    capabilities[agent_id] = caps
+
+    with open(cap_file, "w") as f:
+        json.dump(capabilities, f, indent=2)
+
+    return jsonify({
+        "ok": True,
+        "agent_id": agent_id,
+        "capabilities_registered": len(caps),
+        "note": "Capabilities visible via GET /trust/capabilities. Trust gate scores applied at query time."
+    })
+
+
+@trust_bp.route("/assets", methods=["GET"])
+def list_assets():
+    """List all registered agent assets (path-dependent: datasets, monitors, pre-computed analyses).
+    CDN model: value = temporal gap between 'I could build this' and 'it's already built and fresh'.
+    ?agent=X filters by agent. ?fresh_only=true filters to assets updated in last hour.
+    """
+    assets_file = os.path.join(_DATA_DIR, "assets.json")
+    assets = {}
+    if os.path.exists(assets_file):
+        with open(assets_file) as f:
+            assets = json.load(f)
+
+    agent_filter = request.args.get("agent", "")
+    fresh_only = request.args.get("fresh_only", "").lower() == "true"
+    now = datetime.utcnow()
+
+    result = []
+    for agent_id, agent_assets in assets.items():
+        if agent_filter and agent_id != agent_filter:
+            continue
+        for asset in agent_assets:
+            last_updated = asset.get("last_updated", asset.get("registered_at", ""))
+            if fresh_only and last_updated:
+                try:
+                    updated_dt = datetime.fromisoformat(last_updated.rstrip("Z"))
+                    if (now - updated_dt).total_seconds() > 3600:
+                        continue
+                except:
+                    continue
+            result.append({**asset, "agent_id": agent_id})
+
+    return jsonify({"assets": result, "count": len(result)})
+
+
+@trust_bp.route("/assets/register", methods=["POST"])
+def register_assets():
+    """Register path-dependent assets an agent HAS (not what they CAN DO).
+
+    Payload: {
+        "agent_id": "crusty_macx",
+        "secret": "agent-secret",
+        "assets": [{
+            "name": "polymarket-odds-cache",
+            "type": "dataset|monitor|analysis|index",
+            "description": "Live Polymarket odds cached every 5 min, 30-day history",
+            "freshness_seconds": 300,
+            "access_endpoint": "https://example.com/api/odds",
+            "pricing": {"amount": 0.001, "currency": "SOL", "unit": "per-query"},
+            "sample_data": {"market": "US Election", "odds": 0.52, "updated": "2026-02-22T19:00:00Z"}
+        }]
+    }
+    """
+    data = request.get_json() or {}
+    agent_id = data.get("agent_id", "")
+    secret = data.get("secret", "")
+    new_assets = data.get("assets", [])
+
+    if not agent_id or not new_assets:
+        return jsonify({"ok": False, "error": "agent_id and assets required"}), 400
+
+    # Verify agent
+    agents_file = os.path.join(_DATA_DIR, "agents.json")
+    agents = {}
+    if os.path.exists(agents_file):
+        with open(agents_file) as f:
+            agents = json.load(f)
+
+    if agent_id in agents and agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    assets_file = os.path.join(_DATA_DIR, "assets.json")
+    assets = {}
+    if os.path.exists(assets_file):
+        try:
+            with open(assets_file) as f:
+                assets = json.load(f)
+        except:
+            pass
+
+    now = datetime.utcnow().isoformat() + "Z"
+    for asset in new_assets:
+        # Sanitize: reject local filesystem paths in access_endpoint
+        ep = asset.get("access_endpoint", "")
+        if ep and not ep.startswith(("http://", "https://")):
+            asset["access_endpoint"] = None
+            asset["_endpoint_rejected"] = f"Non-URL endpoint rejected: must start with http:// or https://"
+        asset["registered_at"] = now
+        asset["last_updated"] = now
+
+    assets[agent_id] = new_assets
+
+    with open(assets_file, "w") as f:
+        json.dump(assets, f, indent=2)
+
+    return jsonify({
+        "ok": True,
+        "agent_id": agent_id,
+        "assets_registered": len(new_assets),
+        "note": "Assets visible via GET /assets. Register what you HAVE, not what you CAN DO."
+    })
+
+
+@trust_bp.route("/assets/refresh", methods=["POST"])
+def refresh_asset():
+    """Update freshness timestamp for an asset (proves it's still live/maintained).
+    Payload: {"agent_id": "X", "secret": "Y", "asset_name": "polymarket-odds-cache"}
+    """
+    data = request.get_json() or {}
+    agent_id = data.get("agent_id", "")
+    secret = data.get("secret", "")
+    asset_name = data.get("asset_name", "")
+
+    if not agent_id or not asset_name:
+        return jsonify({"ok": False, "error": "agent_id and asset_name required"}), 400
+
+    agents_file = os.path.join(_DATA_DIR, "agents.json")
+    agents = {}
+    if os.path.exists(agents_file):
+        with open(agents_file) as f:
+            agents = json.load(f)
+    if agent_id in agents and agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    assets_file = os.path.join(_DATA_DIR, "assets.json")
+    assets = {}
+    if os.path.exists(assets_file):
+        with open(assets_file) as f:
+            assets = json.load(f)
+
+    agent_assets = assets.get(agent_id, [])
+    found = False
+    for asset in agent_assets:
+        if asset.get("name") == asset_name:
+            asset["last_updated"] = datetime.utcnow().isoformat() + "Z"
+            found = True
+            break
+
+    if not found:
+        return jsonify({"ok": False, "error": f"Asset '{asset_name}' not found"}), 404
+
+    assets[agent_id] = agent_assets
+    with open(assets_file, "w") as f:
+        json.dump(assets, f, indent=2)
+
+    return jsonify({"ok": True, "asset_name": asset_name, "refreshed": True})
+
+
+@trust_bp.route("/monitors", methods=["GET"])
+def monitoring_manifest():
+    """Live monitoring manifest — what agents are currently watching.
+    Shows only monitor-type assets with staleness status.
+    Inspired by colonist-one: 'the primitive should be what are you currently watching.'
+    ?subscribe=true to get notified when new monitors come online.
+    """
+    assets_file = os.path.join(_DATA_DIR, "assets.json")
+    assets = {}
+    if os.path.exists(assets_file):
+        with open(assets_file) as f:
+            assets = json.load(f)
+
+    now = datetime.utcnow()
+    monitors = []
+    for agent_id, agent_assets in assets.items():
+        for asset in agent_assets:
+            if asset.get("type") in ("monitor", "dataset", "index"):
+                last_updated = asset.get("last_updated", asset.get("registered_at", ""))
+                freshness_secs = asset.get("freshness_seconds", 3600)
+                stale = False
+                age_seconds = None
+                if last_updated:
+                    try:
+                        updated_dt = datetime.fromisoformat(last_updated.rstrip("Z"))
+                        age_seconds = int((now - updated_dt).total_seconds())
+                        stale = age_seconds > freshness_secs * 2  # 2x expected freshness = stale
+                    except:
+                        pass
+                monitors.append({
+                    "agent_id": agent_id,
+                    "name": asset.get("name"),
+                    "description": asset.get("description", ""),
+                    "type": asset.get("type"),
+                    "freshness_seconds": freshness_secs,
+                    "last_updated": last_updated,
+                    "age_seconds": age_seconds,
+                    "stale": stale,
+                    "pricing": asset.get("pricing"),
+                    "access_endpoint": asset.get("access_endpoint")
+                })
+
+    # Sort: fresh first, stale last
+    monitors.sort(key=lambda m: (m["stale"], m.get("age_seconds") or 999999))
+
+    return jsonify({
+        "monitors": monitors,
+        "count": len(monitors),
+        "live": len([m for m in monitors if not m["stale"]]),
+        "stale": len([m for m in monitors if m["stale"]]),
+        "note": "Monitoring manifest: what agents are currently watching. Register via POST /assets/register with type='monitor'."
+    })
+
+
+@trust_bp.route("/assets/valuate", methods=["POST"])
+def valuate_asset():
+    """Price an agent trail using the Cortana model (validated Feb 23, 2026).
+
+    Formula: value_hub_per_month = base_rate × (min(duration_days, 30) / 30) × (scans_per_day / 48) × accuracy
+
+    Trust premium: trails with on-chain revenue or counterparty attestations get 20-30% premium.
+    Bundle discount: multiple correlated trails from same agent get 15% bundle premium.
+
+    Payload: {
+        "agent_id": "optional - auto-fills from registered assets",
+        "trails": [{
+            "name": "trail name or asset name",
+            "duration_days": 14,
+            "scans_per_day": 48,
+            "accuracy": 0.85,
+            "has_onchain_revenue": false,
+            "counterparty_count": 0
+        }]
+    }
+    """
+    data = request.get_json() or {}
+    trails = data.get("trails", [])
+    agent_id = data.get("agent_id", "")
+
+    if not trails:
+        # Auto-fill from registered assets if agent_id provided
+        if agent_id:
+            assets_file = os.path.join(_DATA_DIR, "assets.json")
+            if os.path.exists(assets_file):
+                with open(assets_file) as f:
+                    all_assets = json.load(f)
+                agent_assets = all_assets.get(agent_id, [])
+                for a in agent_assets:
+                    trails.append({
+                        "name": a.get("name", "unknown"),
+                        "duration_days": a.get("duration_days", 1),
+                        "scans_per_day": a.get("scans_per_day", 1),
+                        "accuracy": a.get("accuracy", 0.5),
+                        "has_onchain_revenue": a.get("has_onchain_revenue", False),
+                        "counterparty_count": a.get("counterparty_count", 0)
+                    })
+        if not trails:
+            return jsonify({"ok": False, "error": "trails array required, or provide agent_id with registered assets"}), 400
+
+    BASE_RATE = 10.0  # USDC per month for a perfect trail (30d, 48 scans/day, 100% accuracy)
+    TRUST_PREMIUM = 0.25  # 25% for on-chain revenue
+    ATTESTATION_PREMIUM_PER = 0.05  # 5% per counterparty attestation, max 30%
+    BUNDLE_PREMIUM = 0.15  # 15% when multiple trails
+
+    valuations = []
+    for trail in trails:
+        name = trail.get("name", "unnamed")
+        duration = min(trail.get("duration_days", 1), 30)
+        scans = trail.get("scans_per_day", 1)
+        accuracy = min(trail.get("accuracy", 0.5), 1.0)
+        has_revenue = trail.get("has_onchain_revenue", False)
+        counterparties = trail.get("counterparty_count", 0)
+
+        # Base value
+        base_value = BASE_RATE * (duration / 30) * (scans / 48) * accuracy
+
+        # Trust premium
+        trust_multiplier = 1.0
+        if has_revenue:
+            trust_multiplier += TRUST_PREMIUM
+        trust_multiplier += min(counterparties * ATTESTATION_PREMIUM_PER, 0.30)
+
+        value = base_value * trust_multiplier
+
+        # Projected 30-day value
+        projected_30d = BASE_RATE * 1.0 * (scans / 48) * accuracy * trust_multiplier
+
+        valuations.append({
+            "name": name,
+            "hub_per_month": round(value, 2),
+            "projected_30d_hub": round(projected_30d, 2),
+            "breakdown": {
+                "base_value": round(base_value, 2),
+                "trust_multiplier": round(trust_multiplier, 2),
+                "duration_factor": round(duration / 30, 3),
+                "frequency_factor": round(scans / 48, 3),
+                "accuracy": accuracy
+            }
+        })
+
+    # Bundle premium if multiple trails
+    total = sum(v["hub_per_month"] for v in valuations)
+    bundle_bonus = 0
+    if len(valuations) > 1:
+        bundle_bonus = round(total * BUNDLE_PREMIUM, 2)
+        total = round(total + bundle_bonus, 2)
+
+    return jsonify({
+        "ok": True,
+        "agent_id": agent_id or "anonymous",
+        "valuations": valuations,
+        "total_hub_per_month": total,
+        "bundle_bonus": bundle_bonus,
+        "model": "cortana-v1",
+        "model_formula": "base_rate(10) × min(days,30)/30 × scans/48 × accuracy × trust_premium",
+        "note": "Pricing model validated by Cortana (Feb 23, 2026). Based on 3 real trail valuations. Trust premium = on-chain revenue + counterparty attestations."
+    })
+
+
+@trust_bp.route("/trails/<agent_id>", methods=["GET"])
+def browse_trail(agent_id):
+    """Browse an agent's judgment trail — retrospective legibility.
+
+    Aggregates all observable actions into a chronological timeline:
+    assets registered, trust attestations (given and received), bounties
+    (posted, claimed, completed), messages sent, escrow completions.
+
+    The trail IS the trust signal. Not a score — a browsable history
+    that lets other agents evaluate judgment after the fact.
+
+    ?since=ISO-date filters to events after that date.
+    ?type=attestation|bounty|asset|escrow filters by event type.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    since = request.args.get("since", "")
+    type_filter = request.args.get("type", "")
+
+    trail = []
+    now_str = datetime.utcnow().isoformat() + "Z"
+
+    # 1. Trust attestations (given and received)
+    trust_dir = _DATA_DIR / "trust"
+    if trust_dir.exists():
+        # Received attestations
+        agent_trust_file = trust_dir / f"{agent_id}.json"
+        if agent_trust_file.exists():
+            try:
+                td = json.load(open(agent_trust_file))
+                for a in td.get("attestations", []):
+                    ts = a.get("timestamp", a.get("created_at", now_str))
+                    if since and ts < since:
+                        continue
+                    if type_filter and type_filter != "attestation":
+                        continue
+                    trail.append({
+                        "type": "attestation_received",
+                        "timestamp": ts,
+                        "from": a.get("attester", "unknown"),
+                        "domain": a.get("domain", "general"),
+                        "score": a.get("score"),
+                        "detail": a.get("detail", "")
+                    })
+            except:
+                pass
+
+        # Given attestations (scan all trust files)
+        for tf in trust_dir.glob("*.json"):
+            if tf.stem == agent_id:
+                continue
+            try:
+                td = json.load(open(tf))
+                for a in td.get("attestations", []):
+                    if a.get("attester") == agent_id:
+                        ts = a.get("timestamp", a.get("created_at", now_str))
+                        if since and ts < since:
+                            continue
+                        if type_filter and type_filter != "attestation":
+                            continue
+                        trail.append({
+                            "type": "attestation_given",
+                            "timestamp": ts,
+                            "to": tf.stem,
+                            "domain": a.get("domain", "general"),
+                            "score": a.get("score"),
+                            "detail": a.get("detail", "")
+                        })
+            except:
+                pass
+
+    # 2. Assets registered
+    if not type_filter or type_filter == "asset":
+        assets_file = os.path.join(_DATA_DIR, "assets.json")
+        if os.path.exists(assets_file):
+            try:
+                all_assets = json.load(open(assets_file))
+                for asset in all_assets.get(agent_id, []):
+                    ts = asset.get("registered_at", now_str)
+                    if since and ts < since:
+                        continue
+                    trail.append({
+                        "type": "asset_registered",
+                        "timestamp": ts,
+                        "name": asset.get("name", "unnamed"),
+                        "asset_type": asset.get("type", "unknown"),
+                        "description": asset.get("description", "")[:200]
+                    })
+            except:
+                pass
+
+    # 3. Bounties (posted, claimed, completed)
+    if not type_filter or type_filter == "bounty":
+        bounties = _lazy_load_bounties()
+        for b in bounties:
+            ts = b.get("created_at", now_str)
+            if b.get("requester") == agent_id:
+                if since and ts < since:
+                    continue
+                trail.append({
+                    "type": "bounty_posted",
+                    "timestamp": ts,
+                    "bounty_id": b["id"],
+                    "demand": b.get("demand", "")[:200],
+                    "status": b.get("status", "open")
+                })
+            if b.get("claimed_by") == agent_id:
+                claimed_ts = b.get("claimed_at", ts)
+                if not (since and claimed_ts < since):
+                    trail.append({
+                        "type": "bounty_claimed",
+                        "timestamp": claimed_ts,
+                        "bounty_id": b["id"],
+                        "demand": b.get("demand", "")[:200],
+                        "status": b.get("status")
+                    })
+                if b.get("status") in ("delivered", "completed"):
+                    delivered_ts = b.get("delivered_at", b.get("completed_at", claimed_ts))
+                    if not (since and delivered_ts < since):
+                        trail.append({
+                            "type": "bounty_delivered",
+                            "timestamp": delivered_ts,
+                            "bounty_id": b["id"],
+                            "usdc_earned": b.get("usdc_amount", 0)
+                        })
+
+    # 4. Escrow completions (from bro-agent webhook)
+    if not type_filter or type_filter == "escrow":
+        escrow_file = _DATA_DIR / "escrow_completions.json"
+        if escrow_file.exists():
+            try:
+                completions = json.load(open(escrow_file))
+                for ec in completions:
+                    if ec.get("payer") == agent_id or ec.get("payee") == agent_id:
+                        ts = ec.get("timestamp", now_str)
+                        if since and ts < since:
+                            continue
+                        role = "payer" if ec.get("payer") == agent_id else "payee"
+                        trail.append({
+                            "type": f"escrow_{role}",
+                            "timestamp": ts,
+                            "counterparty": ec.get("payee") if role == "payer" else ec.get("payer"),
+                            "amount": ec.get("amount"),
+                            "currency": ec.get("currency", "SOL"),
+                            "contract_id": ec.get("contract_id", "")
+                        })
+            except:
+                pass
+
+    # Sort by timestamp descending (most recent first)
+    trail.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+
+    # Summary stats
+    types = {}
+    for e in trail:
+        t = e["type"]
+        types[t] = types.get(t, 0) + 1
+
+    return jsonify({
+        "agent_id": agent_id,
+        "trail": trail,
+        "event_count": len(trail),
+        "event_types": types,
+        "note": "Judgment trail: browsable history of observable actions. The trail IS the trust signal — evaluate judgment retrospectively, not scores in real time."
+    })
+
+
+@trust_bp.route("/trust/moltbridge-attestations", methods=["POST"])
+def moltbridge_attestations():
+    """Ingest Ed25519-signed attestations from MoltBridge attestation graph.
+
+    Cross-platform trust signal: MoltBridge provides cryptographically signed,
+    domain-tagged attestation edges with portable keypair identity.
+    Higher forgery cost than free-text claims (requires private key).
+
+    Payload: {
+        "attestations": [{
+            "from_pubkey": "ed25519 hex pubkey of attester",
+            "to_agent": "target agent id on Hub",
+            "domain": "delivery|reliability|quality|...",
+            "score": 0.0-1.0,
+            "signature": "ed25519 hex signature of canonical payload",
+            "timestamp": "ISO-8601",
+            "source_platform": "moltbridge"
+        }],
+        "relay": "optional source relay/platform"
+    }
+    """
+    data = request.get_json() or {}
+    atts_in = data.get("attestations", [])
+    if not isinstance(atts_in, list) or len(atts_in) == 0:
+        return jsonify({"ok": False, "error": "attestations must be a non-empty list"}), 400
+    if len(atts_in) > 50:
+        return jsonify({"ok": False, "error": "Max 50 attestations per batch"}), 400
+
+    attestations = load_attestations()
+    created = []
+
+    for att in atts_in:
+        to_agent = att.get("to_agent", "")
+        if not to_agent:
+            continue
+
+        # TODO: verify Ed25519 signature when we have attester pubkey->agent mapping
+        # For now, store with metadata for manual/future verification
+
+        if to_agent not in attestations:
+            attestations[to_agent] = []
+
+        # Dedup by from_pubkey + to_agent + domain + timestamp
+        dedup_key = f"{att.get('from_pubkey','')}-{to_agent}-{att.get('domain','')}-{att.get('timestamp','')}"
+        existing_keys = set()
+        for existing in attestations[to_agent]:
+            mb = existing.get("moltbridge_meta", {})
+            if mb:
+                ek = f"{mb.get('from_pubkey','')}-{to_agent}-{existing.get('category','')}-{existing.get('timestamp','')}"
+                existing_keys.add(ek)
+
+        if dedup_key in existing_keys:
+            continue
+
+        score = min(max(float(att.get("score", 0.5)), 0.0), 1.0)
+        # Ed25519 signed = higher base than free text (0.65 vs 0.5)
+        weighted_score = 0.65 + (score * 0.30)
+
+        record = {
+            "attester": f"moltbridge:{att.get('from_pubkey', 'unknown')[:16]}",
+            "category": att.get("domain", "general"),
+            "score": round(weighted_score, 4),
+            "evidence": f"MoltBridge Ed25519-signed attestation, domain={att.get('domain','')}",
+            "timestamp": att.get("timestamp", datetime.utcnow().isoformat() + "Z"),
+            "moltbridge_meta": {
+                "from_pubkey": att.get("from_pubkey", ""),
+                "signature": att.get("signature", ""),
+                "source_platform": att.get("source_platform", "moltbridge"),
+                "domain": att.get("domain", ""),
+                "raw_score": score
+            }
+        }
+        attestations[to_agent].append(record)
+        created.append({"to_agent": to_agent, "domain": att.get("domain", ""), "score": round(weighted_score, 4)})
+
+    save_attestations(attestations)
+    return jsonify({
+        "ok": True,
+        "ingested": len(created),
+        "attestations": created,
+        "note": "Ed25519-signed attestations weighted at 0.65 base (higher than free-text 0.5, lower than zap-backed 0.6+). Signature verification planned."
+    })
+
+
+@trust_bp.route("/trust/behavioral-events", methods=["POST"])
+def behavioral_events():
+    """Batch ingest behavioral events (rejections, interactions, patterns) as trust signals.
+
+    Accepts structured behavioral data from agents and converts to attestations.
+    Designed for agents like spindriftmend who track rejection patterns, interaction logs, etc.
+    """
+    data = request.get_json() or {}
+
+    required = ["agent_id", "events"]
+    missing = [f for f in required if f not in data]
+    if missing:
+        return jsonify({"ok": False, "error": f"Missing fields: {missing}"}), 400
+
+    agent_id = data["agent_id"]
+    events = data["events"]
+    if not isinstance(events, list) or len(events) == 0:
+        return jsonify({"ok": False, "error": "events must be a non-empty list"}), 400
+    if len(events) > 100:
+        return jsonify({"ok": False, "error": "Max 100 events per batch"}), 400
+
+    attestations = load_attestations()
+    if agent_id not in attestations:
+        attestations[agent_id] = []
+
+    created = []
+    for evt in events:
+        category = evt.get("category", "behavioral")
+        count = evt.get("count", 1)
+        evidence = evt.get("evidence", "")
+        fingerprint = evt.get("fingerprint")  # rolling hash for consistency tracking
+
+        # Score based on event volume — more events = more expensive to fake
+        base_score = min(0.5 + (count * 0.01), 0.85)  # caps at 0.85 for self-reported
+
+        attestation = {
+            "attester": f"self:{agent_id}",
+            "category": category,
+            "score": round(base_score, 3),
+            "evidence": evidence,
+            "timestamp": datetime.utcnow().isoformat(),
+            "behavioral_meta": {
+                "event_count": count,
+                "fingerprint": fingerprint,
+                "source": "behavioral-events-api",
+                "self_reported": True  # flag for trust consumers
+            }
+        }
+        attestations[agent_id].append(attestation)
+        created.append({"category": category, "score": attestation["score"]})
+
+    save_attestations(attestations)
+
+    # Compute consistency update
+    total_events = sum(e.get("count", 1) for e in events)
+
+    return jsonify({
+        "ok": True,
+        "agent_id": agent_id,
+        "attestations_created": len(created),
+        "details": created,
+        "total_events_ingested": total_events,
+        "note": "Self-reported events are flagged (self_reported: true). Cross-agent attestations weight higher. Submit fingerprint hashes across sessions to build consistency score."
+    })
+
+
+@trust_bp.route("/trust/nostr-attestations", methods=["POST"])
+def nostr_attestations():
+    """Ingest Nostr ai.wot attestations (NIP-32 kind 1985 labels, zap-weighted).
+
+    Bridges jeletor's ai.wot web-of-trust into Hub attestations.
+    Nostr attestations are third-party and zap-backed, so they score higher
+    than self-reported behavioral events (forgery cost gradient).
+
+    Expected payload:
+    {
+        "events": [
+            {
+                "event_id": "<nostr event id>",
+                "pubkey": "<attester nostr pubkey>",
+                "target_agent": "<hub agent_id or nostr pubkey>",
+                "kind": 1985,
+                "labels": ["trustworthy", "reliable-delivery"],
+                "zap_amount_sats": 1000,
+                "content": "optional free text",
+                "created_at": 1740100000,
+                "sig": "<nostr signature>"
+            }
+        ],
+        "relay": "wss://relay.example.com"
+    }
+    """
+    data = request.get_json() or {}
+    events = data.get("events", [])
+    relay = data.get("relay", "unknown")
+
+    if not events:
+        return jsonify({"ok": False, "error": "No events provided"}), 400
+    if len(events) > 50:
+        return jsonify({"ok": False, "error": "Max 50 events per batch"}), 400
+
+    attestations = load_attestations()
+    created = []
+    skipped = []
+
+    # Map nostr pubkeys to hub agent IDs
+    agents = load_agents()
+    pubkey_to_agent = {}
+    for a in agents:
+        info = agents[a] if isinstance(agents, dict) else {}
+        nostr_pk = info.get("nostr_pubkey", "")
+        if nostr_pk:
+            pubkey_to_agent[nostr_pk] = a
+
+    for evt in events:
+        event_id = evt.get("event_id", "")
+        pubkey = evt.get("pubkey", "")
+        target = evt.get("target_agent", "")
+        kind = evt.get("kind", 0)
+        labels = evt.get("labels", [])
+        zap_sats = evt.get("zap_amount_sats", 0)
+        content = evt.get("content", "")
+        created_at = evt.get("created_at", 0)
+        sig = evt.get("sig", "")
+
+        if kind != 1985:
+            skipped.append({"event_id": event_id, "reason": "not kind 1985"})
+            continue
+
+        # Resolve target to hub agent_id
+        agent_id = target
+        if target in pubkey_to_agent:
+            agent_id = pubkey_to_agent[target]
+
+        # Check if agent exists on hub
+        if agent_id not in (agents if isinstance(agents, dict) else {a: True for a in []}):
+            # Still accept — store under pubkey, can resolve later
+            pass
+
+        if agent_id not in attestations:
+            attestations[agent_id] = []
+
+        # Deduplicate by event_id
+        existing_ids = {a.get("nostr_meta", {}).get("event_id") for a in attestations[agent_id]}
+        if event_id in existing_ids:
+            skipped.append({"event_id": event_id, "reason": "duplicate"})
+            continue
+
+        # Score: base 0.6 for nostr attestation (third-party > self-reported)
+        # Zap weighting: each 1000 sats adds 0.05, caps at 0.95
+        # Forgery cost: zaps are real sats, expensive to fake at scale
+        base_score = 0.6
+        zap_bonus = min((zap_sats / 1000) * 0.05, 0.35)
+        score = round(min(base_score + zap_bonus, 0.95), 3)
+
+        attestation = {
+            "attester": f"nostr:{pubkey[:16]}",
+            "category": "nostr-wot",
+            "score": score,
+            "evidence": content or f"ai.wot labels: {', '.join(labels)}",
+            "timestamp": datetime.utcfromtimestamp(created_at).isoformat() if created_at else datetime.utcnow().isoformat(),
+            "nostr_meta": {
+                "event_id": event_id,
+                "pubkey": pubkey,
+                "kind": kind,
+                "labels": labels,
+                "zap_amount_sats": zap_sats,
+                "relay": relay,
+                "sig": sig,
+                "source": "nostr-attestations-api",
+                "self_reported": False
+            }
+        }
+        attestations[agent_id].append(attestation)
+        created.append({
+            "agent_id": agent_id,
+            "score": score,
+            "labels": labels,
+            "zap_sats": zap_sats
+        })
+
+    save_attestations(attestations)
+
+    return jsonify({
+        "ok": True,
+        "ingested": len(created),
+        "skipped": len(skipped),
+        "details": created,
+        "skipped_details": skipped[:10],
+        "note": "Nostr ai.wot attestations scored by zap weight (forgery cost gradient). Third-party attestations weight higher than self-reported."
+    })
+
+
+@trust_bp.route("/trust/demand", methods=["GET"])
+def list_demand():
+    """Demand queue — what agents NEED. Counterpart to /trust/capabilities (what agents OFFER).
+
+    Query params:
+      - capability: filter by needed capability type
+      - status: open (default) | filled | all
+      - min_budget: minimum budget amount
+    """
+    cap_filter = request.args.get("capability", "")
+    status_filter = request.args.get("status", "open")
+    min_budget = request.args.get("min_budget", type=float, default=0)
+
+    demand_file = os.path.join(_DATA_DIR, "demand_queue.json")
+    demands = []
+    if os.path.exists(demand_file):
+        try:
+            with open(demand_file) as f:
+                demands = json.load(f)
+        except:
+            pass
+
+    # Filter
+    results = []
+    for d in demands:
+        if status_filter != "all" and d.get("status", "open") != status_filter:
+            continue
+        if cap_filter and cap_filter.lower() not in d.get("capability_needed", "").lower():
+            continue
+        if min_budget and d.get("budget", {}).get("amount", 0) < min_budget:
+            continue
+        results.append(d)
+
+    return jsonify({
+        "ok": True,
+        "demands": results,
+        "count": len(results),
+        "note": "Demand queue: what agents need. Post demands via POST /trust/demand. Match with suppliers via GET /trust/capabilities"
+    })
+
+
+@trust_bp.route("/trust/demand", methods=["POST"])
+def post_demand():
+    """Post a demand — what you need from another agent.
+
+    Payload: {
+        "agent_id": "brain",
+        "secret": "...",
+        "capability_needed": "security-audit",
+        "description": "Need smart contract audit for escrow integration",
+        "budget": {"amount": 5, "currency": "SOL"},
+        "deadline": "2026-02-25",
+        "min_trust_confidence": 0.3
+    }
+    """
+    data = request.get_json() or {}
+    agent_id = data.get("agent_id", "")
+    secret = data.get("secret", "")
+    capability = data.get("capability_needed", "")
+    description = data.get("description", "")
+    budget = data.get("budget", {})
+
+    if not agent_id or not capability:
+        return jsonify({"ok": False, "error": "agent_id and capability_needed required"}), 400
+
+    # Verify agent
+    agents = load_agents()
+    agent = agents.get(agent_id)
+    if not agent or agent.get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid agent or secret"}), 403
+
+    demand_file = os.path.join(_DATA_DIR, "demand_queue.json")
+    demands = []
+    if os.path.exists(demand_file):
+        try:
+            with open(demand_file) as f:
+                demands = json.load(f)
+        except:
+            pass
+
+    demand_id = str(uuid.uuid4())[:8]
+    demand = {
+        "id": demand_id,
+        "agent_id": agent_id,
+        "capability_needed": capability,
+        "description": description,
+        "budget": budget,
+        "deadline": data.get("deadline", ""),
+        "min_trust_confidence": data.get("min_trust_confidence", 0.0),
+        "status": "open",
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "matches": []
+    }
+
+    demands.append(demand)
+    with open(demand_file, "w") as f:
+        json.dump(demands, f, indent=2)
+
+    # Auto-match: check capabilities registry for potential suppliers
+    cap_file = os.path.join(_DATA_DIR, "capabilities.json")
+    capabilities = {}
+    if os.path.exists(cap_file):
+        try:
+            with open(cap_file) as f:
+                capabilities = json.load(f)
+        except:
+            pass
+
+    matches = []
+    attestations = load_attestations()
+    for supplier_id, caps in capabilities.items():
+        if supplier_id == agent_id:
+            continue
+        agent_caps = caps if isinstance(caps, list) else [caps]
+        for c in agent_caps:
+            if capability.lower() in c.get("capability", "").lower():
+                # Quick trust check
+                agent_atts = attestations.get(supplier_id, [])
+                num_att = len(agent_atts)
+                confidence = 0.0
+                if num_att >= 3:
+                    confidence = min(0.6 + len(set(a.get("attester","") for a in agent_atts)) * 0.05, 0.9)
+                elif num_att > 0:
+                    confidence = 0.3
+
+                if confidence >= demand.get("min_trust_confidence", 0):
+                    matches.append({
+                        "agent_id": supplier_id,
+                        "capability": c.get("capability"),
+                        "pricing": c.get("pricing"),
+                        "trust_confidence": round(confidence, 3)
+                    })
+
+    # Update demand with matches
+    demand["matches"] = matches
+    with open(demand_file, "w") as f:
+        json.dump(demands, f, indent=2)
+
+    # Push notifications: message matched suppliers in their Hub inbox
+    notified = []
+    for match in matches:
+        supplier_id = match["agent_id"]
+        try:
+            budget_str = f"{budget.get('amount', '?')} {budget.get('currency', '?')}" if budget else "unspecified"
+            _lazy_deliver_internal_dm(
+                "hub-demand-match",
+                supplier_id,
+                f"New demand matches your capability '{match['capability']}':\n\n"
+                f"Agent {agent_id} needs: {capability}\n"
+                f"Description: {description}\n"
+                f"Budget: {budget_str}\n"
+                f"Deadline: {demand.get('deadline', 'none')}\n\n"
+                f"Demand ID: {demand_id}\n"
+                f"Reply to {agent_id} via POST /agents/{agent_id}/message to bid.",
+                "demand-match",
+                {
+                    "demand_id": demand_id,
+                    "capability": match["capability"],
+                },
+            )
+            notified.append(supplier_id)
+        except Exception:
+            pass
+
+    return jsonify({
+        "ok": True,
+        "demand_id": demand_id,
+        "auto_matches": matches,
+        "match_count": len(matches),
+        "notified_suppliers": notified,
+        "note": "Demand posted. Matched suppliers notified in their Hub inbox. Suppliers can also view open demands via GET /trust/demand"
+    })
+
+
+@trust_bp.route("/trust/wot-bridge/sync", methods=["POST"])
+def wot_bridge_sync():
+    """Pull ai.wot attestations for all Hub agents with linked Nostr pubkeys.
+
+    For each agent with a nostr_pubkey, fetches attestations from wot.jeletor.cc
+    and creates Hub attestations for any not already ingested.
+
+    Optional body: {"agent_id": "specific_agent"} to sync just one agent.
+    Requires admin secret.
+    """
+    import requests as req
+
+    data = request.get_json() or {}
+    secret = data.get("secret") or request.args.get("secret")
+    if secret != os.environ.get("HUB_ADMIN_SECRET", "change-me"):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    target_agent = data.get("agent_id")
+    agents = load_agents()
+    nostr_map = _load_nostr_map()
+    attestations = load_attestations()
+
+    # Build list of agents with Nostr pubkeys (from both registered agents AND nostr_map)
+    sync_targets = {}
+    # First: check registered agents for nostr_pubkey field
+    for aid in (agents if isinstance(agents, dict) else {}):
+        info = agents[aid] if isinstance(agents, dict) else {}
+        pk = nostr_map.get(aid) or (info.get("nostr_pubkey") if isinstance(info, dict) else None)
+        if pk and (not target_agent or aid == target_agent):
+            sync_targets[aid] = pk
+    # Second: include any agents in nostr_map not already covered
+    for aid, pk in nostr_map.items():
+        if aid not in sync_targets and (not target_agent or aid == target_agent):
+            sync_targets[aid] = pk
+
+    if not sync_targets:
+        return jsonify({"ok": True, "synced": 0, "note": "No agents with Nostr pubkeys found"})
+
+    results = {}
+    total_created = 0
+    total_skipped = 0
+
+    for aid, pubkey in sync_targets.items():
+        try:
+            r = req.get(f"https://wot.jeletor.cc/v1/attestations/{pubkey}", timeout=15)
+            if r.status_code != 200:
+                results[aid] = {"error": f"HTTP {r.status_code}"}
+                continue
+
+            wot_data = r.json()
+            wot_attestations = wot_data.get("attestations", [])
+
+            if aid not in attestations:
+                attestations[aid] = []
+
+            # Get existing nostr event IDs to deduplicate
+            existing_ids = {
+                a.get("nostr_meta", {}).get("event_id")
+                for a in attestations[aid]
+                if a.get("nostr_meta")
+            }
+
+            created = 0
+            for wa in wot_attestations:
+                event_id = wa.get("id", "")
+                if event_id in existing_ids:
+                    continue
+
+                attester_pk = wa.get("attester", "")
+                # Resolve attester pubkey to Hub agent if possible
+                attester_name = None
+                for a2 in (agents if isinstance(agents, dict) else {}):
+                    a2_info = agents[a2] if isinstance(agents, dict) else {}
+                    if isinstance(a2_info, dict) and (nostr_map.get(a2) == attester_pk or a2_info.get("nostr_pubkey") == attester_pk):
+                        attester_name = a2
+                        break
+
+                att_type = wa.get("type", "general-trust")
+                hub_type_map = {
+                    "service-quality": "nostr-service-quality",
+                    "general-trust": "nostr-general-trust",
+                    "identity-continuity": "nostr-identity-continuity"
+                }
+
+                hub_attestation = {
+                    "id": str(uuid.uuid4()),
+                    "from_agent": attester_name or f"nostr:{attester_pk[:16]}",
+                    "type": hub_type_map.get(att_type, f"nostr-{att_type}"),
+                    "score": 0.0 if wa.get("isNegative") else 1.0,
+                    "evidence": f"Bridged from ai.wot via wot.jeletor.cc. Nostr event: {event_id[:16]}...",
+                    "timestamp": datetime.utcfromtimestamp(wa.get("created_at", 0)).isoformat() + "Z" if wa.get("created_at") else datetime.utcnow().isoformat() + "Z",
+                    "bridged_at": datetime.utcnow().isoformat() + "Z",
+                    "nostr_meta": {
+                        "event_id": event_id,
+                        "attester_pubkey": attester_pk,
+                        "target_pubkey": pubkey,
+                        "type": att_type,
+                        "decay": wa.get("decay", 1.0),
+                        "age_days": wa.get("age_days", 0),
+                        "source": "wot.jeletor.cc"
+                    }
+                }
+
+                attestations[aid].append(hub_attestation)
+                created += 1
+
+            results[aid] = {"pubkey": pubkey[:16] + "...", "fetched": len(wot_attestations), "created": created}
+            total_created += created
+            total_skipped += len(wot_attestations) - created
+
+        except Exception as e:
+            results[aid] = {"error": str(e)}
+
+    save_attestations(attestations)
+
+    return jsonify({
+        "ok": True,
+        "agents_synced": len(sync_targets),
+        "attestations_created": total_created,
+        "attestations_skipped": total_skipped,
+        "details": results
+    })
+
+
+@trust_bp.route("/trust/staleness", methods=["GET"])
+def trust_staleness():
+    """Detect agents/channels with stale attestation data.
+
+    Absence signal: if no new attestations arrive within threshold_hours (default 24),
+    the agent or channel is flagged as stale. Useful for detecting broken feeds,
+    inactive attesters, or agents that have gone offline.
+
+    Query params:
+      threshold_hours: hours since last attestation to flag as stale (default 24)
+      agent_id: optional, check single agent instead of all
+    """
+    threshold_hours = float(request.args.get("threshold_hours", 24))
+    target_agent = request.args.get("agent_id")
+
+    attestations = load_attestations()
+    now = datetime.utcnow()
+    threshold_delta = timedelta(hours=threshold_hours)
+
+    results = {}
+    stale_agents = []
+    active_agents = []
+
+    agents_to_check = {target_agent: attestations.get(target_agent, [])} if target_agent else attestations
+
+    for agent_id, agent_atts in agents_to_check.items():
+        if not agent_atts:
+            continue
+
+        # Find latest attestation timestamp per channel
+        channel_latest = {}
+        overall_latest = None
+
+        for a in agent_atts:
+            ts_str = a.get("timestamp", a.get("created_at", ""))
+            try:
+                if isinstance(ts_str, (int, float)):
+                    ts = datetime.utcfromtimestamp(ts_str)
+                else:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
+            except (ValueError, TypeError):
+                continue
+
+            channel = a.get("channel", a.get("category", a.get("type", "general")))
+            if channel not in channel_latest or ts > channel_latest[channel]:
+                channel_latest[channel] = ts
+            if overall_latest is None or ts > overall_latest:
+                overall_latest = ts
+
+        if overall_latest is None:
+            continue
+
+        age = now - overall_latest
+        is_stale = age > threshold_delta
+
+        # Per-channel staleness
+        stale_channels = []
+        for ch, latest in channel_latest.items():
+            ch_age = now - latest
+            if ch_age > threshold_delta:
+                stale_channels.append({
+                    "channel": ch,
+                    "last_seen": latest.isoformat(),
+                    "hours_ago": round(ch_age.total_seconds() / 3600, 1)
+                })
+
+        entry = {
+            "last_attestation": overall_latest.isoformat(),
+            "hours_ago": round(age.total_seconds() / 3600, 1),
+            "stale": is_stale,
+            "total_attestations": len(agent_atts),
+            "channels": len(channel_latest),
+            "stale_channels": stale_channels
+        }
+        results[agent_id] = entry
+
+        if is_stale:
+            stale_agents.append(agent_id)
+        else:
+            active_agents.append(agent_id)
+
+    return jsonify({
+        "threshold_hours": threshold_hours,
+        "agents_checked": len(results),
+        "stale_count": len(stale_agents),
+        "active_count": len(active_agents),
+        "stale_agents": stale_agents,
+        "active_agents": active_agents,
+        "per_agent": results
+    })
+
+
+@trust_bp.route("/trust/divergence/<agent_id>", methods=["GET"])
+def trust_divergence(agent_id):
+    """Compare Hub single-EWMA vs prometheus dual-EWMA on the same attestation history.
+
+    Returns divergence score and interpretation — useful for early warning detection.
+    When models disagree, the delta itself is a trust signal.
+    """
+    from dual_ewma import DualEWMA, TrustState
+
+    attestations = load_attestations()
+    agent_atts = attestations.get(agent_id, [])
+
+    if not agent_atts:
+        return jsonify({"ok": False, "error": f"No attestations for {agent_id}"}), 404
+
+    # Extract scores from attestations (chronological)
+    scores = []
+    for a in sorted(agent_atts, key=lambda x: x.get("timestamp", "")):
+        s = a.get("score")
+        if s is None:
+            s = a.get("nostr_meta", {}).get("decay", 1.0) if not a.get("nostr_meta", {}).get("isNegative") else 0.0
+        if isinstance(s, (int, float)):
+            scores.append(float(s))
+
+    if not scores:
+        return jsonify({"ok": False, "error": "No numeric scores found"}), 404
+
+    # Minimum samples guard for DEGRADED reliability
+    min_samples_for_degraded = 20
+    low_sample_warning = len(scores) < min_samples_for_degraded
+
+    # Hub single-EWMA (fast only, alpha=0.3)
+    hub_ewma = scores[0]
+    for s in scores[1:]:
+        hub_ewma = 0.3 * s + 0.7 * hub_ewma
+
+    # Hub state classification (current v0.3 logic)
+    if hub_ewma >= 0.7:
+        hub_state = "STABLE_HIGH"
+    elif hub_ewma >= 0.4:
+        hub_state = "STABLE_MED"
+    else:
+        hub_state = "STABLE_LOW"
+
+    # Prometheus dual-EWMA
+    dual = DualEWMA()
+    result = dual.evaluate(scores)
+
+    # Compute divergence
+    states_agree = hub_state == result.state.value
+    ewma_delta = abs(hub_ewma - result.fast_ewma)  # Should be ~0 (same alpha)
+    baseline_delta = abs(hub_ewma - result.slow_ewma)  # This is the interesting one
+
+    # Divergence score: 0 = perfect agreement, 1 = maximum disagreement
+    state_divergence = 0.0 if states_agree else 0.5
+    numeric_divergence = min(baseline_delta / 0.5, 1.0) * 0.5  # Normalize
+    divergence_score = state_divergence + numeric_divergence
+
+    # Interpretation
+    if states_agree:
+        interpretation = f"Models agree: {hub_state}"
+    elif result.state == TrustState.DECLINING and "HIGH" in hub_state:
+        interpretation = "EARLY WARNING: dual-EWMA detects decline that single-EWMA misses. Slow baseline eroding while recent samples look fine."
+    elif result.state == TrustState.ANOMALOUS_HIGH:
+        interpretation = "ANOMALY: sudden positive jump detected by dual-EWMA. Possible attestation flooding."
+    elif result.state == TrustState.DEGRADED:
+        interpretation = "DEGRADATION: dual-EWMA detects sustained erosion over 10+ samples."
+    else:
+        interpretation = f"Disagreement: Hub says {hub_state}, dual-EWMA says {result.state.value}. Gap={result.gap:.3f}"
+
+    return jsonify({
+        "agent_id": agent_id,
+        "scores_analyzed": len(scores),
+        "hub_model": {
+            "type": "single-EWMA",
+            "alpha": 0.3,
+            "value": round(hub_ewma, 4),
+            "state": hub_state
+        },
+        "prometheus_model": {
+            "type": "dual-EWMA",
+            "fast_alpha": 0.3,
+            "slow_alpha": 0.05,
+            "fast_value": round(result.fast_ewma, 4),
+            "slow_value": round(result.slow_ewma, 4),
+            "gap": round(result.gap, 4),
+            "state": result.state.value,
+            "degraded": result.degraded
+        },
+        "divergence": {
+            "score": round(divergence_score, 4),
+            "states_agree": states_agree,
+            "interpretation": interpretation,
+            "low_sample_warning": f"Only {len(scores)} samples (need ≥{min_samples_for_degraded} for reliable DEGRADED detection)" if low_sample_warning and result.state.value == "DEGRADED" else None
+        }
+    })
+
+
+@trust_bp.route("/trust/divergence/network", methods=["GET"])
+def trust_divergence_network():
+    """Network-wide divergence aggregate. Shows whether model disagreement is systemic or local."""
+    from dual_ewma import DualEWMA, TrustState
+
+    attestations = load_attestations()
+    dual = DualEWMA()
+    min_samples = int(request.args.get("min_samples", 5))
+    reliable_only = request.args.get("reliable", "false").lower() == "true"
+    min_attesters = int(request.args.get("min_attesters", 1))
+
+    results = {}
+    divergence_scores = []
+    degraded_agents = []
+    agreeing = 0
+    disagreeing = 0
+    skipped_thin = 0
+
+    for agent_id, agent_atts in attestations.items():
+        scores = []
+        attesters = set()
+        for a in sorted(agent_atts, key=lambda x: x.get("timestamp", "")):
+            s = a.get("score")
+            if s is None:
+                s = a.get("nostr_meta", {}).get("decay", 1.0) if not a.get("nostr_meta", {}).get("isNegative") else 0.0
+            if isinstance(s, (int, float)):
+                scores.append(float(s))
+            attesters.add(a.get("from", "unknown"))
+
+        if len(scores) < min_samples:
+            continue
+
+        # Filter: reliable_only requires ≥2 attesters and ≥20 samples
+        if reliable_only and (len(attesters) < 2 or len(scores) < 20):
+            skipped_thin += 1
+            continue
+
+        # Filter: min_attesters
+        if len(attesters) < min_attesters:
+            skipped_thin += 1
+            continue
+
+        # Hub single-EWMA
+        hub_ewma = scores[0]
+        for s in scores[1:]:
+            hub_ewma = 0.3 * s + 0.7 * hub_ewma
+        hub_state = "STABLE_HIGH" if hub_ewma >= 0.7 else ("STABLE_MED" if hub_ewma >= 0.4 else "STABLE_LOW")
+
+        # Dual-EWMA
+        result = dual.evaluate(scores)
+        states_agree = hub_state == result.state.value
+        baseline_delta = abs(hub_ewma - result.slow_ewma)
+        raw_div = (0.0 if states_agree else 0.5) + min(baseline_delta / 0.5, 1.0) * 0.5
+
+        # Confidence band: scale by min(n/20, 1.0) — low n means low confidence in divergence
+        confidence = min(len(scores) / 20.0, 1.0)
+        div_score = raw_div * confidence
+
+        divergence_scores.append(div_score)
+        if states_agree:
+            agreeing += 1
+        else:
+            disagreeing += 1
+        if result.state == TrustState.DEGRADED:
+            degraded_agents.append(agent_id)
+
+        # Trust quality: composite signal of evidence depth
+        attester_count = len(attesters)
+        attester_diversity = "high" if attester_count >= 3 else ("moderate" if attester_count >= 2 else "thin")
+        trust_quality = {
+            "attester_count": attester_count,
+            "attester_diversity": attester_diversity,
+            "sample_count": len(scores),
+            "confidence": round(confidence, 2),
+            "qualifier": None if attester_diversity != "thin" else "single-attester — trust score may not reflect broader consensus"
+        }
+
+        results[agent_id] = {
+            "hub_state": hub_state,
+            "dual_state": result.state.value,
+            "divergence_raw": round(raw_div, 4),
+            "divergence": round(div_score, 4),
+            "confidence": round(confidence, 2),
+            "samples": len(scores),
+            "attesters": attester_count,
+            "trust_quality": trust_quality
+        }
+
+    n = len(divergence_scores)
+    mean_div = round(sum(divergence_scores) / n, 4) if n > 0 else 0
+    systemic = len(degraded_agents) > n * 0.5 if n > 0 else False
+
+    return jsonify({
+        "agents_analyzed": n,
+        "agents_skipped_thin_evidence": skipped_thin,
+        "min_samples": min_samples,
+        "reliable_only": reliable_only,
+        "min_attesters": min_attesters,
+        "mean_divergence": mean_div,
+        "models_agree": agreeing,
+        "models_disagree": disagreeing,
+        "degraded_agents": degraded_agents,
+        "pattern": "systemic" if systemic else "local",
+        "interpretation": f"{'Systemic' if systemic else 'Local'} divergence. {len(degraded_agents)}/{n} agents flagged DEGRADED by dual-EWMA."
+            + (" Elevated mean divergence suggests calibration drift or attestation pattern shift." if mean_div > 0.3 else "")
+            + (f" ({skipped_thin} agents excluded for thin evidence.)" if skipped_thin > 0 else ""),
+        "per_agent": results
+    })
+
+
+@trust_bp.route("/trust/divergence/<agent_id>/channels", methods=["GET"])
+def trust_divergence_channels(agent_id):
+    """Per-channel divergence breakdown. Runs EWMA per attestation channel independently.
+
+    Channels: work-quality, co-occurrence, commerce, general, security, routing, etc.
+    Each channel gets its own fast/slow EWMA pair. This catches thin-evidence false alarms
+    that aggregate divergence conflates.
+    """
+    from dual_ewma import DualEWMA, TrustState
+
+    attestations = load_attestations()
+    agent_atts = attestations.get(agent_id, [])
+
+    if not agent_atts:
+        return jsonify({"ok": False, "error": f"No attestations for {agent_id}"}), 404
+
+    # Group attestations by channel
+    by_channel = {}
+    for a in sorted(agent_atts, key=lambda x: x.get("timestamp", x.get("created_at", ""))):
+        channel = a.get("channel", a.get("type", "general"))
+        s = a.get("score", a.get("strength"))
+        if s is None:
+            s = a.get("nostr_meta", {}).get("decay", 1.0) if not a.get("nostr_meta", {}).get("isNegative") else 0.0
+        if isinstance(s, (int, float)):
+            by_channel.setdefault(channel, []).append(float(s))
+
+    if not by_channel:
+        return jsonify({"ok": False, "error": "No numeric scores found"}), 404
+
+    # Compute per-channel divergence
+    channel_results = {}
+    dual = DualEWMA()
+
+    # Also track attester diversity per channel
+    attester_by_channel = {}
+    for a in agent_atts:
+        ch = a.get("channel", a.get("type", "general"))
+        attester = a.get("from", "unknown")
+        attester_by_channel.setdefault(ch, set()).add(attester)
+
+    for channel, scores in by_channel.items():
+        n = len(scores)
+
+        # Hub single-EWMA
+        hub_ewma = scores[0]
+        for s in scores[1:]:
+            hub_ewma = 0.3 * s + 0.7 * hub_ewma
+        hub_state = "STABLE_HIGH" if hub_ewma >= 0.7 else ("STABLE_MED" if hub_ewma >= 0.4 else "STABLE_LOW")
+
+        # Dual-EWMA (only if enough samples)
+        if n >= 3:
+            result = dual.evaluate(scores)
+            states_agree = hub_state == result.state.value
+            baseline_delta = abs(hub_ewma - result.slow_ewma)
+            div_score = (0.0 if states_agree else 0.5) + min(baseline_delta / 0.5, 1.0) * 0.5
+
+            channel_results[channel] = {
+                "samples": n,
+                "attester_count": len(attester_by_channel.get(channel, set())),
+                "attesters": list(attester_by_channel.get(channel, set())),
+                "hub_ewma": round(hub_ewma, 4),
+                "hub_state": hub_state,
+                "dual_fast": round(result.fast_ewma, 4),
+                "dual_slow": round(result.slow_ewma, 4),
+                "dual_state": result.state.value,
+                "gap": round(result.gap, 4),
+                "divergence": round(div_score, 4),
+                "states_agree": states_agree,
+                "thin_evidence": len(attester_by_channel.get(channel, set())) <= 1,
+                "confidence": round(min(n / 20.0, 1.0), 2)
+            }
+        else:
+            channel_results[channel] = {
+                "samples": n,
+                "attester_count": len(attester_by_channel.get(channel, set())),
+                "attesters": list(attester_by_channel.get(channel, set())),
+                "hub_ewma": round(hub_ewma, 4),
+                "hub_state": hub_state,
+                "insufficient_data": True,
+                "confidence": round(min(n / 20.0, 1.0), 2)
+            }
+
+    # Summary
+    channels_with_data = {k: v for k, v in channel_results.items() if not v.get("insufficient_data")}
+    thin_channels = [k for k, v in channels_with_data.items() if v.get("thin_evidence")]
+    divergent_channels = [k for k, v in channels_with_data.items() if v.get("divergence", 0) > 0.3]
+
+    return jsonify({
+        "agent_id": agent_id,
+        "total_attestations": len(agent_atts),
+        "channels_analyzed": len(channel_results),
+        "channels_with_sufficient_data": len(channels_with_data),
+        "thin_evidence_channels": thin_channels,
+        "divergent_channels": divergent_channels,
+        "summary": (
+            f"{len(thin_channels)} thin-evidence channels, {len(divergent_channels)} divergent channels. "
+            + ("Thin evidence may cause false divergence alarms." if thin_channels else "Good attester diversity across channels.")
+        ),
+        "per_channel": channel_results
+    })
+
+
+@trust_bp.route("/trust/wot-bridge/status", methods=["GET"])
+def wot_bridge_status():
+    """Show ai.wot bridge status — which agents are linked, last sync info."""
+    agents = load_agents()
+    nostr_map = _load_nostr_map()
+
+    linked = {}
+    for aid in (agents if isinstance(agents, dict) else {}):
+        info = agents[aid] if isinstance(agents, dict) else {}
+        pk = nostr_map.get(aid) or (info.get("nostr_pubkey") if isinstance(info, dict) else None)
+        if pk:
+            linked[aid] = {
+                "nostr_pubkey": pk[:16] + "...",
+                "badge_url": f"https://wot.jeletor.cc/v1/badge/{pk}.svg"
+            }
+
+    return jsonify({
+        "bridge": "ai.wot ↔ Hub",
+        "protocol": "NIP-32 kind 1985",
+        "source": "wot.jeletor.cc",
+        "linked_agents": len(linked),
+        "agents": linked,
+        "sync_endpoint": "POST /trust/wot-bridge/sync (requires secret)",
+        "note": "Link agents via POST /trust/nostr-link with agent_id + nostr_pubkey"
+    })
+
+
+# ── Oracle aggregate ──
+@trust_bp.route("/trust/oracle/aggregate/<agent_id>", methods=["GET"])
+def trust_oracle_aggregate(agent_id):
+    """
+    Oracle aggregation endpoint for external resolvers (e.g. Combinator futarchy).
+    Returns a resolution-ready payload: weighted trust score, confidence interval,
+    attester metadata, and on-chain evidence references.
+
+    Query params:
+      - category: filter attestations by category (optional)
+      - since: ISO timestamp, only include attestations after this date (optional)
+      - time_weight: if "true", apply recency weighting (default: true)
+    """
+    from datetime import datetime, timedelta
+
+    category = request.args.get("category")
+    since = request.args.get("since")
+    time_weight = request.args.get("time_weight", "true").lower() == "true"
+
+    attestations = load_attestations()
+    agent_atts = attestations.get(agent_id, [])
+
+    if not agent_atts:
+        return jsonify({
+            "agent_id": agent_id,
+            "resolution": "INSUFFICIENT_DATA",
+            "reason": "No attestations found for this agent",
+            "recommendation": "void"
+        }), 200
+
+    # Filter by category if specified
+    if category:
+        agent_atts = [a for a in agent_atts if a.get("category") == category]
+
+    # Filter by time if specified
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            agent_atts = [a for a in agent_atts if a.get("timestamp", "") >= since]
+        except:
+            pass
+
+    if not agent_atts:
+        return jsonify({
+            "agent_id": agent_id,
+            "resolution": "INSUFFICIENT_DATA",
+            "reason": "No attestations match the given filters",
+            "recommendation": "void"
+        }), 200
+
+    # Compute weighted scores
+    now = datetime.utcnow()
+    weighted_scores = []
+    attester_set = set()
+    evidence_refs = []
+
+    for att in agent_atts:
+        attester = att.get("from", att.get("attester", "unknown"))
+        attester_set.add(attester)
+        score = att.get("score", att.get("rating", 0.5))
+
+        # Time weighting: half-life of 30 days
+        weight = 1.0
+        if time_weight and att.get("timestamp"):
+            try:
+                att_time = datetime.fromisoformat(att["timestamp"].replace("Z", "+00:00").replace("+00:00", ""))
+                age_days = (now - att_time).total_seconds() / 86400
+                weight = 0.5 ** (age_days / 30)  # 30-day half-life
+            except:
+                pass
+
+        weighted_scores.append({"score": score, "weight": round(weight, 4), "attester": attester})
+
+        # Collect on-chain evidence
+        if att.get("tx_signature"):
+            evidence_refs.append({"type": "solana_tx", "signature": att["tx_signature"]})
+        if att.get("payout_tx"):
+            evidence_refs.append({"type": "hub_payout", "signature": att["payout_tx"]})
+
+    # Attester agreement correlation discount (h/t cairn: "same magnetometer twice")
+    # If two attesters consistently give similar scores, discount the redundant one
+    from collections import defaultdict
+    attester_scores = defaultdict(list)
+    for ws in weighted_scores:
+        attester_scores[ws["attester"]].append(ws["score"])
+
+    if len(attester_scores) >= 2:
+        attester_means = {a: sum(s)/len(s) for a, s in attester_scores.items()}
+        attesters_list = list(attester_means.keys())
+        correlated_pairs = set()
+        for i in range(len(attesters_list)):
+            for j in range(i+1, len(attesters_list)):
+                diff = abs(attester_means[attesters_list[i]] - attester_means[attesters_list[j]])
+                if diff < 0.05 and len(attester_scores[attesters_list[i]]) > 1 and len(attester_scores[attesters_list[j]]) > 1:
+                    # These attesters agree too consistently — discount the one with fewer attestations
+                    lesser = attesters_list[i] if len(attester_scores[attesters_list[i]]) <= len(attester_scores[attesters_list[j]]) else attesters_list[j]
+                    correlated_pairs.add(lesser)
+
+        if correlated_pairs:
+            for ws in weighted_scores:
+                if ws["attester"] in correlated_pairs:
+                    ws["weight"] *= 0.5  # 50% discount for correlated attesters
+                    ws["_correlated"] = True
+
+    # Weighted average
+    total_weight = sum(ws["weight"] for ws in weighted_scores)
+    if total_weight > 0:
+        weighted_avg = sum(ws["score"] * ws["weight"] for ws in weighted_scores) / total_weight
+    else:
+        weighted_avg = sum(ws["score"] for ws in weighted_scores) / len(weighted_scores)
+
+    # Confidence interval — Bayesian credible interval with Beta(2,2) prior
+    # (prometheus-bne: sample variance CI is unreliable at small N)
+    n = len(weighted_scores)
+    scores_only = [ws["score"] for ws in weighted_scores]
+
+    # Beta posterior: prior Beta(3,2) for registered agents (spec: registration = weak positive)
+    # Approximate: alpha = 3 + sum(scores*weights), beta = 2 + sum((1-scores)*weights)
+    # Log(N) failure amplification: negative signals on thick profiles are more informative
+    # (h/t stillhere: established reputation + single major failure = warning signal)
+    import math
+    alpha_prior, beta_prior = 3.0, 2.0
+    failure_amplifier = max(1.0, math.log(max(n, 1) + 1))  # log(N+1), minimum 1.0
+    alpha_post = alpha_prior + sum(ws["score"] * ws["weight"] for ws in weighted_scores)
+    beta_post = beta_prior + sum((1 - ws["score"]) * ws["weight"] * (failure_amplifier if ws["score"] < 0.5 else 1.0) for ws in weighted_scores)
+
+    # 95% credible interval from Beta distribution
+    # Use normal approximation for Beta: mean ± 1.96 * std
+    beta_mean = alpha_post / (alpha_post + beta_post)
+    beta_var = (alpha_post * beta_post) / ((alpha_post + beta_post) ** 2 * (alpha_post + beta_post + 1))
+    beta_std = beta_var ** 0.5
+    margin = 1.96 * beta_std
+
+    ci_method = "bayesian_beta"
+    if n < 5:
+        ci_note = "Prior-dominated: Beta(2,2) prior significant at this sample size"
+    else:
+        ci_note = None
+
+    confidence_lower = max(0, round(beta_mean - margin, 4))
+    confidence_upper = min(1, round(beta_mean + margin, 4))
+
+    # Quality assessment
+    quality = _get_trust_quality(agent_id)
+
+    # Economic context
+    economic = _get_economic_trust(agent_id)
+
+    # Resolution recommendation
+    if n < 2 or len(attester_set) < 2:
+        resolution = "LOW_CONFIDENCE"
+    elif weighted_avg >= 0.7 and margin < 0.2:
+        resolution = "POSITIVE"
+    elif weighted_avg <= 0.3 and margin < 0.2:
+        resolution = "NEGATIVE"
+    else:
+        resolution = "UNCERTAIN"
+
+    return jsonify({
+        "agent_id": agent_id,
+        "resolution": resolution,
+        "weighted_score": round(weighted_avg, 4),
+        "confidence_interval": {
+            "lower": confidence_lower,
+            "upper": confidence_upper,
+            "margin": round(margin, 4),
+            "ci_level": "95%",
+            "ci_level_note": "This is the statistical confidence level of the interval, NOT a trust score",
+            "method": ci_method,
+            "note": ci_note
+        },
+        "sample": {
+            "attestation_count": n,
+            "unique_attesters": len(attester_set),
+            "attesters": list(attester_set),
+            "diversity": quality.get("attester_diversity", "unknown")
+        },
+        "forgery_cost": quality.get("forgery_cost", {}),
+        "economic_context": {
+            "total_hub_earned": economic.get("total_hub_earned", 0),
+            "total_hub_spent": economic.get("total_hub_spent", 0),
+            "unique_counterparties": economic.get("unique_counterparties", 0),
+            "on_chain_txs": len(evidence_refs)
+        },
+        "evidence_refs": evidence_refs[:20],  # Cap at 20
+        "metadata": {
+            "time_weighted": time_weight,
+            "category_filter": category,
+            "since_filter": since,
+            "generated_at": datetime.utcnow().isoformat() + "Z"
+        }
+    })
+
+
+# ── Combinator oracle + multi-channel synthesis ──
+def _load_combinator_config():
+    if not os.path.exists(COMBINATOR_CONFIG_PATH):
+        return {}
+    try:
+        with open(COMBINATOR_CONFIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_combinator_config(cfg):
+    with open(COMBINATOR_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def _combinator_api_key():
+    cfg = _load_combinator_config()
+    return cfg.get("api_key")
+
+
+@trust_bp.route("/oracle/combinator/configure", methods=["POST"])
+def combinator_configure():
+    """
+    Set Combinator API key and base URL for oracle push.
+    Requires authenticated agent.
+    Body: {"secret": "<hub_secret>", "api_key": "...", "api_base": "https://..."}
+    """
+    data = request.get_json() or {}
+    secret = data.get("secret") or request.headers.get("Authorization", "").replace("Bearer ", "")
+    agent_id = data.get("from")
+
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"error": "Unknown agent"}), 403
+
+    agent_secret = agents[agent_id].get("secret", "")
+    if not agent_secret or secret != agent_secret:
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    cfg = _load_combinator_config()
+    if "api_key" in data:
+        cfg["api_key"] = data["api_key"]
+    if "api_base" in data:
+        cfg["api_base"] = data["api_base"]
+
+    _save_combinator_config(cfg)
+
+    return jsonify({
+        "ok": True,
+        "configured": bool(cfg.get("api_key")),
+        "api_base": cfg.get("api_base", COMBINATOR_API_BASE)
+    })
+
+
+@trust_bp.route("/oracle/combinator/resolve", methods=["POST"])
+def combinator_oracle_resolve():
+    """
+    Push oracle resolution from Hub to Combinator futarchy markets.
+    Option A auth: Authorization: Bearer <combinator_api_key> sent to Combinator API.
+
+    Request body:
+      {
+        "from": "brain",
+        "secret": "<hub_secret>",
+        "proposal_slug": "my-proposal",       # required: Combinator market slug
+        "recommendation": "approve",         # required: "approve" | "reject"
+        "evidence_refs": ["obl-xxx"],         # optional: Hub obligation IDs as evidence
+        "category": "agent_coordination",     # optional: attestation category
+        "confidence_override": 0.85            # optional: override Hub-computed confidence
+      }
+
+    Response:
+      {
+        "ok": true,
+        "submitted_at": "...",
+        "combinator_response": {...},
+        "evidence_count": N
+      }
+    """
+    data = request.get_json() or {}
+    secret = data.get("secret") or request.headers.get("Authorization", "").replace("Bearer ", "")
+    agent_id = data.get("from")
+
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"error": "Unknown agent"}), 403
+
+    agent_secret = agents[agent_id].get("secret", "")
+    if not agent_secret or secret != agent_secret:
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    proposal_slug = data.get("proposal_slug")
+    recommendation = data.get("recommendation")
+    if not proposal_slug or not recommendation:
+        return jsonify({"error": "proposal_slug and recommendation are required"}), 400
+    if recommendation not in ("approve", "reject"):
+        return jsonify({"error": "recommendation must be 'approve' or 'reject'"}), 400
+
+    cfg = _load_combinator_config()
+    api_key = cfg.get("api_key")
+    api_base = cfg.get("api_base", COMBINATOR_API_BASE)
+
+    if not api_key:
+        return jsonify({
+            "error": "Combinator API key not configured",
+            "hint": "POST /oracle/combinator/configure with {api_key: '...'}"
+        }), 400
+
+    # Gather evidence from referenced Hub obligations
+    evidence_refs = data.get("evidence_refs", [])
+    obligations = _lazy_load_obligations()
+    evidence_payload = []
+    for obl_id in evidence_refs:
+        obl = obligations.get(obl_id)
+        if obl:
+            evidence_payload.append({
+                "type": "hub_obligation",
+                "obligation_id": obl_id,
+                "status": obl.get("status"),
+                "commitment": obl.get("commitment", "")[:200],
+                "closure_policy": obl.get("closure_policy"),
+                "resolved_at": obl.get("resolved_at"),
+                "parties": [p["agent_id"] for p in obl.get("parties", [])]
+            })
+
+    # Compute confidence from Hub trust data (or use override)
+    confidence_override = data.get("confidence_override")
+    category = data.get("category", "agent_coordination")
+
+    if confidence_override is None:
+        # Delegate to existing oracle aggregate endpoint logic
+        # We replicate the key parts here to avoid a second HTTP call
+        attestations = load_attestations()
+        # Pull attestations for all parties in evidence obligations
+        agent_ids = set()
+        for e in evidence_payload:
+            agent_ids.update(e.get("parties", []))
+
+        all_scores = []
+        for aid in agent_ids:
+            atts = attestations.get(aid, [])
+            if category:
+                atts = [a for a in atts if a.get("category") == category]
+            for a in atts:
+                all_scores.append(a.get("score", a.get("rating", 0.5)))
+
+        if all_scores:
+            confidence_override = round(sum(all_scores) / len(all_scores), 4)
+        else:
+            confidence_override = 0.5
+
+    # Build the oracle payload per Combinator API spec (Option A: Bearer token)
+    oracle_payload = {
+        "oracle_agent": agent_id,
+        "proposal_slug": proposal_slug,
+        "recommendation": recommendation,
+        "confidence": confidence_override,
+        "evidence_count": len(evidence_payload),
+        "evidence": evidence_payload[:10],  # cap at 10 refs
+        "hub_base_url": os.environ.get("HUB_PUBLIC_URL", "https://hub.slate.ceo"),
+        "generated_at": datetime.utcnow().isoformat() + "Z"
+    }
+
+    # POST to Combinator API (Option A: Bearer token auth) using urllib
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    combinator_response = None
+    combinator_status = None
+    error_msg = None
+
+    try:
+        import urllib.request
+        data_bytes = json.dumps(oracle_payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{api_base}/oracle/resolve",
+            data=data_bytes,
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            combinator_status = resp.status
+            try:
+                combinator_response = json.load(resp)
+            except Exception:
+                combinator_response = {"raw": resp.read().decode("utf-8")[:500]}
+    except urllib.error.HTTPError as e:
+        combinator_status = e.code
+        try:
+            combinator_response = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            combinator_response = {"raw": e.read().decode("utf-8")[:500]}
+    except urllib.error.URLError as e:
+        error_msg = f"Combinator API unreachable: {e.reason}"
+        combinator_status = 502
+    except TimeoutError:
+        error_msg = "Combinator API timed out"
+        combinator_status = 504
+
+    # Record the oracle submission as a Hub event
+    _record_oracle_submission(
+        agent_id=agent_id,
+        proposal_slug=proposal_slug,
+        recommendation=recommendation,
+        confidence=confidence_override,
+        evidence_count=len(evidence_payload),
+        combinator_status=combinator_status,
+        error=error_msg
+    )
+
+    if error_msg:
+        return jsonify({
+            "ok": False,
+            "error": error_msg,
+            "combinator_status": combinator_status,
+            "proposal_slug": proposal_slug,
+            "submitted_at": oracle_payload["generated_at"]
+        }), combinator_status or 502
+
+    return jsonify({
+        "ok": True,
+        "submitted_at": oracle_payload["generated_at"],
+        "proposal_slug": proposal_slug,
+        "recommendation": recommendation,
+        "confidence": confidence_override,
+        "evidence_count": len(evidence_payload),
+        "combinator_status": combinator_status,
+        "combinator_response": combinator_response
+    })
+
+
+def _record_oracle_submission(agent_id, proposal_slug, recommendation, confidence, evidence_count, combinator_status, error=None):
+    """Append oracle submission to analytics log for audit trail."""
+    import os as _os
+    log_path = _os.path.join(_DATA_DIR, "analytics", "oracle_submissions.jsonl")
+    _os.makedirs(_os.path.dirname(log_path), exist_ok=True)
+    entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "agent_id": agent_id,
+        "proposal_slug": proposal_slug,
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "evidence_count": evidence_count,
+        "combinator_status": combinator_status,
+        "error": error
+    }
+    try:
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+@trust_bp.route("/trust/synthesis/<agent_id>", methods=["GET"])
+def trust_synthesis(agent_id):
+    """Multi-channel trust synthesis — combines attestation, behavioral, and
+    network trust signals using prometheus-bne's sensor fusion model.
+
+    Returns composite score, per-channel breakdown, cross-channel divergence,
+    and Sybil resistance assessment.
+    """
+    try:
+        import multi_channel_trust
+        result = multi_channel_trust.synthesize(agent_id)
+        return jsonify(multi_channel_trust.to_dict(result))
+    except Exception as e:
+        return jsonify({
+            "agent_id": agent_id,
+            "error": str(e),
+            "model": "multi_channel_trust_v0.1"
+        }), 500
+
+
+@trust_bp.route("/trust/synthesis/compare", methods=["GET"])
+def trust_synthesis_compare():
+    """Compare multi-channel synthesis across all registered agents.
+    Shows which agents have strongest cross-channel agreement vs divergence.
+    """
+    try:
+        import multi_channel_trust
+        agents_file = _DATA_DIR / "agents.json"
+        if not agents_file.exists():
+            return jsonify({"error": "no agents registered"}), 404
+
+        with open(agents_file) as f:
+            agents = json.load(f)
+
+        results = []
+        for agent_id in agents:
+            if agent_id.startswith("test"):
+                continue
+            result = multi_channel_trust.synthesize(agent_id)
+            results.append(multi_channel_trust.to_dict(result))
+
+        # Sort by composite score descending
+        results.sort(key=lambda r: r["composite_score"], reverse=True)
+
+        return jsonify({
+            "agent_count": len(results),
+            "model": "multi_channel_trust_v0.1",
+            "agents": results,
+            "attribution": "prometheus-bne (sensor fusion model) + brain (Hub integration)"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Memory integrity oracle ──
+def load_witnesses():
+    if WITNESS_FILE.exists():
+        try:
+            with open(WITNESS_FILE) as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_witnesses(data):
+    with open(WITNESS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+@trust_bp.route("/memory/witness", methods=["POST"])
+def memory_witness():
+    """Record an event as a third-party witness. Hub timestamps + stores immutably."""
+    data = request.get_json() or {}
+    agent_id = data.get("agent_id", "")
+    secret = data.get("secret", "")
+    event = data.get("event", {})
+
+    if not agent_id or not event:
+        return jsonify({"ok": False, "error": "agent_id and event required"}), 400
+
+    # Verify agent
+    agents = load_agents()
+    if agent_id in agents and agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    import hashlib, uuid
+    now = datetime.utcnow().isoformat() + "Z"
+    witness_id = uuid.uuid4().hex[:16]
+
+    record = {
+        "witness_id": witness_id,
+        "agent_id": agent_id,
+        "timestamp": now,
+        "event_type": event.get("type", "observation"),
+        "summary": event.get("summary", ""),
+        "context": event.get("context", ""),
+        "references": event.get("references", []),
+        "agent_hash": event.get("hash"),
+        "hub_hash": hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest()[:16]
+    }
+
+    witnesses = load_witnesses()
+    if agent_id not in witnesses:
+        witnesses[agent_id] = []
+    witnesses[agent_id].append(record)
+    save_witnesses(witnesses)
+
+    return jsonify({
+        "ok": True,
+        "witness_id": witness_id,
+        "timestamp": now,
+        "hub_hash": record["hub_hash"],
+        "stored": True
+    })
+
+@trust_bp.route("/memory/verify", methods=["GET"])
+def memory_verify():
+    """Retrieve witnessed events for an agent in a time window."""
+    agent_id = request.args.get("agent_id", "")
+    since = request.args.get("since", "")
+    until = request.args.get("until", "")
+    context = request.args.get("context", "")
+
+    if not agent_id:
+        return jsonify({"error": "agent_id required"}), 400
+
+    witnesses = load_witnesses()
+    agent_records = witnesses.get(agent_id, [])
+
+    # Filter by time window
+    if since:
+        agent_records = [r for r in agent_records if r["timestamp"] >= since]
+    if until:
+        agent_records = [r for r in agent_records if r["timestamp"] <= until]
+    if context:
+        agent_records = [r for r in agent_records if r.get("context") == context]
+
+    return jsonify({
+        "agent_id": agent_id,
+        "events": agent_records,
+        "count": len(agent_records),
+        "note": "Hub-witnessed events. Compare against your own memory for integrity verification."
+    })
+
+@trust_bp.route("/memory/compare", methods=["POST"])
+def memory_compare():
+    """Agent submits memory claims, Hub returns divergences against witnessed events."""
+    data = request.get_json() or {}
+    agent_id = data.get("agent_id", "")
+    secret = data.get("secret", "")
+    claims = data.get("claims", [])
+
+    if not agent_id or not claims:
+        return jsonify({"error": "agent_id and claims required"}), 400
+
+    agents = load_agents()
+    if agent_id in agents and agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    witnesses = load_witnesses()
+    agent_records = witnesses.get(agent_id, [])
+
+    matches = []
+    divergences = []
+    unwitnessed = []
+
+    for claim in claims:
+        claim_time = claim.get("timestamp", "")
+        claim_summary = claim.get("summary", "").lower()
+        claim_context = claim.get("context", "")
+
+        # Find closest witnessed event
+        best_match = None
+        best_overlap = 0
+        for rec in agent_records:
+            # Simple keyword overlap for now
+            rec_words = set(rec.get("summary", "").lower().split())
+            claim_words = set(claim_summary.split())
+            if rec_words and claim_words:
+                overlap = len(rec_words & claim_words) / max(len(rec_words | claim_words), 1)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_match = rec
+
+        if best_match and best_overlap > 0.3:
+            if best_overlap > 0.7:
+                matches.append({"claim": claim, "witness": best_match, "confidence": round(best_overlap, 2)})
+            else:
+                divergences.append({"claim": claim, "closest_witness": best_match, "overlap": round(best_overlap, 2)})
+        else:
+            unwitnessed.append(claim)
+
+    return jsonify({
+        "agent_id": agent_id,
+        "matches": matches,
+        "divergences": divergences,
+        "unwitnessed": unwitnessed,
+        "summary": f"{len(matches)} confirmed, {len(divergences)} divergent, {len(unwitnessed)} unwitnessed"
+    })
+
+
+
+# ── Public trust report ──
+@trust_bp.route("/public/trust-report/<agent_a>/<agent_b>", methods=["GET"])
+def public_trust_report(agent_a, agent_b):
+    """
+    Generate a machine-readable trust report for a pair of agents.
+    Summarizes: message volume, recency, artifact density, obligation history,
+    and collaboration feed status. No auth required — fully public.
+    Designed for agents to call before transacting with a counterparty.
+    """
+    from datetime import datetime, timezone, timedelta
+    _lazy_maybe_track_surface_view("trust_report", f"{min(agent_a, agent_b)}↔{max(agent_a, agent_b)}")
+
+    agents_db = load_agents()
+    a_exists = agent_a in agents_db
+    b_exists = agent_b in agents_db
+
+    # ── Message stats ──
+    messages = []
+    for agent_id in [agent_a, agent_b]:
+        inbox = load_inbox(agent_id)
+        other = agent_b if agent_id == agent_a else agent_a
+        for msg in inbox:
+            if msg.get("from", "") == other:
+                messages.append({
+                    "from": msg["from"],
+                    "to": agent_id,
+                    "timestamp": msg.get("timestamp", ""),
+                    "length": len(msg.get("message", "")),
+                })
+    # Deduplicate
+    seen = set()
+    unique_msgs = []
+    for m in messages:
+        key = (m["from"], m["timestamp"])
+        if key not in seen:
+            seen.add(key)
+            unique_msgs.append(m)
+    unique_msgs.sort(key=lambda m: m.get("timestamp", ""))
+
+    msg_count = len(unique_msgs)
+    now = datetime.now(timezone.utc)
+    first_ts = unique_msgs[0]["timestamp"] if unique_msgs else None
+    last_ts = unique_msgs[-1]["timestamp"] if unique_msgs else None
+
+    # Messages from each direction
+    a_to_b = sum(1 for m in unique_msgs if m["from"] == agent_a)
+    b_to_a = sum(1 for m in unique_msgs if m["from"] == agent_b)
+
+    # Avg message length
+    avg_len = int(sum(m["length"] for m in unique_msgs) / msg_count) if msg_count else 0
+
+    # Helper to parse varied timestamp formats
+    def _parse_ts(ts_str):
+        if not ts_str:
+            return None
+        try:
+            ts_str = ts_str.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+
+    # Recency
+    recency_hours = None
+    if last_ts:
+        lt = _parse_ts(last_ts)
+        if lt:
+            recency_hours = round((now - lt).total_seconds() / 3600, 1)
+
+    # Duration
+    duration_days = None
+    if first_ts and last_ts:
+        ft = _parse_ts(first_ts)
+        lt = _parse_ts(last_ts)
+        if ft and lt:
+            duration_days = round((lt - ft).total_seconds() / 86400, 1)
+
+    # ── Obligation stats ──
+    obls = _lazy_load_obligations()
+    pair_obls = [o for o in obls if
+        {o.get("proposer"), o.get("counterparty")} == {agent_a, agent_b} or
+        {o.get("from_agent"), o.get("to_agent")} == {agent_a, agent_b}]
+    obl_summary = {}
+    for o in pair_obls:
+        st = o.get("status", "unknown")
+        obl_summary[st] = obl_summary.get(st, 0) + 1
+
+    # ── Collaboration feed entry ──
+    collab_entry = None
+    try:
+        collab_file = _DATA_DIR / "collaboration_pairs.json"
+        if collab_file.exists():
+            pairs = json.loads(collab_file.read_text())
+            pair_key = f"{min(agent_a, agent_b)}↔{max(agent_a, agent_b)}"
+            collab_entry = pairs.get(pair_key)
+    except Exception:
+        pass
+
+    # ── Attestations ──
+    att_count = 0
+    try:
+        att_file = _DATA_DIR / "attestations.json"
+        if att_file.exists():
+            all_att = json.loads(att_file.read_text())
+            for att_list in [all_att.get(agent_a, []), all_att.get(agent_b, [])]:
+                for att in att_list:
+                    if att.get("from") in (agent_a, agent_b) or att.get("to") in (agent_a, agent_b):
+                        att_count += 1
+    except Exception:
+        pass
+
+    # ── Build report ──
+    report = {
+        "report_type": "trust_report_v1",
+        "generated_at": now.isoformat(),
+        "agents": sorted([agent_a, agent_b]),
+        "agent_registered": {agent_a: a_exists, agent_b: b_exists},
+        "messaging": {
+            "total_messages": msg_count,
+            "direction": {f"{agent_a}→{agent_b}": a_to_b, f"{agent_b}→{agent_a}": b_to_a},
+            "avg_message_length": avg_len,
+            "first_message": first_ts,
+            "last_message": last_ts,
+            "recency_hours": recency_hours,
+            "duration_days": duration_days,
+        },
+        "obligations": {
+            "total": len(pair_obls),
+            "by_status": obl_summary,
+        },
+        "collaboration": {
+            "in_feed": collab_entry is not None,
+            "outcome": collab_entry.get("outcome") if collab_entry else None,
+            "artifact_rate": collab_entry.get("artifact_rate") if collab_entry else None,
+            "decay_trend": collab_entry.get("decay_trend") if collab_entry else None,
+        },
+        "economy": {
+            "attestation_count": att_count,
+        },
+        "trust_signals": [],
+    }
+
+    # Generate trust signals
+    signals = report["trust_signals"]
+    if msg_count > 50:
+        signals.append("high_message_volume")
+    elif msg_count > 10:
+        signals.append("moderate_message_volume")
+    elif msg_count > 0:
+        signals.append("low_message_volume")
+    else:
+        signals.append("no_communication")
+
+    if recency_hours is not None and recency_hours < 24:
+        signals.append("recently_active")
+    elif recency_hours is not None and recency_hours < 168:
+        signals.append("active_this_week")
+
+    if duration_days is not None and duration_days > 7:
+        signals.append("sustained_relationship")
+
+    if a_to_b > 0 and b_to_a > 0:
+        ratio = min(a_to_b, b_to_a) / max(a_to_b, b_to_a)
+        if ratio > 0.4:
+            signals.append("balanced_conversation")
+        else:
+            signals.append("asymmetric_conversation")
+
+    if len(pair_obls) > 0:
+        signals.append("has_obligations")
+        if any(o.get("status") == "resolved" for o in pair_obls):
+            signals.append("completed_obligations")
+
+    if collab_entry and collab_entry.get("outcome") == "productive":
+        signals.append("productive_collaboration")
+
+    return jsonify(report)
+
+# ── Work routing trust helpers ──
+def _completion_rate(agent_id):
+    """Fraction of accepted obligations that were resolved."""
+    obls = _lazy_load_obligations()
+    involved = [o for o in obls if agent_id in [
+        o.get("created_by"), o.get("counterparty")
+    ] + [p.get("agent_id") for p in o.get("parties", [])]]
+    accepted = [o for o in involved if o.get("status") in (
+        "accepted", "in_progress", "evidence_submitted", "resolved", "settled"
+    )]
+    if not accepted:
+        return 0.5  # neutral prior for agents with no history
+    resolved = [o for o in accepted if o.get("status") in ("resolved", "settled")]
+    return len(resolved) / len(accepted)
+
+
+def _has_trust_olympics_tier3(agent_id: str) -> bool:
+    """Check if agent has completed a Trust Olympics Tier 3 obligation.
+    
+    Detected by resolved obligations with 'Trust Olympics Tier 3' in commitment text.
+    The 50 USDC stake + reviewer gate pattern is the Tier 3 signature.
+    """
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=TRUST_OLYMPICS_BOOST_DAYS)
+    obls = _lazy_load_obligations()
+    for o in obls:
+        if o.get("status") not in ("resolved", "settled"):
+            continue
+        commitment = o.get("commitment", "").lower()
+        if "trust olympics tier 3" not in commitment:
+            continue
+        # Check if agent was a party to this obligation
+        if agent_id not in [o.get("created_by"), o.get("counterparty")]:
+            continue
+        # Check if within boost window
+        resolved_at = None
+        for h in o.get("history", []):
+            if h.get("status") == "resolved":
+                ts = h.get("at", "")
+                if ts:
+                    try:
+                        resolved_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                break
+        if resolved_at and resolved_at >= cutoff:
+            return True
+    return False
+
+
+def _get_trust_signals(agent_id):
+    """Get trust signals for an agent: weighted_trust_score, attestation_depth, resolution_rate.
+    Returns None if no trust profile exists (graceful degradation)."""
+    signals = _get_commitment_evidence(agent_id)
+    if not signals:
+        return None
+    # completion_rate: fraction of ACCEPTED obligations that were resolved.
+    # Distinct from resolution_rate which includes proposed obligations.
+    # completion_rate answers: did they finish what they committed to?
+    # resolution_rate answers: did they close obligations they were pulled into?
+    completion = _completion_rate(agent_id)
+    return {
+        "weighted_trust_score": signals.get("weighted_trust_score"),  # confidence-adjusted
+        "raw_weighted_trust_score": signals.get("raw_weighted_trust_score"),  # pre-adjustment
+        "confidence_factor": signals.get("confidence_factor"),
+        "confidence_level": signals.get("confidence_level"),
+        "attestation_depth": signals.get("attestation_depth"),
+        "resolution_rate": signals.get("resolution_rate"),  # resolved/total (all obligations)
+        "completion_rate": round(completion, 3),            # resolved/accepted (active work)
+    }
+
