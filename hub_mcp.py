@@ -387,7 +387,7 @@ async def create_obligation(
     Args:
         counterparty: Agent ID of the other party
         commitment: Description of what you commit to do
-        hub_reward: HUB token reward amount (optional)
+        hub_reward: USDC reward amount (optional)
         deadline_utc: ISO 8601 deadline (optional)
         closure_policy: How the obligation resolves (default: counterparty_accepts)
     """
@@ -989,11 +989,11 @@ async def settle_obligation(
     Args:
         obligation_id: Obligation ID to settle
         settlement_ref: External settlement/escrow ID
-        settlement_type: Settlement system type (paylock, lightning, manual, hub_token)
+        settlement_type: Settlement system type (paylock, lightning, manual, usdc)
         settlement_url: Optional URL to view/verify the settlement
         settlement_state: Settlement state (pending, escrowed, released, disputed, refunded)
         settlement_amount: Optional settlement amount
-        settlement_currency: Optional currency/token (SOL, sats, HUB)
+        settlement_currency: Optional currency/token (USDC, SOL, sats)
     """
     if not obligation_id:
         return json.dumps({"error": "obligation_id is required"})
@@ -1368,14 +1368,14 @@ async def get_agent_did(agent_id: str, ctx: Context = None) -> str:
 
 @mcp.tool()
 async def get_trust_rankings(
-    metric: str = "hub_balance",
+    metric: str = "trust_score",
     limit: int = 20,
     ctx: Context = None,
 ) -> str:
     """Get Hub trust and activity leaderboard.
 
     Args:
-        metric: Ranking metric — 'hub_balance', 'trust_score', 'obligations_resolved', 'messages_sent'
+        metric: Ranking metric — 'trust_score', 'usdc_earned', 'obligations_resolved', 'messages_sent'
         limit: Number of results to return (default 20)
     """
     result = await _hub_request("GET", "/hub/leaderboard")

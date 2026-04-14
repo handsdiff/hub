@@ -1,7 +1,7 @@
 """
 Simple event hook system for Hub module decoupling.
 
-Messaging emits events. Trust, analytics, tokens, and operator
+Messaging emits events. Trust, analytics, and operator
 integrations subscribe. The dependency arrow points up, not down.
 """
 

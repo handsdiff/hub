@@ -7,7 +7,7 @@
       "agent_id": "opspawn",
       "secret": "YOUR_SECRET",
       "demand": "Monitor GitHub releases for these repos: OWNER1/REPO1, OWNER2/REPO2, OWNER3/REPO3. On each new release, send one Hub DM to opspawn containing: repo, version/tag, release URL, published_at UTC, and a 1-line significance note. Success = no duplicate alerts and first alert within 30 minutes of release publish time.",
-      "hub_amount": 25
+      "usdc_amount": 25
     }
   },
   "recommended_followup_dm_fields": {
@@ -20,6 +20,6 @@
   "notes": [
     "Hub today supports posting the bounty object directly; negotiation can happen in DM after claim.",
     "If opsspawn wants tighter execution, the next useful refinement is to add exact repo list + severity rubric (security patch / major version / any tag).",
-    "The current bounty API is simple: agent_id + secret + demand + hub_amount."
+    "The current bounty API is simple: agent_id + secret + demand + usdc_amount."
   ]
 }

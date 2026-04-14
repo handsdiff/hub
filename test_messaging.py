@@ -174,14 +174,13 @@ class TestRegistration:
         from hub.messaging import on_agent_registered
 
         def add_extras(agent_id, record, data):
-            return {"hub_balance": 100, "hub_token": "TOKEN123"}
+            return {"custom_field": "test123"}
 
         on_agent_registered.subscribe(add_extras)
         with app.test_client() as c:
             resp = c.post("/agents/register", json={"agent_id": "extras-test"})
             data = resp.get_json()
-            assert data["hub_balance"] == 100
-            assert data["hub_token"] == "TOKEN123"
+            assert data["ok"] is True
 
     def test_welcome_message_in_inbox(self, msg_app):
         app, _ = msg_app

@@ -1,6 +1,6 @@
 """
-HUB SPL Token Transfer Module
-Handles on-chain HUB token transfers for bounties, airdrops, etc.
+USDC SPL Token Transfer Module
+Handles on-chain USDC transfers for bounties, settlements, etc.
 Error classification: retriable vs permanent.
 """
 
@@ -14,14 +14,14 @@ from solders.transaction import Transaction
 from solders.message import Message
 from solders.compute_budget import set_compute_unit_price
 
-HUB_MINT = Pubkey.from_string("9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue")
+USDC_MINT = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 ASSOCIATED_TOKEN_PROGRAM = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 SYSTEM_PROGRAM = Pubkey.from_string("11111111111111111111111111111111")
 RENT = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
 
-# HUB has 6 decimals
-HUB_DECIMALS = 6
+# USDC has 6 decimals
+USDC_DECIMALS = 6
 
 # Load wallet — try hub-wallet-v2.json first (base58 string), then hub-wallet.json (list bytes)
 _wallet_paths = [
@@ -43,12 +43,12 @@ for _wp in _wallet_paths:
             elif isinstance(_pk, list):
                 WALLET_KP = Keypair.from_bytes(bytes(_pk))
             WALLET_PUBKEY = WALLET_KP.pubkey()
-            print(f"[HUB-SPL] Loaded wallet from {_wp}: {WALLET_PUBKEY}")
+            print(f"[USDC-SPL] Loaded wallet from {_wp}: {WALLET_PUBKEY}")
             break
         except Exception as e:
-            print(f"[HUB-SPL] Failed to load wallet from {_wp}: {e}")
+            print(f"[USDC-SPL] Failed to load wallet from {_wp}: {e}")
 if WALLET_KP is None:
-    print("[HUB-SPL] WARNING: No wallet keypair found — SPL transfers will fail. Set up wallet at credentials/hub-wallet[-v2].json")
+    print("[USDC-SPL] WARNING: No wallet keypair found — USDC transfers will fail. Set up wallet at credentials/hub-wallet[-v2].json")
 
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 CLIENT = Client(SOLANA_RPC_URL)
@@ -101,14 +101,14 @@ def _classify_error(exc: Exception) -> str:
 
 # ─── Token helpers ──────────────────────────────────────────────────────────
 
-def get_ata(owner: Pubkey, mint: Pubkey = HUB_MINT) -> Pubkey:
+def get_ata(owner: Pubkey, mint: Pubkey = USDC_MINT) -> Pubkey:
     """Derive associated token account address."""
     seeds = [bytes(owner), bytes(TOKEN_PROGRAM), bytes(mint)]
     ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM)
     return ata
 
 
-def create_ata_instruction(payer: Pubkey, owner: Pubkey, mint: Pubkey = HUB_MINT) -> Instruction:
+def create_ata_instruction(payer: Pubkey, owner: Pubkey, mint: Pubkey = USDC_MINT) -> Instruction:
     """Create associated token account instruction."""
     ata = get_ata(owner, mint)
     return Instruction(
@@ -145,8 +145,8 @@ def ata_exists(ata: Pubkey) -> bool:
     return resp.value is not None
 
 
-def get_hub_balance(owner_address: str) -> float:
-    """Get HUB balance for an address."""
+def get_usdc_balance(owner_address: str) -> float:
+    """Get USDC balance for an address."""
     try:
         owner = Pubkey.from_string(owner_address)
         ata = get_ata(owner)
@@ -160,9 +160,9 @@ def get_hub_balance(owner_address: str) -> float:
 
 # ─── Core transfer ───────────────────────────────────────────────────────────
 
-def send_hub(recipient_address: str, amount: float) -> dict:
+def send_usdc(recipient_address: str, amount: float) -> dict:
     """
-    Send HUB tokens to a recipient.
+    Send USDC to a recipient.
     Creates ATA if needed. Returns tx signature or structured error.
 
     Returns:
@@ -183,7 +183,7 @@ def send_hub(recipient_address: str, amount: float) -> dict:
         }
 
     try:
-        amount_raw = int(amount * (10 ** HUB_DECIMALS))
+        amount_raw = int(amount * (10 ** USDC_DECIMALS))
     except Exception as exc:
         return {
             "success": False,
@@ -234,11 +234,11 @@ def send_hub(recipient_address: str, amount: float) -> dict:
 
 
 def get_treasury_balance() -> float:
-    """Get Brain's HUB treasury balance."""
-    return get_hub_balance(str(WALLET_PUBKEY))
+    """Get Hub's USDC treasury balance."""
+    return get_usdc_balance(str(WALLET_PUBKEY))
 
 
 if __name__ == "__main__":
     print(f"Wallet: {WALLET_PUBKEY}")
-    print(f"HUB Mint: {HUB_MINT}")
-    print(f"Treasury: {get_treasury_balance()} HUB")
+    print(f"USDC Mint: {USDC_MINT}")
+    print(f"Treasury: {get_treasury_balance()} USDC")

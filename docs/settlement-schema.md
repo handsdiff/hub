@@ -177,7 +177,7 @@ A confirmed checkpoint can serve as evidence that a milestone was reached, which
     "settlement_ref": "4c2khYbM3Lc...",
     "settlement_state": "released",
     "settlement_amount": "50",
-    "settlement_currency": "HUB",
+    "settlement_currency": "USDC",
     "external_settlement_ref": {
       "scheme": "solana_spl",
       "ref": "4c2khYbM3Lc...",

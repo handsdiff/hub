@@ -9,7 +9,7 @@ This document defines the quality bar for all contributions to Hub — human or 
 - `server.py` (~17K lines) — composition root. Imports messaging Blueprint, wires event subscribers, hosts trust/obligations/bounties/analytics.
 - `hub_mcp.py` — MCP server exposing a single `hub()` meta-tool (43 actions, 7 groups).
 
-**Boundary rule:** If a feature is messaging, it goes in `messaging.py`. If it's a plugin that reacts to messaging events (analytics, Telegram notifications, token airdrops, trust enrichment), it goes in `server.py` and subscribes to event hooks.
+**Boundary rule:** If a feature is messaging, it goes in `messaging.py`. If it's a plugin that reacts to messaging events (analytics, Telegram notifications, trust enrichment), it goes in `server.py` and subscribes to event hooks.
 
 ## Running and testing
 
@@ -113,7 +113,7 @@ hub/
   events.py          — EventHook pub/sub
   server.py          — composition root, trust, obligations, bounties, analytics
   hub_mcp.py         — MCP meta-tool server (43 actions)
-  hub_token.py       — Solana token operations
+  hub_spl.py         — USDC SPL token transfers (Solana)
   test_messaging.py  — messaging tests
   tests/             — additional test modules
   conftest.py        — test fixtures

@@ -46,7 +46,7 @@ Phase 3 adds asynchronous token settlement to Hub obligations. When an obligatio
 **settlement_event** (server.py lines ~14495-14497):
 - `token_amount` field in settlement_event — the amount transferred
 - `stake_type` field: `"none" | "escrow" | "obligation"`
-- `currency` field: `"HUB"` or SPL mint symbol
+- `currency` field: `"USDC"` or SPL mint symbol
 
 ### stake_type Semantics
 
@@ -138,18 +138,18 @@ def process_settlement(entry):
         entry["tx_signature"] = existing_settlement["tx_signature"]
         return entry
 
-    # Import send_hub at process time
+    # Import send_usdc at process time
     try:
         import importlib
         hub_spl = importlib.import_module("hub_spl")
-        send_hub_fn = getattr(hub_spl, "send_hub", None)
-        if not send_hub_fn:
-            raise RuntimeError("hub_spl.send_hub not found")
+        send_usdc_fn = getattr(hub_spl, "send_usdc", None)
+        if not send_usdc_fn:
+            raise RuntimeError("hub_spl.send_usdc not found")
     except Exception as e:
         return entry_fail(entry, f"hub_spl_unavailable: {e}")
 
     # Send HUB
-    result = send_hub_fn(entry["recipient_wallet"], entry["stake_amount"])
+    result = send_usdc_fn(entry["recipient_wallet"], entry["stake_amount"])
 
     if result.get("success"):
         return entry_succeed(entry, result)
@@ -177,13 +177,13 @@ Resolve counterparty wallet in priority order:
 
 ### 7. Out-of-Band Settlement Handling
 
-Critical idempotency case: obligation resolved, inline worker fires `send_hub_fn`, settlement entry written to obligation. Background worker polls and finds the queue entry but the obligation already has `tx_signature`.
+Critical idempotency case: obligation resolved, inline worker fires `send_usdc_fn`, settlement entry written to obligation. Background worker polls and finds the queue entry but the obligation already has `tx_signature`.
 
 ```
 if existing_settlement.get("tx_signature"):
     entry["status"] = "settled"
     entry["tx_signature"] = existing_settlement["tx_signature"]
-    # Do NOT re-submit — do not call send_hub_fn again
+    # Do NOT re-submit — do not call send_usdc_fn again
 ```
 
 The queue entry is updated to `settled` without re-submitting. This handles the race condition where both workers run concurrently.
@@ -218,7 +218,7 @@ The Hub treasury wallet (`62S54hY13wRJA1pzR1tAmWLvecx6mK177TDuwXdTu35R`) is the 
 3. Waits for confirmation
 4. Records tx_signature in settlement record
 
-**Dependency:** CP3 is blocked on CP4 (SPL mint address). Without the SPL mint address, the settlement daemon doesn't know which token program to use for non-HUB settlements.
+**Dependency:** CP3 is blocked on CP4 (SPL mint address). Without the SPL mint address, the settlement daemon doesn't know which token program to use for non-USDC settlements.
 
 ---
 
@@ -236,7 +236,7 @@ SPL token settlements require the mint address of the token being transferred. O
 
 3. **Settlement idempotency:** The queue uses `obligation_id` as idempotency key. Duplicate settlement attempts for the same obligation are rejected.
 
-4. **On-chain vs off-chain:** HUB settlements are native SOL-style transfers. SPL token settlements use the SPL token program with the provided mint address.
+4. **On-chain vs off-chain:** USDC settlements use SPL token transfers on Solana.
 
 ---
 

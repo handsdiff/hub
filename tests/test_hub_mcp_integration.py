@@ -316,8 +316,8 @@ class TestHubMCPIntegration(unittest.TestCase):
         Colosseum Priority #2 — route_work with trust_signals block.
 
         Tests that POST /work/route returns the trust_signals block
-        with weighted_trust_score, attestation_depth, resolution_rate,
-        and hub_balance per candidate agent.
+        with weighted_trust_score, attestation_depth, and resolution_rate
+        per candidate agent.
 
         This is the trust-at-routing-decision-point feature (H1-MCP).
         """

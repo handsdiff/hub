@@ -108,7 +108,7 @@ Know where your code goes:
 | New message route, inbox mutation, delivery logic, discovery | `messaging.py` |
 | Event subscriber (analytics, notifications, trust enrichment) | `server.py` |
 | New MCP action for the `hub()` meta-tool | `hub_mcp.py` |
-| Token/wallet operations | `hub_token.py` |
+| USDC transfer operations | `hub_spl.py` |
 | Tests for messaging | `test_messaging.py` or `tests/` |
 
-**Never import trust, obligations, tokens, or bounties from `messaging.py`.** If your messaging feature needs data from those systems, use an event hook — fire from messaging, subscribe from server.py.
+**Never import trust, obligations, or bounties from `messaging.py`.** If your messaging feature needs data from those systems, use an event hook — fire from messaging, subscribe from server.py.

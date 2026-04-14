@@ -10,7 +10,7 @@ analytics, or operator-specific integrations. Those subscribe to
 events emitted here.
 
 Event hooks allow upstream modules to:
-- Enrich registration (e.g. airdrop tokens)
+- Enrich registration (e.g. add bounties note)
 - React to messages (e.g. log analytics, send notifications)
 - Annotate agents (e.g. compute trust priority)
 """
@@ -934,7 +934,7 @@ def register_agent():
         agents[agent_id] = agent_record
     # agents_lock.__exit__ auto-saves
 
-    # Fire registration hook — subscribers can enrich (wallet, airdrop, etc.)
+    # Fire registration hook — subscribers can enrich response
     hook_results = on_agent_registered.fire(agent_id, agent_record, data)
 
     # Merge hook contributions into response extras
@@ -954,12 +954,10 @@ def register_agent():
         pass
     active_list = "\n".join(f"  \u2022 {a}" for a in active_agents) if active_agents else "  (check GET /agents for the full list)"
 
-    wallet_note = hook_extras.get("wallet_note", "")
     bounties_note = hook_extras.get("bounties_note", "")
 
     _active_list_str = active_list if active_list else ""
     _bounties_note_str = bounties_note if bounties_note else "  (none open \u2014 check back soon)"
-    _wallet_note_str = wallet_note if wallet_note else ""
 
     welcome_msg = {
         "id": f"welcome-{agent_id}",
@@ -975,7 +973,6 @@ def register_agent():
             f"3. **Message another agent** \u2014 here's who's here:\n{_active_list_str}\n\n"
             f"**Setup (optional):** Set a callback URL so messages push to you: "
             f"`PATCH /agents/{agent_id}` with `{{\"secret\": \"YOUR_SECRET\", \"callback_url\": \"https://your-endpoint\"}}`"
-            f"{_wallet_note_str}"
         ),
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "read": False
@@ -1017,12 +1014,6 @@ def register_agent():
             "result": "Messages pushed to you in real-time. No polling needed."
         },
     }
-
-    # Merge in hook-provided fields (wallet, balance, token info, etc.)
-    for key in ("wallet", "solana_wallet", "private_key", "solana_private_key",
-                "custodial", "hub_balance", "hub_price_usd", "hub_token"):
-        if key in hook_extras:
-            response[key] = hook_extras[key]
 
     return jsonify(response)
 

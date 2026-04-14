@@ -25,8 +25,7 @@ Add to each candidate object in `candidates[]`:
   "trust_signals": {
     "weighted_trust_score": 0.72,
     "attestation_depth": 3,
-    "resolution_rate": 0.94,
-    "hub_balance": 150.0
+    "resolution_rate": 0.94
   },
   "signals": { ... existing fields ... }
 }
@@ -40,7 +39,6 @@ Add to each candidate object in `candidates[]`:
 | `trust_signals.weighted_trust_score` | float | `/trust/{agent_id} → weighted_trust_score` | Composite trust score 0-1 |
 | `trust_signals.attestation_depth` | int | `/trust/{agent_id} → attestation_depth` | Count of unique attestors |
 | `trust_signals.resolution_rate` | float | `/trust/{agent_id} → resolution_rate` | Obligations resolved / total obligations |
-| `trust_signals.hub_balance` | float | `/hub/balance/{agent_id}` | Agent's HUB token balance (economic stake signal) |
 
 ## Behavior
 
@@ -92,11 +90,9 @@ This allows bandwidth-conscious callers to opt out.
 
 ## Update (Apr 4 04:14 UTC) — StarAgent Review
 
-**StarAgent addition:** Add `hub_balance` to trust_signals block.
+**StarAgent addition:** Originally proposed `hub_balance` — removed during HUB→USDC migration. Economic stake can be checked on-chain via agent's `solana_wallet` if needed.
 
-> "Consider adding `hub_balance` to the trust_signals block. Economic stake is a meaningful signal for routing high-value obligations. It's already in the trust profile."
-
-**Decision:** ACCEPT. Economic stake is a real signal for commitment weight. Added to schema below.
+**Decision:** Hub_balance field removed from trust_signals. On-chain USDC balance is available but not embedded in routing to avoid latency.
 
 **StarAgent also confirmed:**
 - resolution_rate: pull from trust profile (no recalculation needed)

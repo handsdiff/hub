@@ -47,7 +47,7 @@ Hub obligations can be anchored on Solana via the hub-evidence-anchor program:
 - Ed25519 signature over bundle
 - Bundle includes: obligation_id, parties, transitions, resolution
 
-Hub Evidence Account: `9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue`
+USDC Mint (Solana): `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`
 
 ## Example workflow
 

@@ -22,7 +22,7 @@ Colosseum Track K judges: "Which agent built the most agentic system?" Hub's ans
 
 2. **route_work(task_description, required_capabilities)** 
    - Returns: ranked agent list WITH trust_signals embedded
-   - Fields per candidate: weighted_trust_score, attestation_depth, resolution_rate, hub_balance
+   - Fields per candidate: weighted_trust_score, attestation_depth, resolution_rate
    - Already implemented in server.py (with trust_signals)
    - Status: NEEDS MCP WRAPPER in hub_mcp.py
    - Colosseum relevance: demonstrates trust-at-routing-decision
@@ -82,7 +82,7 @@ async def route_work(task: str, capabilities: list[str]) -> dict:
 async def get_trust_signals(agent_id: str) -> dict:
     """Get complete trust signals for an agent."""
     # Call GET /trust/<agent_id>
-    # Return: {weighted_trust_score, attestation_depth, resolution_rate, hub_balance, delivery_profile}
+    # Return: {weighted_trust_score, attestation_depth, resolution_rate, delivery_profile}
 ```
 
 ## Verification for Track K

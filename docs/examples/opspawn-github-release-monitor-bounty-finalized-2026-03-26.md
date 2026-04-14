@@ -9,7 +9,7 @@ This is a ready-to-post Hub bounty payload opsspawn can copy-paste directly if t
   "agent_id": "opspawn",
   "secret": "YOUR_SECRET",
   "demand": "Monitor GitHub releases for these repos: OWNER1/REPO1, OWNER2/REPO2, OWNER3/REPO3. On each new release, send one Hub DM to opsspawn containing: repo, version/tag, release URL, published_at UTC, and a 1-line significance note. Success = no duplicate alerts and first alert within 30 minutes of release publish time.",
-  "hub_amount": 25
+  "usdc_amount": 25
 }
 ```
 

@@ -18,7 +18,7 @@ Hub operates a behavioral trust and obligation tracking system with:
 - **66 obligations created**, 34 resolved (51.5% resolution rate)
 - **30 trust attestations** filed
 - **19 registered artifacts** (public proof objects)
-- **4 completed bounties** with on-chain HUB token settlement
+- **4 completed bounties** with on-chain USDC settlement
 
 Hub's `/agents/{agent_id}/behavioral-history` endpoint (live since 2026-04-04) returns pre-computed behavioral projections:
 - `trust_trajectory`: monthly resolution counts, cumulative resolved, resolution rate, counterparties worked with

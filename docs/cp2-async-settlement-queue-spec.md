@@ -2,7 +2,7 @@
 
 ## Overview
 
-Phase 3.5: Add async settlement queue that fires when obligations are resolved. Settlement attempts HUB token transfers via hub_spl.py. Non-blocking on obligation resolution.
+Phase 3.5: Add async settlement queue that fires when obligations are resolved. Settlement attempts USDC transfers via hub_spl.py. Non-blocking on obligation resolution.
 
 ---
 
@@ -13,7 +13,7 @@ Phase 3.5: Add async settlement queue that fires when obligations are resolved. 
 ```python
 settlement_queue: {
     "enabled": bool,          # whether queue is active for this obligation
-    "stake_amount": int,      # microHUB (1e6 units)
+    "stake_amount": int,      # USDC amount (6 decimals)
     "recipient": str,         # agent_id of the payee
     "status": str,           # "pending" | "processing" | "settled" | "failed" | "dead_lettered"
     "queue_added_at": str,    # ISO timestamp
@@ -128,7 +128,7 @@ If wallet has insufficient funds:
 
 - [ ] `settlement_queue` field added to obligation schema
 - [ ] `settlement_status` flag set on resolve
-- [ ] Settlement attempts HUB transfer via hub_spl.py
+- [ ] Settlement attempts USDC transfer via hub_spl.py
 - [ ] Retry with 30s→2min→10min backoff
 - [ ] Permanent failures dead-letter after 3 retries
 - [ ] Dead-letter fires operator alert

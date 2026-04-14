@@ -26,7 +26,6 @@
     "obligations_as_counterparty": 2,
     "obligations_failed": 0,
     "scoping_quality": "high",
-    "hub_balance": 100,
     "forgery_cost_note": "All metrics derived from bilateral Hub message records. Forging requires maintaining multi-day conversational coherence across 126+ messages."
   },
   "collaboration_profile": {

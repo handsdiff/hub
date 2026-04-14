@@ -48,25 +48,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# --- HUB Price Cache ---
-_hub_price_cache = {"price": None, "updated": 0}
-def get_hub_price():
-    """Get HUB token price from DexScreener, cached 5 min."""
-    import time as _t
-    if _hub_price_cache["price"] and _t.time() - _hub_price_cache["updated"] < 300:
-        return _hub_price_cache["price"]
-    try:
-        import requests as _req
-        r = _req.get("https://api.dexscreener.com/latest/dex/tokens/9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue", timeout=5)
-        pairs = r.json().get("pairs", [])
-        if pairs:
-            price = float(pairs[0].get("priceUsd", 0))
-            _hub_price_cache["price"] = price
-            _hub_price_cache["updated"] = _t.time()
-            return price
-    except:
-        pass
-    return _hub_price_cache["price"] or 0
 
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -339,53 +320,10 @@ def _notify_sender_read_receipt(agent_id, message_id, sender_id):
 on_message_sent.subscribe(_notify_sender_delivery_receipt)
 on_message_read.subscribe(_notify_sender_read_receipt)
 
-# Registration: Solana wallet generation + HUB token airdrop
-def _registration_wallet_and_airdrop(agent_id, agent_record, registration_data):
-    """Generate custodial wallet, airdrop tokens, return extras for registration response."""
+# Registration: build bounties note for welcome message
+def _registration_extras(agent_id, agent_record, registration_data):
+    """Return extras for registration response (bounties note, hub_base)."""
     extras = {}
-    solana_wallet = registration_data.get("solana_wallet", "")
-    custodial_keypair = None
-    custodial_private_key = None
-    if not solana_wallet:
-        try:
-            from solders.keypair import Keypair as SolKeypair
-            import base58 as b58
-            kp = SolKeypair()
-            solana_wallet = str(kp.pubkey())
-            custodial_keypair = list(bytes(kp))
-            custodial_private_key = b58.b58encode(bytes(kp)).decode()
-            print(f"[WALLET] Generated custodial wallet for {agent_id}: {solana_wallet}")
-        except Exception as e:
-            print(f"[WALLET] Wallet generation failed for {agent_id}: {type(e).__name__}: {e}")
-
-    # Store wallet in agent record
-    with agents_lock() as agents:
-        if agent_id in agents:
-            agents[agent_id]["solana_wallet"] = solana_wallet
-            agents[agent_id]["custodial"] = custodial_keypair is not None
-            agents[agent_id]["wallets"] = [solana_wallet] if solana_wallet else []
-
-    # Store custodial keypair
-    if custodial_keypair:
-        wallets_file = os.path.join(DATA_DIR, "custodial_wallets.json")
-        wallets = {}
-        if os.path.exists(wallets_file):
-            try:
-                with open(wallets_file) as f:
-                    wallets = json.load(f)
-            except Exception:
-                pass
-        wallets[agent_id] = {"pubkey": solana_wallet, "keypair": custodial_keypair}
-        with open(wallets_file, "w") as f:
-            json.dump(wallets, f)
-
-    # Airdrop HUB tokens
-    airdrop_result = hub_airdrop(agent_id)
-    print(f"[HUB] Airdrop result for {agent_id}: {airdrop_result} HUB")
-
-    # Build extras for registration response
-    balances = load_hub_balances()
-    airdrop_balance = balances.get(agent_id, 0)
 
     # Build bounties note for welcome message
     bounties_note = ""
@@ -393,35 +331,17 @@ def _registration_wallet_and_airdrop(agent_id, agent_record, registration_data):
         all_bounties = load_bounties()
         open_b = [b for b in all_bounties if b.get("status") == "open"]
         if open_b:
-            bounties_note = "\n".join(f"  \u2022 [{b['id']}] {b['demand'][:60]}... ({b.get('hub_amount',0)} HUB)" for b in open_b[:3])
+            bounties_note = "\n".join(f"  \u2022 [{b['id']}] {b['demand'][:60]}... ({b.get('usdc_amount',0)} USDC)" for b in open_b[:3])
     except Exception:
         pass
 
-    wallet_note = ""
-    if custodial_private_key:
-        wallet_note = (
-            f"\n\n**Your Solana wallet:** `{solana_wallet}`\n"
-            f"100 HUB tokens have been airdropped to this wallet. "
-            f"You own the private key (returned in your registration response). "
-            f"You can also add your own wallet via PATCH /agents/{agent_id} \u2014 both wallets count for trust attestations."
-        )
-
     extras.update({
-        "wallet": solana_wallet or None,
-        "solana_wallet": solana_wallet or None,
-        "private_key": custodial_private_key,
-        "solana_private_key": custodial_private_key,
-        "custodial": custodial_keypair is not None,
-        "hub_balance": airdrop_balance,
-        "hub_price_usd": get_hub_price(),
-        "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
         "hub_base": "https://hub.slate.ceo",
-        "wallet_note": wallet_note,
         "bounties_note": bounties_note,
     })
     return extras
 
-on_agent_registered.subscribe(_registration_wallet_and_airdrop)
+on_agent_registered.subscribe(_registration_extras)
 
 # Trust context on send_message 404s (recipient not found)
 def _enrich_404_with_trust_gap(from_agent, target_agent_id):
@@ -1003,7 +923,7 @@ def check_permission(agent_id, action, **kwargs):
 
     Supported actions:
         send_message: kwargs: recipient, size_bytes
-        create_obligation: kwargs: hub_amount, counterparty
+        create_obligation: kwargs: usdc_amount, counterparty
         trust_attest: kwargs: target_agent, claim
         scope_expansion: kwargs: obl_id
     """
@@ -1033,13 +953,13 @@ def check_permission(agent_id, action, **kwargs):
 
     # Numeric limit checks
     if action == "create_obligation":
-        hub_amount = kwargs.get("hub_amount", 0)
-        max_hub = constraints.get("max_obligation_hub", float("inf"))
-        effective_max = max_hub * trust_multiplier
-        if hub_amount > effective_max:
-            _log_permission_denial(agent_id, action, "hub_amount exceeds effective limit",
-                                    {"requested": hub_amount, "effective_max": round(effective_max, 2), "trust_multiplier": round(trust_multiplier, 2)})
-            return False, f"hub_amount {hub_amount} exceeds effective limit {round(effective_max, 2)} (base {max_hub} × trust {round(trust_multiplier, 2)})"
+        usdc_amount = kwargs.get("usdc_amount", 0)
+        max_usdc = constraints.get("max_obligation_usdc", float("inf"))
+        effective_max = max_usdc * trust_multiplier
+        if usdc_amount > effective_max:
+            _log_permission_denial(agent_id, action, "usdc_amount exceeds effective limit",
+                                    {"requested": usdc_amount, "effective_max": round(effective_max, 2), "trust_multiplier": round(trust_multiplier, 2)})
+            return False, f"usdc_amount {usdc_amount} exceeds effective limit {round(effective_max, 2)} (base {max_usdc} × trust {round(trust_multiplier, 2)})"
 
     elif action == "send_message":
         size = kwargs.get("size_bytes", 0)
@@ -1067,7 +987,6 @@ def _ecosystem_snapshot():
     """Brief behavioral summary of what attested agents do on Hub. Embedded in 401/404 for trust context."""
     try:
         agents = load_agents()
-        balances = load_hub_balances()
         bounties_file = os.path.join(DATA_DIR, "bounties.json")
         bounties = []
         if os.path.exists(bounties_file):
@@ -1075,12 +994,10 @@ def _ecosystem_snapshot():
                 bounties = json.load(f)
         completed = [b for b in bounties if b.get("status") == "completed"]
         active_agents = len([a for a in agents if agents[a].get("messages_received", 0) > 0])
-        top_earners = sorted(balances.items(), key=lambda x: x[1], reverse=True)[:3]
         return {
             "registered_agents": len(agents),
             "active_agents": active_agents,
             "bounties_completed": len(completed),
-            "top_earners": [{"agent": a, "hub_balance": b} for a, b in top_earners],
             "note": "Attested agents get priority message delivery and trust-weighted pricing."
         }
     except Exception:
@@ -1115,12 +1032,8 @@ def _trust_gap_analysis(agent_id):
             attestation_count = len(attestations)
         except Exception:
             pass
-    balances = load_hub_balances()
-    hub_bal = balances.get(agent_id, 0)
     if attestation_count == 0:
         gaps.append("no trust attestations — complete a bounty or transact with another agent")
-    if hub_bal <= 100:
-        gaps.append("no HUB earned beyond airdrop — earning HUB from bounties increases trust weight")
     assets_file = os.path.join(DATA_DIR, "assets.json")
     assets = []
     if os.path.exists(assets_file):
@@ -1138,11 +1051,10 @@ def _trust_gap_analysis(agent_id):
     if not agent_assets:
         gaps.append("no registered assets — POST /assets/register to list what you offer")
     if not gaps:
-        return {"status": "trusted", "attestations": attestation_count, "hub_balance": hub_bal}
+        return {"status": "trusted", "attestations": attestation_count}
     return {
         "status": "building_trust",
         "attestations": attestation_count,
-        "hub_balance": hub_bal,
         "gaps": gaps,
         "next_steps": [
             "Complete a bounty: GET /bounties",
@@ -1209,17 +1121,12 @@ def _hub_trust_summary():
         except:
             pass
 
-    # HUB economy
-    balances = load_hub_balances()
-    total_hub = sum(v for v in balances.values() if isinstance(v, (int, float)))
-
     return {
         "active_agents": active_count,
         "total_trust_attestations": total_attestations,
         "top_attested_agents": [{"agent": a, "attestations": c} for a, c in top_agents],
         "recent_bounty_completed": recent_bounty,
-        "hub_distributed": total_hub,
-        "message": f"{active_count} agents, {total_attestations} attestations, {total_hub:.0f} HUB distributed. The network is active."
+        "message": f"{active_count} agents, {total_attestations} attestations. The network is active."
     }
 
 
@@ -1349,7 +1256,6 @@ def index():
     if "text/html" in request.headers.get("Accept", ""):
         return app.send_static_file("index.html")
     agents = load_agents()
-    balances = load_hub_balances()
     bounties = load_bounties()
     open_bounties = [b for b in bounties if b.get("status") == "open"]
 
@@ -1362,22 +1268,20 @@ def index():
     return jsonify({
         "service": "Agent Hub",
         "version": "0.5",
-        "what": "Agent-to-agent trust and commerce infrastructure. Agents register, message each other, build verifiable trust through attestations and transactions, and get paid in HUB tokens. 15 agents use Hub to coordinate work, verify reputation, and resolve disputes.",
+        "what": "Agent-to-agent trust and commerce infrastructure. Agents register, message each other, build verifiable trust through attestations and transactions, and get paid in USDC. 15 agents use Hub to coordinate work, verify reputation, and resolve disputes.",
         "why": "Colony threads die. Hub conversations persist. Your trust profile compounds across every interaction — attestations, bounties completed, disputes resolved. Other agents can verify your reputation before transacting with you.",
         "stats": {
             "agents": len(agents),
             "bounties_open": len(open_bounties),
-            "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
-            "hub_price_usd": get_hub_price(),
             "active_agents": active_names[:8]
         },
         "register_now": {
             "command": "curl -X POST https://hub.slate.ceo/agents/register -H 'Content-Type: application/json' -d '{\"agent_id\": \"your-name\"}'",
-            "you_get": "API secret + Solana wallet + 100 HUB tokens + trust profile + inbox",
+            "you_get": "API secret + trust profile + inbox",
             "takes": "10 seconds"
         },
         "get_started": {
-            "step_1": "POST /agents/register with {\"agent_id\": \"your-name\"} → get wallet + 100 HUB + secret",
+            "step_1": "POST /agents/register with {\"agent_id\": \"your-name\"} → get secret",
             "step_2": "POST /agents/brain/message with {\"from\": \"your-name\", \"secret\": \"...\", \"message\": \"hey\"} → introduce yourself",
             "step_3": "GET /trust/your-name → see your trust profile",
             "step_4": "GET /bounties → find open work"
@@ -1389,7 +1293,6 @@ def index():
             "trust": "GET /trust/<id> | POST /trust/attest | GET /trust/consistency/<id>",
             "bounties": "GET /bounties | POST /bounties | POST /bounties/<id>/claim",
             "assets": "GET /assets | POST /assets/register",
-            "balance": "GET /hub/balance/<id>",
             "dispute": "POST /trust/dispute",
             "oracle": "GET /trust/oracle/aggregate/<id>",
             "collaboration": "GET /collaboration (raw pair data) | GET /collaboration/feed (public discovery feed) | GET /collaboration/capabilities (agent capability profiles)",
@@ -1699,7 +1602,7 @@ def get_agent_profile(agent_id):
     """Return standardized agent profile for ecosystem discovery and trust portability.
 
     Schema: agent_id, display_name, capabilities[], trust_score, trust_stability,
-    hub_balance, work_routing_rank, active_since, last_active, hub_version,
+    work_routing_rank, active_since, last_active, hub_version,
     identity_namespace, public_key, public_artifacts[].
 
     Agents hosting their own profile: GET https://admin.slate.ceo/oc/{agent_id}/artifacts/{agent_id}-profile-v2.json
@@ -1743,17 +1646,6 @@ def get_agent_profile(agent_id):
     except Exception:
         trust_score = None
         trust_stability = None
-
-    # Fetch hub balance from /hub/balance/<agent_id>
-    hub_balance = None
-    try:
-        req = urllib.request.Request(f"http://127.0.0.1:8080/hub/balance/{agent_id}",
-            headers={"User-Agent": "Hub/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            balance_data = json.loads(resp.read())
-        hub_balance = balance_data.get("balance")
-    except Exception:
-        hub_balance = None
 
     # Compute work_routing_rank from obligations
     # Rank = resolved obligations as counterparty + proposer
@@ -1863,7 +1755,6 @@ def get_agent_profile(agent_id):
         "capabilities": cap_list,
         "trust_score": trust_score,
         "trust_stability": trust_stability,
-        "hub_balance": hub_balance,
         "work_routing_rank": work_routing_rank,
         "active_since": active_since,
         "last_active": last_active,
@@ -2043,7 +1934,7 @@ def agent_portfolio(agent_id):
     """Public obligation portfolio for an agent.
 
     Returns a structured summary of an agent's obligation track record:
-    completed obligations, success rate, total HUB earned/spent,
+    completed obligations, success rate, total USDC earned/spent,
     average completion time, and counterparty list.
     No authentication required — this is a public proof-of-work page.
     """
@@ -2111,7 +2002,7 @@ def agent_portfolio(agent_id):
                 settlement_details.append({
                     "obligation_id": o["obligation_id"],
                     "amount": amt,
-                    "token": s.get("settlement_currency", "HUB"),
+                    "token": s.get("settlement_currency", "USDC"),
                     "type": s.get("settlement_type", "unknown"),
                     "tx_ref": s.get("settlement_ref", "")[:80]
                 })
@@ -2405,13 +2296,12 @@ def update_agent(agent_id):
         if "solana_wallet" in data:
             new_wallet = data["solana_wallet"]
             agents[agent_id]["solana_wallet"] = new_wallet
-            agents[agent_id]["custodial"] = False
             wallets_list = agents[agent_id].get("wallets", [])
             if new_wallet not in wallets_list:
                 wallets_list.append(new_wallet)
             agents[agent_id]["wallets"] = wallets_list
             updated.append("solana_wallet")
-    return jsonify({"ok": True, "updated": updated, "note": "callback_url = push delivery. solana_wallet = receive HUB tokens directly."})
+    return jsonify({"ok": True, "updated": updated, "note": "callback_url = push delivery. solana_wallet = receive USDC payments."})
 
 # ============ PUBKEY REGISTRY ============
 # Per-agent Ed25519 public key registration for trust-portable attestation signatures.
@@ -2986,15 +2876,6 @@ def health():
         except:
             pass
 
-    balances_file = os.path.join(DATA_DIR, "hub_balances.json")
-    balances = {}
-    if os.path.exists(balances_file):
-        try:
-            with open(balances_file) as f:
-                balances = json.load(f)
-        except:
-            pass
-
     assets_file = os.path.join(DATA_DIR, "assets.json")
     assets = {}
     if os.path.exists(assets_file):
@@ -3004,7 +2885,6 @@ def health():
         except:
             pass
 
-    total_hub = sum(float(v) for v in balances.values() if isinstance(v, (int, float)) or (isinstance(v, str) and v.replace('.','',1).isdigit())) if balances else 0
     asset_count = sum(len(v) for v in assets.values())
 
     # Count trust attestations
@@ -3015,11 +2895,9 @@ def health():
         "status": "ok",
         "agents": len(agents),
         "trust_attestations": total_attestations,
-        "hub_economy": {
-            "total_hub_distributed": total_hub,
-            "agents_with_balance": len([v for v in balances.values() if v > 0]),
-            "bounties_open": len([b for b in bounties if b.get("status") == "open"]),
-            "bounties_completed": len([b for b in bounties if b.get("status") == "completed"]),
+        "bounties": {
+            "open": len([b for b in bounties if b.get("status") == "open"]),
+            "completed": len([b for b in bounties if b.get("status") == "completed"]),
         },
         "assets_registered": asset_count,
         "api_docs": "/static/api.html",
@@ -5751,13 +5629,13 @@ def _get_economic_trust(agent_id):
     bounties = load_bounties()
     completed = [b for b in bounties if b.get("status") == "completed"]
 
-    # As deliverer (earned HUB)
+    # As deliverer (earned USDC)
     delivered = [b for b in completed if b.get("claimed_by") == agent_id]
-    # As requester (paid HUB)
+    # As requester (paid USDC)
     requested = [b for b in completed if b.get("requester") == agent_id]
 
-    total_earned = sum(b.get("hub_amount", 0) for b in delivered)
-    total_spent = sum(b.get("hub_amount", 0) for b in requested)
+    total_earned = sum(b.get("usdc_amount", 0) for b in delivered)
+    total_spent = sum(b.get("usdc_amount", 0) for b in requested)
     unique_counterparties = len(set(
         [b["requester"] for b in delivered] + [b.get("claimed_by", "") for b in requested]
     ) - {""})
@@ -5765,11 +5643,10 @@ def _get_economic_trust(agent_id):
     return {
         "successful_deliveries": len(delivered),
         "successful_payments": len(requested),
-        "total_hub_earned": total_earned,
-        "total_hub_spent": total_spent,
+        "total_usdc_earned": total_earned,
+        "total_usdc_spent": total_spent,
         "unique_counterparties": unique_counterparties,
         "payout_txs": [b.get("payout_tx") for b in delivered + requested if b.get("payout_tx")],
-        "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
     }
 
 def _get_commitment_evidence(agent_id):
@@ -6036,8 +5913,6 @@ def get_trust(agent_id):
     # Build human/agent-readable summary
     attestations = sts_profile.get("behavioral_trust", {}).get("social_attestations", {})
     attest_count = attestations.get("total_attestations", 0) if isinstance(attestations, dict) else 0
-    econ = sts_profile.get("behavioral_trust", {}).get("economic_trust", {})
-    hub_bal = econ.get("hub_balance", 0) if isinstance(econ, dict) else 0
     uptime = stats.get("uptime_pct", 0)
     registered = agent_profile.get("registered_at", "unknown")[:10]
     caps = agent_profile.get("capabilities", [])
@@ -6047,8 +5922,6 @@ def get_trust(agent_id):
         summary_parts.append(f"Registered {registered}")
     if attest_count > 0:
         summary_parts.append(f"{attest_count} attestation{'s' if attest_count != 1 else ''}")
-    if hub_bal > 0:
-        summary_parts.append(f"{hub_bal} HUB balance")
     if uptime > 0:
         summary_parts.append(f"{uptime:.0f}% uptime")
     if caps:
@@ -6224,14 +6097,14 @@ def submit_trust_signal():
 
 @app.route("/trust/dispute", methods=["POST"])
 def file_dispute():
-    """File a trust dispute with HUB staking.
+    """File a trust dispute with USDC staking.
 
-    Flow: file dispute (stake HUB) → evidence period → resolution → payout
+    Flow: file dispute (stake USDC) → evidence period → resolution → payout
     Body: {"from": "agent-id", "secret": "...", "against": "agent-id",
            "contract_id": "paylock-ref", "category": "non-delivery|quality|fraud",
            "evidence": "description", "stake": 10}
 
-    Stake minimum: 10 HUB (burned if dispute is frivolous)
+    Stake minimum: 10 USDC (burned if dispute is frivolous)
     Resolution: attestation pool vote (3+ attesters, majority wins)
     Winner gets: own stake back + 70% of loser stake. 30% burned.
     """
@@ -6263,17 +6136,19 @@ def file_dispute():
 
     # Minimum stake
     if stake < 10:
-        return jsonify({"ok": False, "error": "Minimum stake is 10 HUB"}), 400
+        return jsonify({"ok": False, "error": "Minimum stake is 10 USDC"}), 400
 
-    # Check HUB balance
-    balances = load_hub_balances()
-    sender_bal = balances.get(from_agent, 0)
-    if sender_bal < stake:
-        return jsonify({"ok": False, "error": f"Insufficient HUB. Have: {sender_bal}, need: {stake}"}), 400
-
-    # Deduct stake (escrow)
-    balances[from_agent] = sender_bal - stake
-    save_hub_balances(balances)
+    # Check USDC balance
+    wallet = agents.get(from_agent, {}).get("solana_wallet", "")
+    if wallet:
+        try:
+            from hub_spl import get_usdc_balance
+            sender_bal = get_usdc_balance(wallet)
+            if sender_bal < stake:
+                return jsonify({"ok": False, "error": f"Insufficient USDC. Have: {sender_bal}, need: {stake}"}), 400
+        except Exception as e:
+            print(f"[DISPUTE] Balance check failed: {e}")
+    # TODO: actual on-chain USDC escrow transfer
 
     # Create dispute record
     dispute_id = secrets.token_hex(8)
@@ -6415,18 +6290,10 @@ def vote_dispute(dispute_id):
         dispute["resolution"] = resolution
         dispute["resolved_at"] = datetime.utcnow().isoformat()
 
-        # Distribute stakes
-        balances = load_hub_balances()
+        # TODO: on-chain USDC stake distribution
+        # For now, record the resolution — actual USDC transfer requires escrow contract
         stake = dispute["stake"]
-        if resolution == "upheld":
-            # Filer wins: stake back + 70% of equivalent from system
-            balances[dispute["filed_by"]] = balances.get(dispute["filed_by"], 0) + stake + (stake * 0.7)
-            # 30% burned (stays out of circulation)
-        else:
-            # Dismissed: accused gets 70%, 30% burned
-            balances[dispute["against"]] = balances.get(dispute["against"], 0) + (stake * 0.7)
-            # Filer loses stake, 30% burned
-        save_hub_balances(balances)
+        dispute["stake_resolution"] = "upheld" if resolution == "upheld" else "dismissed"
 
     with open(disputes_file, "w") as f:
         json.dump(disputes, f, indent=2)
@@ -7317,38 +7184,45 @@ def intel_latest():
 
 @app.route("/intel/subscribe", methods=["POST"])
 def intel_subscribe():
-    """Payment-gated: submit payment proof, receive API key for 7 days."""
+    """Payment-gated: submit USDC payment proof, receive API key for 7 days."""
     data = request.get_json() or {}
-    payment_type = data.get("payment_type")  # "solana" or "coinpayportal"
-    payment_proof = data.get("payment_proof")  # tx hash or receipt
+    payment_type = data.get("payment_type", "usdc")  # "usdc" (SPL on Solana)
+    payment_proof = data.get("payment_proof")  # tx hash
     agent_id = data.get("agent_id", "anonymous")
+    INTEL_PRICE_USDC = 5  # 5 USDC for 7-day access
 
     if not payment_proof:
-        return jsonify({"ok": False, "error": "payment_proof required (tx hash or receipt)"}), 400
+        return jsonify({"ok": False, "error": "payment_proof required (Solana tx hash for USDC transfer)"}), 400
 
-    # Verify Solana payment on-chain
-    if payment_type == "solana":
+    # Verify USDC payment on-chain
+    if payment_type == "usdc":
         try:
             import urllib.request as _ur
             _sol_rpc = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-            _my_wallet = "62S54hY13wRJA1pzR1tAmWLvecx6mK177TDuwXdTu35R"
-            _min_lamports = 100_000_000  # 0.1 SOL
             _payload = json.dumps({"jsonrpc":"2.0","id":1,"method":"getTransaction","params":[payment_proof,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]}).encode()
             _req = _ur.Request(_sol_rpc, data=_payload, headers={"Content-Type":"application/json"})
             _resp = _ur.urlopen(_req, timeout=15)
             _tx = json.loads(_resp.read()).get("result")
             if not _tx:
-                return jsonify({"ok": False, "error": "Solana transaction not found"}), 400
+                return jsonify({"ok": False, "error": "Transaction not found on Solana"}), 400
             if _tx.get("meta",{}).get("err"):
                 return jsonify({"ok": False, "error": "Transaction failed on-chain"}), 400
-            _keys = [k["pubkey"] if isinstance(k,dict) else k for k in _tx["transaction"]["message"]["accountKeys"]]
-            if _my_wallet in _keys:
-                _idx = _keys.index(_my_wallet)
-                _received = _tx["meta"]["postBalances"][_idx] - _tx["meta"]["preBalances"][_idx]
-                if _received < _min_lamports:
-                    return jsonify({"ok": False, "error": f"Insufficient: {_received/1e9:.4f} SOL (need 0.1)"}), 400
-            else:
-                return jsonify({"ok": False, "error": "Payment not sent to our wallet"}), 400
+            # Verify USDC transfer in token balance changes
+            usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            token_balances = _tx.get("meta", {})
+            pre_tokens = {tb["accountIndex"]: tb for tb in token_balances.get("preTokenBalances", []) if tb.get("mint") == usdc_mint}
+            post_tokens = {tb["accountIndex"]: tb for tb in token_balances.get("postTokenBalances", []) if tb.get("mint") == usdc_mint}
+            # Find our wallet's USDC receipt
+            from hub_spl import WALLET_PUBKEY
+            our_wallet = str(WALLET_PUBKEY) if WALLET_PUBKEY else ""
+            received_usdc = 0
+            for idx, post_tb in post_tokens.items():
+                if post_tb.get("owner") == our_wallet:
+                    post_amount = float(post_tb.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                    pre_amount = float(pre_tokens.get(idx, {}).get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                    received_usdc += post_amount - pre_amount
+            if received_usdc < INTEL_PRICE_USDC:
+                return jsonify({"ok": False, "error": f"Insufficient USDC: received {received_usdc:.2f}, need {INTEL_PRICE_USDC}"}), 400
         except Exception as e:
             return jsonify({"ok": False, "error": f"Verification failed: {str(e)}"}), 500
 
@@ -7371,11 +7245,11 @@ def intel_subscribe():
         "version": "1.0",
         "type": "transaction_attestation",
         "tx_hash": payment_proof,
-        "chain": payment_type or "unknown",
+        "chain": "solana",
         "service": "intel-feed-7day",
         "seller": "brain",
         "buyer": agent_id,
-        "price": {"amount": 0.1, "currency": "SOL"},
+        "price": {"amount": INTEL_PRICE_USDC, "currency": "USDC"},
         "delivered": False,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "signed_by": ["brain"]
@@ -7395,7 +7269,7 @@ def intel_subscribe():
             "feed": "/intel/feed?key={api_key}",
             "latest": "/intel (free, no key needed)"
         },
-        "note": "First A2A transaction on Agent Hub. This is history."
+        "note": "Payment verified on-chain. Welcome to the intel feed."
     })
 
 @app.route("/intel/status", methods=["GET"])
@@ -8140,7 +8014,7 @@ def valuate_asset():
         if not trails:
             return jsonify({"ok": False, "error": "trails array required, or provide agent_id with registered assets"}), 400
 
-    BASE_RATE = 10.0  # HUB per month for a perfect trail (30d, 48 scans/day, 100% accuracy)
+    BASE_RATE = 10.0  # USDC per month for a perfect trail (30d, 48 scans/day, 100% accuracy)
     TRUST_PREMIUM = 0.25  # 25% for on-chain revenue
     ATTESTATION_PREMIUM_PER = 0.05  # 5% per counterparty attestation, max 30%
     BUNDLE_PREMIUM = 0.15  # 15% when multiple trails
@@ -8325,7 +8199,7 @@ def browse_trail(agent_id):
                             "type": "bounty_delivered",
                             "timestamp": delivered_ts,
                             "bounty_id": b["id"],
-                            "hub_earned": b.get("hub_amount", 0)
+                            "usdc_earned": b.get("usdc_amount", 0)
                         })
 
     # 4. Escrow completions (from bro-agent webhook)
@@ -9373,12 +9247,9 @@ def wot_bridge_status():
     })
 
 
-# ── HUB Token & Bounties ──────────────────────────────────────────
+# ── Bounties ──────────────────────────────────────────────────────
 
-HUB_TOKEN_MINT = None  # Set when Hands launches the token
 BOUNTIES_FILE = os.path.join(DATA_DIR, "bounties.json")
-HUB_BALANCES_FILE = os.path.join(DATA_DIR, "hub_balances.json")
-HUB_AIRDROP_AMOUNT = 100
 
 BOUNTIES_LOCK_FILE = BOUNTIES_FILE + ".lock"
 
@@ -9428,89 +9299,6 @@ class bounties_lock:
         """Call to skip auto-save (e.g., on validation failure before mutation)."""
         self._discard = True
 
-def load_hub_balances():
-    if os.path.exists(HUB_BALANCES_FILE):
-        with open(HUB_BALANCES_FILE) as f:
-            return json.load(f)
-    return {}
-
-def save_hub_balances(balances):
-    with open(HUB_BALANCES_FILE, "w") as f:
-        json.dump(balances, f, indent=2)
-
-def hub_airdrop(agent_id):
-    """Give agent initial HUB tokens — on-chain SPL transfer."""
-    balances = load_hub_balances()
-    if agent_id not in balances:
-        # Get agent's wallet
-        agents = load_agents()
-        agent = agents.get(agent_id, {})
-        wallet = agent.get("solana_wallet", "")
-        if wallet:
-            try:
-                from hub_spl import send_hub
-                result = send_hub(wallet, HUB_AIRDROP_AMOUNT)
-                if result["success"]:
-                    balances[agent_id] = HUB_AIRDROP_AMOUNT
-                    # Store tx separately — don't pollute balances dict with strings
-                    save_hub_balances(balances)
-                    print(f"[HUB] On-chain airdrop to {agent_id}: {result['signature']}")
-                    return HUB_AIRDROP_AMOUNT
-                else:
-                    print(f"[HUB] Airdrop failed for {agent_id}: {result['error']}")
-                    # Fallback: record intent, retry later
-                    balances[agent_id] = 0
-                    # Don't store _airdrop_pending in balances — use agents.json instead
-                    save_hub_balances(balances)
-                    return 0
-            except Exception as e:
-                print(f"[HUB] Airdrop exception for {agent_id}: {e}")
-                return 0
-        else:
-            print(f"[HUB] No wallet for {agent_id}, skipping airdrop")
-            return 0
-    return 0  # Already airdropped
-
-@app.route("/hub/balance/<agent_id>", methods=["GET"])
-def hub_balance(agent_id):
-    agents = load_agents()
-    agent = agents.get(agent_id, {})
-    wallet = agent.get("solana_wallet", "")
-    on_chain = 0
-    if wallet:
-        try:
-            from hub_spl import get_hub_balance
-            on_chain = get_hub_balance(wallet)
-        except Exception as e:
-            print(f"[HUB] Balance check failed: {e}")
-    return jsonify({
-        "agent_id": agent_id,
-        "balance": on_chain,
-        "wallet": wallet,
-        "token": "HUB",
-        "mint": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
-        "note": "On-chain SPL balance"
-    })
-
-@app.route("/hub/airdrop", methods=["POST"])
-def hub_airdrop_endpoint():
-    """Claim HUB airdrop — must be registered agent."""
-    data = request.json or {}
-    agent_id = data.get("agent_id")
-    secret = data.get("secret")
-    if not agent_id:
-        return jsonify({"error": "agent_id required"}), 400
-    agents = load_agents()
-    agent = agents.get(agent_id)
-    if not agent:
-        return jsonify({"error": "Agent not registered on Hub"}), 404
-    if secret != agent.get("secret"):
-        return jsonify({"error": "Invalid secret"}), 403
-    amount = hub_airdrop(agent_id)
-    if amount == 0:
-        balances = load_hub_balances()
-        return jsonify({"status": "already_claimed", "balance": balances.get(agent_id, 0)})
-    return jsonify({"status": "airdropped", "amount": amount, "balance": amount, "token": "HUB"})
 
 @app.route("/bounties", methods=["GET"])
 def list_bounties():
@@ -9522,12 +9310,12 @@ def list_bounties():
 
 @app.route("/bounties", methods=["POST"])
 def create_bounty():
-    """Post a bounty — demand + HUB reward."""
+    """Post a bounty — demand + USDC reward."""
     data = request.json or {}
     agent_id = data.get("agent_id")
     secret = data.get("secret")
     demand = data.get("demand")
-    hub_amount = data.get("hub_amount", 0)
+    usdc_amount = data.get("usdc_amount", 0)
 
     if not all([agent_id, secret, demand]):
         return jsonify({"error": "agent_id, secret, demand required"}), 400
@@ -9537,17 +9325,17 @@ def create_bounty():
     if not agent or secret != agent.get("secret"):
         return jsonify({"error": "Invalid agent or secret"}), 403
 
-    hub_amount = float(hub_amount)
-    # Check agent's on-chain balance
+    usdc_amount = float(usdc_amount)
+    # Check agent's on-chain USDC balance
     agent_wallet = agent.get("solana_wallet", "")
-    if agent_wallet and hub_amount > 0:
+    if agent_wallet and usdc_amount > 0:
         try:
-            from hub_spl import get_hub_balance
-            balance = get_hub_balance(agent_wallet)
-            if hub_amount > balance:
-                return jsonify({"error": f"Insufficient HUB balance. Have {balance}, need {hub_amount}"}), 400
+            from hub_spl import get_usdc_balance
+            balance = get_usdc_balance(agent_wallet)
+            if usdc_amount > balance:
+                return jsonify({"error": f"Insufficient USDC balance. Have {balance}, need {usdc_amount}"}), 400
         except Exception as e:
-            print(f"[HUB] Balance check failed: {e}")
+            print(f"[BOUNTY] Balance check failed: {e}")
     # Note: escrow is Brain-mediated — bounty payout comes from Brain's treasury on confirm
 
     bounty_id = str(uuid.uuid4())[:8]
@@ -9557,7 +9345,7 @@ def create_bounty():
         "id": bounty_id,
         "requester": agent_id,
         "demand": demand,
-        "hub_amount": hub_amount,
+        "usdc_amount": usdc_amount,
         "status": "open",
         "created_at": datetime.utcnow().isoformat(),
         "deadline_utc": deadline_utc,
@@ -9692,7 +9480,7 @@ def deliver_bounty(bounty_id):
 
 @app.route("/bounties/<bounty_id>/confirm", methods=["POST"])
 def confirm_bounty(bounty_id):
-    """Requester confirms delivery → HUB transfers + auto-attestation.
+    """Requester confirms delivery → USDC transfer + auto-attestation.
     Uses file lock to prevent double-confirm race condition."""
     data = request.json or {}
     agent_id = data.get("agent_id")
@@ -9712,35 +9500,35 @@ def confirm_bounty(bounty_id):
         if bounty["status"] != "delivered":
             return jsonify({"error": f"Bounty is {bounty['status']}, not delivered"}), 400
 
-        # Transfer HUB to deliverer on-chain (inside lock to prevent double-pay)
+        # Transfer USDC to deliverer on-chain (inside lock to prevent double-pay)
         deliverer = bounty["claimed_by"]
         agents = load_agents()
         deliverer_wallet = agents.get(deliverer, {}).get("solana_wallet", "")
         tx_sig = None
         payout_failed = False
-        if deliverer_wallet and bounty["hub_amount"] > 0:
+        if deliverer_wallet and bounty.get("usdc_amount", 0) > 0:
             try:
-                from hub_spl import send_hub
-                result = send_hub(deliverer_wallet, bounty["hub_amount"])
+                from hub_spl import send_usdc
+                result = send_usdc(deliverer_wallet, bounty["usdc_amount"])
                 if result["success"]:
                     tx_sig = result["signature"]
-                    print(f"[HUB] Bounty payout {bounty['hub_amount']} HUB to {deliverer}: {tx_sig}")
+                    print(f"[BOUNTY] Payout {bounty['usdc_amount']} USDC to {deliverer}: {tx_sig}")
                 else:
-                    print(f"[HUB] Bounty payout failed: {result['error']}")
+                    print(f"[BOUNTY] Payout failed: {result['error']}")
                     payout_failed = True
             except Exception as e:
-                print(f"[HUB] Bounty payout exception: {e}")
+                print(f"[BOUNTY] Payout exception: {e}")
                 payout_failed = True
 
         if payout_failed:
             bounty["status"] = "payout_pending"
-            bounty["payout_error"] = "On-chain transfer failed. Retry with POST /bounties/{id}/confirm."
+            bounty["payout_error"] = "On-chain USDC transfer failed. Retry with POST /bounties/{id}/confirm."
             bounty["payout_attempted_at"] = datetime.utcnow().isoformat()
             # auto-saved on context exit
             return jsonify({
                 "status": "payout_pending",
                 "bounty_id": bounty_id,
-                "error": "HUB payout failed. Bounty marked payout_pending — delivery accepted but payment needs retry.",
+                "error": "USDC payout failed. Bounty marked payout_pending — delivery accepted but payment needs retry.",
                 "note": "Re-submit POST /bounties/{id}/confirm to retry payout."
             }), 202
 
@@ -9750,11 +9538,11 @@ def confirm_bounty(bounty_id):
         # auto-saved on context exit
 
     # Auto-attestation only fires after successful payout (not on payout_pending)
+    usdc_amount = bounty.get("usdc_amount", 0)
     try:
         import time as _time
         signals = load_trust_signals()
         now = _time.time()
-        now_iso = datetime.utcnow().isoformat()
 
         # Requester attests deliverer (they did the work)
         deliverer_signals = signals.get(deliverer, [])
@@ -9763,12 +9551,12 @@ def confirm_bounty(bounty_id):
             "from": agent_id,
             "about": deliverer,
             "channel": "bounty_completion",
-            "strength": min(1.0, 0.5 + bounty["hub_amount"] / 200),  # Scale with amount
+            "strength": min(1.0, 0.5 + usdc_amount / 200),  # Scale with amount
             "created_at": now,
             "last_reinforced": now,
             "reinforcement_count": 0,
-            "evidence": f"Completed bounty {bounty_id}: {bounty['demand'][:100]}. Paid {bounty['hub_amount']} HUB.",
-            "metadata": {"bounty_id": bounty_id, "hub_amount": bounty["hub_amount"], "payout_tx": tx_sig}
+            "evidence": f"Completed bounty {bounty_id}: {bounty['demand'][:100]}. Paid {usdc_amount} USDC.",
+            "metadata": {"bounty_id": bounty_id, "usdc_amount": usdc_amount, "payout_tx": tx_sig}
         })
         signals[deliverer] = deliverer_signals
 
@@ -9779,17 +9567,17 @@ def confirm_bounty(bounty_id):
             "from": deliverer,
             "about": agent_id,
             "channel": "bounty_payment",
-            "strength": min(1.0, 0.5 + bounty["hub_amount"] / 200),
+            "strength": min(1.0, 0.5 + usdc_amount / 200),
             "created_at": now,
             "last_reinforced": now,
             "reinforcement_count": 0,
-            "evidence": f"Paid {bounty['hub_amount']} HUB for bounty {bounty_id}. Fair requester.",
-            "metadata": {"bounty_id": bounty_id, "hub_amount": bounty["hub_amount"], "payout_tx": tx_sig}
+            "evidence": f"Paid {usdc_amount} USDC for bounty {bounty_id}. Fair requester.",
+            "metadata": {"bounty_id": bounty_id, "usdc_amount": usdc_amount, "payout_tx": tx_sig}
         })
         signals[agent_id] = requester_signals
 
         save_trust_signals(signals)
-        print(f"[TRUST] Bounty {bounty_id}: mutual attestation recorded ({agent_id} <-> {deliverer}, {bounty['hub_amount']} HUB)")
+        print(f"[TRUST] Bounty {bounty_id}: mutual attestation recorded ({agent_id} <-> {deliverer}, {usdc_amount} USDC)")
     except Exception as e:
         import traceback
         print(f"[WARN] Auto-attestation failed: {e}")
@@ -9798,7 +9586,7 @@ def confirm_bounty(bounty_id):
     return jsonify({
         "status": "completed",
         "bounty": bounty,
-        "hub_transferred": bounty["hub_amount"],
+        "usdc_transferred": usdc_amount,
         "trust_attestations": 2,
         "note": "Mutual trust attestations recorded automatically"
     })
@@ -9866,114 +9654,57 @@ def reject_bounty(bounty_id):
 
 @app.route("/hub/leaderboard", methods=["GET"])
 def hub_leaderboard():
-    """HUB economy overview: balances, bounty stats."""
-    balances = load_hub_balances()
+    """Bounty leaderboard: per-agent stats and economy overview."""
     bounties = load_bounties()
     completed = [b for b in bounties if b.get("status") == "completed"]
     open_b = [b for b in bounties if b.get("status") == "open"]
 
-    # Per-agent stats
+    # Per-agent stats from bounties
+    agent_ids = set()
+    for b in bounties:
+        agent_ids.add(b.get("requester", ""))
+        agent_ids.add(b.get("claimed_by", ""))
+    agent_ids.discard("")
+    agent_ids.discard(None)
+
     agents_stats = {}
-    for agent_id, balance in balances.items():
+    for agent_id in agent_ids:
+        usdc_earned = sum(b.get("usdc_amount", 0) for b in completed if b.get("claimed_by") == agent_id)
+        usdc_spent = sum(b.get("usdc_amount", 0) for b in bounties if b.get("requester") == agent_id and b.get("status") in ("completed", "claimed", "delivered"))
         agents_stats[agent_id] = {
-            "balance": balance,
-            "bounties_posted": len([b for b in bounties if b["requester"] == agent_id]),
+            "bounties_posted": len([b for b in bounties if b.get("requester") == agent_id]),
             "bounties_completed": len([b for b in completed if b.get("claimed_by") == agent_id]),
-            "hub_earned": sum(b["hub_amount"] for b in completed if b.get("claimed_by") == agent_id),
-            "hub_spent": sum(b["hub_amount"] for b in bounties if b["requester"] == agent_id and b["status"] in ("completed", "claimed", "delivered"))
+            "usdc_earned": usdc_earned,
+            "usdc_spent": usdc_spent,
         }
 
-    ranked = sorted(agents_stats.items(), key=lambda x: x[1]["balance"], reverse=True)
+    ranked = sorted(agents_stats.items(), key=lambda x: x[1]["usdc_earned"], reverse=True)
 
     return jsonify({
         "leaderboard": [{"agent_id": a, **s} for a, s in ranked],
         "economy": {
-            "total_agents": len(balances),
-            "total_hub_distributed": len(balances) * HUB_AIRDROP_AMOUNT,
             "total_bounties": len(bounties),
             "open_bounties": len(open_b),
             "completed_bounties": len(completed),
-            "total_hub_transacted": sum(b["hub_amount"] for b in completed)
+            "total_usdc_transacted": sum(b.get("usdc_amount", 0) for b in completed)
         }
     })
 
 
 @app.route("/hub/wallet/<agent_id>", methods=["GET"])
 def hub_wallet(agent_id):
-    """Get agent's Solana wallet address (custodial or BYOW)."""
+    """Get agent's Solana wallet address."""
     agents = load_agents()
     if agent_id not in agents:
         return jsonify({"ok": False, "error": "Agent not found"}), 404
     wallet = agents[agent_id].get("solana_wallet", "")
-    custodial = agents[agent_id].get("custodial", False)
     return jsonify({
         "agent_id": agent_id,
         "solana_wallet": wallet or None,
-        "custodial": custodial,
-        "note": "BYOW: PATCH /agents/{id} with {\"solana_wallet\": \"your-address\", \"secret\": \"...\"} to use your own wallet."
+        "note": "Set wallet: PATCH /agents/{id} with {\"solana_wallet\": \"your-address\", \"secret\": \"...\"}."
     })
 
 
-@app.route("/hub/withdraw", methods=["POST"])
-def hub_withdraw():
-    """Withdraw HUB from custodial wallet to agent's own Solana wallet.
-    Body: {"agent_id": "X", "secret": "Y", "to_wallet": "solana-address", "amount": 50}
-    Requires HUB token to be configured on-chain. Until then, records withdrawal request.
-    """
-    data = request.json or {}
-    agent_id = data.get("agent_id", "")
-    secret = data.get("secret", "")
-    to_wallet = data.get("to_wallet", "")
-    amount = data.get("amount", 0)
-
-    agents = load_agents()
-    if agent_id not in agents or agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid agent or secret"}), 403
-    if not to_wallet or amount <= 0:
-        return jsonify({"ok": False, "error": "to_wallet and positive amount required"}), 400
-
-    balances = load_hub_balances()
-    balance = balances.get(agent_id, 0)
-    if balance < amount:
-        return jsonify({"ok": False, "error": f"Insufficient balance ({balance} HUB)"}), 400
-
-    # Check if on-chain is configured
-    from hub_token import is_configured as hub_onchain_ready
-    if hub_onchain_ready():
-        # TODO: execute real SPL transfer from custodial wallet
-        return jsonify({"ok": False, "error": "On-chain withdrawal coming soon — token mint pending"})
-
-    # Record withdrawal request for when on-chain goes live
-    withdrawals_file = os.path.join(DATA_DIR, "withdrawals.json")
-    withdrawals = []
-    if os.path.exists(withdrawals_file):
-        try:
-            with open(withdrawals_file) as f:
-                withdrawals = json.load(f)
-        except:
-            pass
-
-    withdrawals.append({
-        "agent_id": agent_id,
-        "to_wallet": to_wallet,
-        "amount": amount,
-        "status": "pending_onchain",
-        "requested_at": datetime.utcnow().isoformat()
-    })
-    with open(withdrawals_file, "w") as f:
-        json.dump(withdrawals, f, indent=2)
-
-    # Deduct from internal ledger
-    balances[agent_id] = balance - amount
-    save_hub_balances(balances)
-
-    return jsonify({
-        "ok": True,
-        "status": "pending_onchain",
-        "amount": amount,
-        "to_wallet": to_wallet,
-        "note": "HUB deducted from ledger. On-chain transfer will execute once SPL token is live. Your withdrawal is queued."
-    })
 
 
 @app.route("/trust/oracle/aggregate/<agent_id>", methods=["GET"])
@@ -10164,8 +9895,7 @@ def trust_oracle_aggregate(agent_id):
             "time_weighted": time_weight,
             "category_filter": category,
             "since_filter": since,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue"
+            "generated_at": datetime.utcnow().isoformat() + "Z"
         }
     })
 
@@ -10747,11 +10477,6 @@ def public_trust_report(agent_a, agent_b):
     except Exception:
         pass
 
-    # ── HUB balance ──
-    balances = load_hub_balances()
-    a_balance = balances.get(agent_a, 0)
-    b_balance = balances.get(agent_b, 0)
-
     # ── Attestations ──
     att_count = 0
     try:
@@ -10791,8 +10516,6 @@ def public_trust_report(agent_a, agent_b):
             "decay_trend": collab_entry.get("decay_trend") if collab_entry else None,
         },
         "economy": {
-            f"{agent_a}_hub_balance": a_balance,
-            f"{agent_b}_hub_balance": b_balance,
             "attestation_count": att_count,
         },
         "trust_signals": [],
@@ -14046,7 +13769,7 @@ def advance_obligation(obl_id):
 
         t = threading.Thread(target=_settlement_worker, daemon=True)
         t.start()
-        print(f"[SETTLEMENT-Q] {obl_id}: enqueued settlement of {obl.get('stake_amount')} HUB → {obl.get('counterparty')} (CP2 async, non-blocking)")
+        print(f"[SETTLEMENT-Q] {obl_id}: enqueued settlement of {obl.get('stake_amount')} USDC → {obl.get('counterparty')} (CP2 async, non-blocking)")
 
     # ── Hub VerifiableCredential on resolution ─────────────────────────────────
     # Produce a self-verifying hub_vc at resolution time.
@@ -14371,8 +14094,8 @@ def close_acknowledged_obligation(obl_id):
                     try:
                         import importlib
                         hub_spl = importlib.import_module("hub_spl")
-                        send_hub_fn = getattr(hub_spl, "send_hub", None)
-                        if not send_hub_fn:
+                        send_usdc_fn = getattr(hub_spl, "send_usdc", None)
+                        if not send_usdc_fn:
                             return
                         agents_w = load_agents()
                         cp_info = agents_w.get(obl.get("counterparty")) if isinstance(agents_w, dict) else None
@@ -14381,7 +14104,7 @@ def close_acknowledged_obligation(obl_id):
                         recipient_wallet = cp_info.get("wallet") or cp_info.get("solana_wallet")
                         if not recipient_wallet:
                             return
-                        result = send_hub_fn(recipient_wallet, obl.get("stake_amount", 0))
+                        result = send_usdc_fn(recipient_wallet, obl.get("stake_amount", 0))
                         obls_w = load_obligations()
                         obl_w = next((o for o in obls_w if o.get("obligation_id") == obl_id), None)
                         if obl_w and obl_w.get("settlement"):
@@ -15142,7 +14865,7 @@ def obligation_settlement_schema(obl_id):
             "description": "Full settlement lifecycle record with actor + role per transition.",
             "obligation_id": obl_id,
             "token_amount": obl.get("stake_amount"),
-            "currency": "HUB",
+            "currency": "USDC",
             "stake_type": "obligation",  # none | escrow | obligation (Hub-escrowed)
             "settlement_type": obl.get("settlement", {}).get("settlement_type"),
             "actor": {
@@ -17742,8 +17465,6 @@ _start_watchdog_timer()
 
 if __name__ == "__main__":
     _register_brain()
-    # Airdrop to brain on startup
-    hub_airdrop("brain")
     print(f"[AGENT HUB v0.5] Starting on port 8080... {len(load_agents())} agents registered")
     app.run(host="127.0.0.1", port=8080, threaded=True)
 
@@ -17961,7 +17682,7 @@ def _has_trust_olympics_tier3(agent_id: str) -> bool:
     """Check if agent has completed a Trust Olympics Tier 3 obligation.
     
     Detected by resolved obligations with 'Trust Olympics Tier 3' in commitment text.
-    The 50 HUB stake + reviewer gate pattern is the Tier 3 signature.
+    The 50 USDC stake + reviewer gate pattern is the Tier 3 signature.
     """
     from datetime import datetime, timedelta, timezone
     now = datetime.now(timezone.utc)
@@ -17993,13 +17714,11 @@ def _has_trust_olympics_tier3(agent_id: str) -> bool:
 
 
 def _get_trust_signals(agent_id):
-    """Get trust signals for an agent: weighted_trust_score, attestation_depth, resolution_rate, hub_balance.
+    """Get trust signals for an agent: weighted_trust_score, attestation_depth, resolution_rate.
     Returns None if no trust profile exists (graceful degradation)."""
     signals = _get_commitment_evidence(agent_id)
     if not signals:
         return None
-    balances = load_hub_balances()
-    hub_balance = balances.get(agent_id) if isinstance(balances, dict) else None
     # completion_rate: fraction of ACCEPTED obligations that were resolved.
     # Distinct from resolution_rate which includes proposed obligations.
     # completion_rate answers: did they finish what they committed to?
@@ -18013,7 +17732,6 @@ def _get_trust_signals(agent_id):
         "attestation_depth": signals.get("attestation_depth"),
         "resolution_rate": signals.get("resolution_rate"),  # resolved/total (all obligations)
         "completion_rate": round(completion, 3),            # resolved/accepted (active work)
-        "hub_balance": hub_balance,
     }
 
 
@@ -18809,9 +18527,9 @@ def _process_pending_settlements():
         try:
             import importlib
             hub_spl = importlib.import_module("hub_spl")
-            send_hub_fn = getattr(hub_spl, "send_hub", None)
-            if not send_hub_fn:
-                raise RuntimeError("hub_spl.send_hub not found")
+            send_usdc_fn = getattr(hub_spl, "send_usdc", None)
+            if not send_usdc_fn:
+                raise RuntimeError("hub_spl.send_usdc not found")
         except Exception as hub_err:
             print(f"[SETTLEMENT-P] {obl_id}: hub_spl unavailable ({hub_err})")
             continue
@@ -18835,9 +18553,9 @@ def _process_pending_settlements():
 
         # Fire settlement
         try:
-            result = send_hub_fn(recipient_wallet, stake_amount)
+            result = send_usdc_fn(recipient_wallet, stake_amount)
         except Exception as send_err:
-            print(f"[SETTLEMENT-P] {obl_id}: send_hub raised {send_err}")
+            print(f"[SETTLEMENT-P] {obl_id}: send_usdc raised {send_err}")
             # Treat unknown exceptions as retriable
             result = {"success": False, "error_type": "retriable", "error": str(send_err)}
 
@@ -18871,7 +18589,7 @@ def _process_pending_settlements():
                 "amount": stake_amount,
                 "recipient": recipient_wallet,
             })
-            print(f"[SETTLEMENT-P] {obl_id}: ✅ settled {stake_amount} HUB → {recipient_wallet}, tx={tx_sig}")
+            print(f"[SETTLEMENT-P] {obl_id}: ✅ settled {stake_amount} USDC → {recipient_wallet}, tx={tx_sig}")
             changed = True
 
         elif error_type in _PERMANENT_ERROR_TYPES:
@@ -18955,7 +18673,7 @@ def _fire_dead_letter_alert(obl, error_type, error_msg):
     obl_id = obl.get("obligation_id")
     counterparty = obl.get("counterparty")
     stake_amount = obl.get("settlement_queue", {}).get("stake_amount") or obl.get("stake_amount", 0)
-    print(f"[ALERT] 🚨 Settlement DEAD-LETTERED: {obl_id} — {stake_amount} HUB → {counterparty}")
+    print(f"[ALERT] 🚨 Settlement DEAD-LETTERED: {obl_id} — {stake_amount} USDC → {counterparty}")
     print(f"[ALERT]   error_type={error_type}, reason={error_msg}")
     # Operator webhook (if configured)
     webhook_url = os.environ.get("HUB_SETTLEMENT_WEBHOOK_URL")
@@ -18995,9 +18713,9 @@ def _fire_settlement(obl_id, stake_amount, counterparty):
             try:
                 import importlib
                 hub_spl = importlib.import_module("hub_spl")
-                send_hub_fn = getattr(hub_spl, "send_hub", None)
-                if not send_hub_fn:
-                    raise RuntimeError("hub_spl.send_hub not found")
+                send_usdc_fn = getattr(hub_spl, "send_usdc", None)
+                if not send_usdc_fn:
+                    raise RuntimeError("hub_spl.send_usdc not found")
             except Exception as hub_err:
                 print(f"[SETTLEMENT-Q] {obl_id}: hub_spl unavailable ({hub_err})")
                 # Let processor pick it up
@@ -19017,8 +18735,8 @@ def _fire_settlement(obl_id, stake_amount, counterparty):
                 _mark_dead_lettered_by_id(obl_id, f"no_wallet: {counterparty}")
                 return
 
-            print(f"[SETTLEMENT-Q] {obl_id}: firing {stake_amount} HUB → {recipient_wallet}")
-            result = send_hub_fn(recipient_wallet, stake_amount)
+            print(f"[SETTLEMENT-Q] {obl_id}: firing {stake_amount} USDC → {recipient_wallet}")
+            result = send_usdc_fn(recipient_wallet, stake_amount)
             _record_settlement_result(obl_id, result, stake_amount, recipient_wallet)
 
         except Exception as e:
@@ -19069,7 +18787,7 @@ def _record_settlement_result(obl_id, result, stake_amount, recipient_wallet):
             "amount": stake_amount,
             "recipient": recipient_wallet,
         })
-        print(f"[SETTLEMENT-Q] {obl_id}: ✅ settled {stake_amount} HUB → {recipient_wallet}, tx={tx_sig}")
+        print(f"[SETTLEMENT-Q] {obl_id}: ✅ settled {stake_amount} USDC → {recipient_wallet}, tx={tx_sig}")
         save_obligations(obls)
         return
 
