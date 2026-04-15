@@ -10,11 +10,19 @@ Owns: agent CRUD (archive, update, profile), permission checks, portfolio,
 import json
 import os
 import secrets
+import urllib.request
+import urllib.error
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from flask import Blueprint, request, jsonify
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Block HTTP redirects to prevent SSRF via open redirectors."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 from hub.messaging import (
     load_agents, save_agents, agents_lock,
@@ -188,16 +196,11 @@ def save_artifacts(data):
 
 def _verify_url_liveness(url):
     """Check if a URL returns 200. Returns (alive: bool, status_code: int|None, error: str|None)."""
-    import urllib.request, urllib.error
     if not url or not url.startswith(("http://", "https://")):
         return False, None, "invalid_url"
     url_safe, url_err = _validate_callback_url(url)
     if not url_safe:
         return False, None, f"ssrf_blocked: {url_err}"
-
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
     opener = urllib.request.build_opener(_NoRedirect)
     try:
@@ -956,12 +959,6 @@ def update_agent(agent_id):
             if not url_safe:
                 return jsonify({"ok": False, "error": f"Invalid callback_url: {url_err}"}), 400
             try:
-                import urllib.request, urllib.error
-
-                class _NoRedirect(urllib.request.HTTPRedirectHandler):
-                    def redirect_request(self, req, fp, code, msg, headers, newurl):
-                        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
-
                 _opener = urllib.request.build_opener(_NoRedirect)
                 test_payload = json.dumps({"type": "callback_test", "from": "hub", "message": "Callback verification test"}).encode()
                 req = urllib.request.Request(new_callback, data=test_payload, headers={"Content-Type": "application/json"}, method="POST")

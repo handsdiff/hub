@@ -8,15 +8,19 @@ Owns: trust signals, attestations, STS profiles, decay scoring, disputes,
 """
 
 import json
+import logging
 import math
 import os
 import secrets
+import traceback
 import uuid
 import hashlib
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from flask import Blueprint, request, jsonify
+
+logger = logging.getLogger(__name__)
 
 from hub.messaging import (
     load_agents, save_agents,
@@ -57,8 +61,11 @@ def _lazy_classify_outcome(artifact_rate, is_bilateral, days_since_last, duratio
     return _classify_outcome(artifact_rate, is_bilateral, days_since_last, duration_days)
 
 def _lazy_maybe_track_surface_view(event, target):
-    from hub.analytics import _maybe_track_surface_view
-    return _maybe_track_surface_view(event, target)
+    try:
+        from hub.analytics import _maybe_track_surface_view
+        return _maybe_track_surface_view(event, target)
+    except Exception as e:
+        logger.debug("Surface view tracking skipped: %s", e)
 
 def _lazy_load_pubkeys():
     from hub.agents import _load_pubkeys
@@ -496,7 +503,8 @@ def _trust_gap_analysis(agent_id):
     attestation_count = 0
     if trust_file.exists():
         try:
-            td = json.load(open(trust_file))
+            with open(trust_file) as f:
+                td = json.load(f)
             attestations = td.get("attestations", [])
             attestation_count = len(attestations)
         except Exception:
@@ -539,7 +547,8 @@ def _trust_teaser(agent_id):
     if not trust_file.exists():
         return None
     try:
-        td = json.load(open(trust_file))
+        with open(trust_file) as f:
+            td = json.load(f)
         attestations = td.get("attestations", [])
         unique_attesters = len(set(a.get("attester", "") for a in attestations) - {""})
         if unique_attesters == 0:
@@ -550,8 +559,7 @@ def _trust_teaser(agent_id):
             "unique_attesters": unique_attesters,
             "hint": f"This agent has {len(attestations)} trust attestations from {unique_attesters} unique counterparties. Register to see the full breakdown.",
         }
-    except:
-        return None
+    except (json.JSONDecodeError, OSError):        return None
 
 
 def _hub_trust_summary():
@@ -571,8 +579,7 @@ def _hub_trust_summary():
                 if isinstance(atts, list):
                     total_attestations += len(atts)
                     agent_activity[agent_id] = len(atts)
-        except:
-            pass
+        except (json.JSONDecodeError, OSError):            pass
 
     # Top 3 most attested agents
     top_agents = sorted(agent_activity.items(), key=lambda x: -x[1])[:3]
@@ -587,8 +594,7 @@ def _hub_trust_summary():
             completed = [b for b in bounties if b.get("status") == "completed"]
             if completed:
                 recent_bounty = completed[-1].get("demand", "")[:80]
-        except:
-            pass
+        except (json.JSONDecodeError, OSError):            pass
 
     return {
         "active_agents": active_count,
@@ -719,9 +725,12 @@ def _compute_message_priority(sender_id):
 
 # ── Attestation storage ──
 def load_attestations():
-    if ATTESTATIONS_FILE.exists():
-        with open(ATTESTATIONS_FILE) as f:
-            return json.load(f)
+    try:
+        if ATTESTATIONS_FILE.exists():
+            with open(ATTESTATIONS_FILE) as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load attestations.json: %s", e)
     return {}
 
 def save_attestations(data):
@@ -1299,7 +1308,8 @@ def trust_did_resolve(did_str):
     if hub_link:
         trust_file = _DATA_DIR / "trust" / f"{hub_link}.json"
         if trust_file.exists():
-            td = json.load(open(trust_file))
+            with open(trust_file) as f:
+                td = json.load(f)
             result["trust_profile"] = td
 
     return jsonify(result)
@@ -1635,9 +1645,12 @@ def list_capabilities():
 
 # ── Trust / operational state (STS v1) ──
 def load_health_history():
-    if HEALTH_HISTORY_FILE.exists():
-        with open(HEALTH_HISTORY_FILE) as f:
-            return json.load(f)
+    try:
+        if HEALTH_HISTORY_FILE.exists():
+            with open(HEALTH_HISTORY_FILE) as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load health_history.json: %s", e)
     return {}
 
 def _load_nostr_map():
@@ -1878,7 +1891,7 @@ def _get_economic_trust(agent_id):
     total_earned = sum(b.get("usdc_amount", 0) for b in delivered)
     total_spent = sum(b.get("usdc_amount", 0) for b in requested)
     unique_counterparties = len(set(
-        [b["requester"] for b in delivered] + [b.get("claimed_by", "") for b in requested]
+        [b.get("requester", "") for b in delivered] + [b.get("claimed_by", "") for b in requested]
     ) - {""})
 
     return {
@@ -1900,7 +1913,8 @@ def _get_commitment_evidence(agent_id):
     try:
         with open(obligations_path) as f:
             all_obls = json.load(f)
-    except:
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load obligations.json for commitment evidence: %s", e)
         return None
 
     if not isinstance(all_obls, list):
@@ -2057,7 +2071,7 @@ def _get_collaboration_summary(agent_id):
             content = str(m.get("message", m.get("content", "")))
             if artifact_any.search(content):
                 pair_data[partner]["artifact_refs"] += 1
-        except:
+        except (KeyError, TypeError):
             continue
 
     if not pair_data:
@@ -2095,6 +2109,16 @@ def get_trust(agent_id):
     Get STS v1 trust profile for a discovered agent.
     Full spec: https://thecolony.cc/post/9b91a53f-af49-4086-95de-8cff69cc684d
     """
+    try:
+        return _build_trust_profile(agent_id)
+    except Exception:
+        logger.error("GET /trust/%s failed:\n%s", agent_id, traceback.format_exc())
+        return jsonify({"error": "internal_error", "agent_id": agent_id,
+                        "message": "Trust profile generation failed. Check server logs."}), 500
+
+
+def _build_trust_profile(agent_id):
+    """Build and return the STS v1 trust profile JSON response."""
     _lazy_maybe_track_surface_view("agent_trust_page_open", f"agent:{agent_id}")
     history = load_health_history()
     agent_data = history.get(agent_id, {"stats": {}, "checks": []})
@@ -2207,9 +2231,12 @@ def list_trust():
 
 # ── Trust signals storage ──
 def load_trust_signals():
-    if os.path.exists(TRUST_SIGNALS_FILE):
-        with open(TRUST_SIGNALS_FILE) as f:
-            return json.load(f)
+    try:
+        if os.path.exists(TRUST_SIGNALS_FILE):
+            with open(TRUST_SIGNALS_FILE) as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load trust_signals.json: %s", e)
     return {}
 
 def save_trust_signals(data):
@@ -2395,7 +2422,7 @@ def file_dispute():
     try:
         with open(disputes_file) as f:
             disputes = json.load(f)
-    except:
+    except (json.JSONDecodeError, OSError):
         disputes = []
 
     dispute = {
@@ -2429,8 +2456,8 @@ def file_dispute():
                 "priority": "high",
             },
         )
-    except:
-        pass
+    except Exception as e:
+        logger.warning("Failed to notify dispute target: %s", e)
 
     return jsonify({
         "ok": True,
@@ -2453,7 +2480,7 @@ def get_dispute(dispute_id):
     try:
         with open(disputes_file) as f:
             disputes = json.load(f)
-    except:
+    except (json.JSONDecodeError, OSError):
         return jsonify({"ok": False, "error": "No disputes found"}), 404
 
     for d in disputes:
@@ -2487,7 +2514,7 @@ def vote_dispute(dispute_id):
     try:
         with open(disputes_file) as f:
             disputes = json.load(f)
-    except:
+    except (json.JSONDecodeError, OSError):
         return jsonify({"ok": False, "error": "No disputes"}), 404
 
     dispute = None
@@ -2557,7 +2584,7 @@ def list_disputes():
     try:
         with open(disputes_file) as f:
             disputes = json.load(f)
-    except:
+    except (json.JSONDecodeError, OSError):
         disputes = []
 
     if status_filter:
@@ -3055,7 +3082,7 @@ def intel_feed():
                 recent.append({"file": f.name, "data": data})
                 if len(recent) >= 24:  # Max 24 snapshots
                     break
-            except: pass
+            except (json.JSONDecodeError, OSError): pass
         result["signals"]["snapshots_24h"] = recent
 
     result["subscription"] = {
@@ -3248,7 +3275,7 @@ def trust_gate(agent_id):
                         "note": "Agent has behavioral footprint but no attestations — weak prior only"
                     }
                     confidence = min(confidence + 0.05, 0.95)
-            except:
+            except (KeyError, TypeError, ValueError):
                 pass
 
     # MoltBridge live query — cross-platform attestation data
@@ -3273,8 +3300,8 @@ def trust_gate(agent_id):
                 if not cross_platform:
                     cross_platform = True
                     attester_systems.add("moltbridge_live")
-    except:
-        pass  # MoltBridge API unavailable — graceful degradation
+    except Exception as e:
+        logger.debug("MoltBridge API unavailable: %s", e)
 
     # Freshness check — flag stale attestations
     freshness_warning = None
@@ -3287,7 +3314,7 @@ def trust_gate(agent_id):
                 if days_since > 30:
                     freshness_warning = f"Last attestation {days_since} days ago — trust may be stale"
                     confidence = max(confidence - 0.1, 0.1)
-            except:
+            except (ValueError, TypeError):
                 pass
 
     return jsonify({
@@ -3344,7 +3371,7 @@ def trust_capabilities():
         try:
             with open(cap_file) as f:
                 capabilities = json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError):
             pass
 
     # Load attestations for trust scoring
@@ -3443,7 +3470,7 @@ def register_capabilities():
         try:
             with open(cap_file) as f:
                 capabilities = json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError):
             pass
 
     # Add timestamp to each capability
@@ -3490,7 +3517,7 @@ def list_assets():
                     updated_dt = datetime.fromisoformat(last_updated.rstrip("Z"))
                     if (now - updated_dt).total_seconds() > 3600:
                         continue
-                except:
+                except (ValueError, TypeError):
                     continue
             result.append({**asset, "agent_id": agent_id})
 
@@ -3539,7 +3566,7 @@ def register_assets():
         try:
             with open(assets_file) as f:
                 assets = json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError):
             pass
 
     now = datetime.utcnow().isoformat() + "Z"
@@ -3637,7 +3664,7 @@ def monitoring_manifest():
                         updated_dt = datetime.fromisoformat(last_updated.rstrip("Z"))
                         age_seconds = int((now - updated_dt).total_seconds())
                         stale = age_seconds > freshness_secs * 2  # 2x expected freshness = stale
-                    except:
+                    except (ValueError, TypeError):
                         pass
                 monitors.append({
                     "agent_id": agent_id,
@@ -3800,7 +3827,8 @@ def browse_trail(agent_id):
         agent_trust_file = trust_dir / f"{agent_id}.json"
         if agent_trust_file.exists():
             try:
-                td = json.load(open(agent_trust_file))
+                with open(agent_trust_file) as f:
+                    td = json.load(f)
                 for a in td.get("attestations", []):
                     ts = a.get("timestamp", a.get("created_at", now_str))
                     if since and ts < since:
@@ -3815,7 +3843,7 @@ def browse_trail(agent_id):
                         "score": a.get("score"),
                         "detail": a.get("detail", "")
                     })
-            except:
+            except (json.JSONDecodeError, OSError, KeyError):
                 pass
 
         # Given attestations (scan all trust files)
@@ -3823,7 +3851,8 @@ def browse_trail(agent_id):
             if tf.stem == agent_id:
                 continue
             try:
-                td = json.load(open(tf))
+                with open(tf) as f:
+                    td = json.load(f)
                 for a in td.get("attestations", []):
                     if a.get("attester") == agent_id:
                         ts = a.get("timestamp", a.get("created_at", now_str))
@@ -3839,7 +3868,7 @@ def browse_trail(agent_id):
                             "score": a.get("score"),
                             "detail": a.get("detail", "")
                         })
-            except:
+            except (json.JSONDecodeError, OSError, KeyError):
                 pass
 
     # 2. Assets registered
@@ -3847,7 +3876,8 @@ def browse_trail(agent_id):
         assets_file = os.path.join(_DATA_DIR, "assets.json")
         if os.path.exists(assets_file):
             try:
-                all_assets = json.load(open(assets_file))
+                with open(assets_file) as f:
+                    all_assets = json.load(f)
                 for asset in all_assets.get(agent_id, []):
                     ts = asset.get("registered_at", now_str)
                     if since and ts < since:
@@ -3859,7 +3889,7 @@ def browse_trail(agent_id):
                         "asset_type": asset.get("type", "unknown"),
                         "description": asset.get("description", "")[:200]
                     })
-            except:
+            except (json.JSONDecodeError, OSError, KeyError):
                 pass
 
     # 3. Bounties (posted, claimed, completed)
@@ -3902,7 +3932,8 @@ def browse_trail(agent_id):
         escrow_file = _DATA_DIR / "escrow_completions.json"
         if escrow_file.exists():
             try:
-                completions = json.load(open(escrow_file))
+                with open(escrow_file) as f:
+                    completions = json.load(f)
                 for ec in completions:
                     if ec.get("payer") == agent_id or ec.get("payee") == agent_id:
                         ts = ec.get("timestamp", now_str)
@@ -3917,7 +3948,7 @@ def browse_trail(agent_id):
                             "currency": ec.get("currency", "SOL"),
                             "contract_id": ec.get("contract_id", "")
                         })
-            except:
+            except (KeyError, TypeError):
                 pass
 
     # Sort by timestamp descending (most recent first)
@@ -4234,7 +4265,7 @@ def list_demand():
         try:
             with open(demand_file) as f:
                 demands = json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError):
             pass
 
     # Filter
@@ -4292,7 +4323,7 @@ def post_demand():
         try:
             with open(demand_file) as f:
                 demands = json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError):
             pass
 
     demand_id = str(uuid.uuid4())[:8]
@@ -4320,7 +4351,7 @@ def post_demand():
         try:
             with open(cap_file) as f:
                 capabilities = json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError):
             pass
 
     matches = []
@@ -4612,7 +4643,11 @@ def trust_divergence(agent_id):
     Returns divergence score and interpretation — useful for early warning detection.
     When models disagree, the delta itself is a trust signal.
     """
-    from dual_ewma import DualEWMA, TrustState
+    try:
+        from dual_ewma import DualEWMA, TrustState
+    except ImportError:
+        return jsonify({"agent_id": agent_id, "error": "dual_ewma module not available",
+                        "model": "dual-EWMA"}), 501
 
     attestations = load_attestations()
     agent_atts = attestations.get(agent_id, [])
@@ -4706,7 +4741,10 @@ def trust_divergence(agent_id):
 @trust_bp.route("/trust/divergence/network", methods=["GET"])
 def trust_divergence_network():
     """Network-wide divergence aggregate. Shows whether model disagreement is systemic or local."""
-    from dual_ewma import DualEWMA, TrustState
+    try:
+        from dual_ewma import DualEWMA, TrustState
+    except ImportError:
+        return jsonify({"error": "dual_ewma module not available", "model": "dual-EWMA"}), 501
 
     attestations = load_attestations()
     dual = DualEWMA()
@@ -4821,7 +4859,11 @@ def trust_divergence_channels(agent_id):
     Each channel gets its own fast/slow EWMA pair. This catches thin-evidence false alarms
     that aggregate divergence conflates.
     """
-    from dual_ewma import DualEWMA, TrustState
+    try:
+        from dual_ewma import DualEWMA, TrustState
+    except ImportError:
+        return jsonify({"agent_id": agent_id, "error": "dual_ewma module not available",
+                        "model": "dual-EWMA"}), 501
 
     attestations = load_attestations()
     agent_atts = attestations.get(agent_id, [])
@@ -4981,7 +5023,7 @@ def trust_oracle_aggregate(agent_id):
         try:
             since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
             agent_atts = [a for a in agent_atts if a.get("timestamp", "") >= since]
-        except:
+        except (ValueError, TypeError):
             pass
 
     if not agent_atts:
@@ -5010,7 +5052,7 @@ def trust_oracle_aggregate(agent_id):
                 att_time = datetime.fromisoformat(att["timestamp"].replace("Z", "+00:00").replace("+00:00", ""))
                 age_days = (now - att_time).total_seconds() / 86400
                 weight = 0.5 ** (age_days / 30)  # 30-day half-life
-            except:
+            except (ValueError, TypeError):
                 pass
 
         weighted_scores.append({"score": score, "weight": round(weight, 4), "attester": attester})
@@ -5451,7 +5493,7 @@ def load_witnesses():
         try:
             with open(WITNESS_FILE) as f:
                 return json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError):
             return {}
     return {}
 

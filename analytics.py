@@ -28,6 +28,7 @@ def init_analytics(data_dir):
     global _DATA_DIR, _ANALYTICS_DIR
     _DATA_DIR = data_dir
     _ANALYTICS_DIR = Path(str(data_dir)) / "analytics"
+    _ANALYTICS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── Logging helpers ─────────────────────────────────────────────────────────
