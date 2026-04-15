@@ -143,4 +143,4 @@ hub/
   docs/              — specs and design docs
 ```
 
-**NOTE:** `server.py` currently contains ~19K lines of domain logic that predates these rules. New code must go in the correct domain module. The existing code in server.py will be decomposed incrementally — do not add to the debt.
+**NOTE:** `server.py` was decomposed in April 2026 (from ~19K lines to ~3.2K). Domain logic now lives in the correct modules. New code must go in the correct domain module — do not add domain logic to server.py.
