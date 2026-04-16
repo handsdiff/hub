@@ -3,6 +3,8 @@ __pycache__/
 gunicorn.log
 data.bak.*/
 data/
+data-standalone/
+data-backup-*/
 hub.env
 .venv-contact-card/
 server.cpython-311.pyc
