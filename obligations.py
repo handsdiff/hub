@@ -87,6 +87,45 @@ def save_commitments(commits):
     with open(COMMITMENTS_FILE, "w") as f:
         json.dump(commits, f, indent=2)
 
+
+def _format_utc(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_utc(iso_value):
+    return datetime.fromisoformat(iso_value.replace("Z", "+00:00")).replace(tzinfo=None)
+
+
+def _default_deadline_from(now_iso):
+    created = _parse_utc(now_iso) if now_iso else datetime.utcnow()
+    return _format_utc(created + timedelta(days=_COUNTERPARTY_ACCEPTS_DEFAULT_DEADLINE_DAYS))
+
+
+def _resolve_deadline_for_policy(closure_policy, deadline_utc, now_iso):
+    if deadline_utc:
+        return deadline_utc, False, None
+    if closure_policy == "counterparty_accepts":
+        return _default_deadline_from(now_iso), True, None
+    if closure_policy in _DEADLINE_REQUIRED_POLICIES:
+        return None, False, f"deadline_utc is required for closure_policy '{closure_policy}' (prevents indefinite hang)"
+    return None, False, None
+
+
+def _ensure_counterparty_accepts_deadline(obl):
+    if obl.get("closure_policy") != "counterparty_accepts" or obl.get("deadline_utc"):
+        return False
+    deadline = _default_deadline_from(obl.get("created_at"))
+    obl["deadline_utc"] = deadline
+    obl["deadline_defaulted"] = True
+    obl.setdefault("history", []).append({
+        "event": "deadline_defaulted",
+        "at": datetime.utcnow().isoformat() + "Z",
+        "by": "system",
+        "deadline_utc": deadline,
+        "reason": "counterparty_accepts obligations require a deadline; defaulted to 14 days from creation.",
+    })
+    return True
+
 # Valid status transitions (reducer rules from the spec)
 _OBL_TRANSITIONS = {
     "proposed":           ["accepted", "rejected", "withdrawn", "failed", "expired"],
@@ -108,6 +147,9 @@ _OBL_TRANSITIONS = {
 }
 
 _TIMEOUT_POLICIES = ["claimant_self_resolve", "auto_expire", "escalate"]
+
+_COUNTERPARTY_ACCEPTS_DEFAULT_DEADLINE_DAYS = 14
+_EVIDENCE_SUBMITTED_SELF_RESOLVE_HOURS = 48
 
 _WATCHDOG_DEFAULTS = {
     "enabled": True,
@@ -550,10 +592,12 @@ def _check_evidence_submitted_ttl(obl):
     Checks run REGARDLESS of current status (evidence_submitted, ghost_nudged, ghost_escalated).
     Previously bypassed when watchdog changed status from evidence_submitted — fixed here.
 
-    TTL: 24h after last evidence submission, if counterparty still ghost, auto-resolve.
+    TTL: 48h after last evidence submission, if counterparty still ghost, auto-resolve.
     This closes the loop on obligations stuck after bilateral evidence when counterparty ghosts.
     """
     # Check: evidence submitted? (no status gate — run regardless of current status)
+    if obl.get("timeout_policy", "claimant_self_resolve") != "claimant_self_resolve":
+        return False
     evidence_refs = obl.get("evidence_refs", [])
     if not evidence_refs:
         return False
@@ -561,7 +605,7 @@ def _check_evidence_submitted_ttl(obl):
     last_evidence = evidence_refs[-1]
     submitted_at = last_evidence.get("submitted_at", obl.get("created_at", ""))
     hours_since_evidence = _hours_since_iso(submitted_at) if submitted_at else 999
-    if hours_since_evidence < 24:
+    if hours_since_evidence < _EVIDENCE_SUBMITTED_SELF_RESOLVE_HOURS:
         return False
 
     # Check: counterparty ghost?
@@ -570,7 +614,7 @@ def _check_evidence_submitted_ttl(obl):
         return False
 
     # All conditions met: auto-resolve
-    if hours_since_evidence >= 24:
+    if hours_since_evidence >= _EVIDENCE_SUBMITTED_SELF_RESOLVE_HOURS:
         now_iso = datetime.utcnow().isoformat() + "Z"
         closure_policy = obl.get("closure_policy", "counterparty_accepts")
 
@@ -582,7 +626,7 @@ def _check_evidence_submitted_ttl(obl):
             "closure_policy": closure_policy,
             "resolution_reason": f"counterparty '{obl.get('counterparty')}' confirmed ghost "
                                  f"({hours_silent:.0f}h silent), evidence submitted {hours_since_evidence:.0f}h ago, "
-                                 f"24h TTL exceeded. Auto-resolving.",
+                                 f"{_EVIDENCE_SUBMITTED_SELF_RESOLVE_HOURS}h TTL exceeded. Auto-resolving.",
             "evidence_count": len(evidence_refs),
             "evidence_refs": evidence_refs,
             "commitment": obl.get("commitment", ""),
@@ -673,6 +717,8 @@ def _expire_obligations(obls):
     """Check all obligations for deadline expiry, watchdog state changes, and ghost timeouts."""
     changed = False
     for obl in obls:
+        if _ensure_counterparty_accepts_deadline(obl):
+            changed = True
         if _check_deadline_expiry(obl):
             changed = True
         if _check_ghost_watchdog(obl):
@@ -832,13 +878,14 @@ def _can_resolve(obl, agent_id):
     # This MUST run before the policy-specific returns so it overrides counterparty_accepts.
     # Solves: bilateral deadlock where claimant submitted evidence, counterparty is ghost/unresponsive,
     # but system TTL didn't fire (e.g. counterparty_liveness_class = "active" despite being unreachable).
-    if (policy in ("counterparty_accepts", "claimant_self_attests") and
+    if (policy == "counterparty_accepts" and
+        obl.get("timeout_policy", "claimant_self_resolve") == "claimant_self_resolve" and
         obl.get("status") == "evidence_submitted" and
         obl.get("evidence_refs")):
         last_evidence = obl.get("evidence_refs", [{}])[-1].get("submitted_at", "")
         if last_evidence:
             hours_since_evidence = _hours_since_iso(last_evidence) if last_evidence else 999
-            if hours_since_evidence >= 24 and _match("claimant", "created_by"):
+            if hours_since_evidence >= _EVIDENCE_SUBMITTED_SELF_RESOLVE_HOURS and _match("claimant", "created_by"):
                 return True
 
     if policy == "claimant_self_attests":
@@ -928,9 +975,13 @@ def create_obligation():
     if closure_policy not in _CLOSURE_POLICIES:
         return jsonify({"error": f"invalid closure_policy, must be one of: {_CLOSURE_POLICIES}"}), 400
 
-    deadline_utc = data.get("deadline_utc")
-    if closure_policy in _DEADLINE_REQUIRED_POLICIES and not deadline_utc:
-        return jsonify({"error": f"deadline_utc is required for closure_policy '{closure_policy}' (prevents indefinite hang)"}), 400
+    deadline_utc, deadline_defaulted, deadline_error = _resolve_deadline_for_policy(
+        closure_policy,
+        data.get("deadline_utc"),
+        now,
+    )
+    if deadline_error:
+        return jsonify({"error": deadline_error}), 400
 
     timeout_policy = data.get("timeout_policy", "claimant_self_resolve")
     if timeout_policy not in _TIMEOUT_POLICIES:
@@ -991,6 +1042,7 @@ def create_obligation():
         "success_condition": data.get("success_condition"),
         "closure_policy": closure_policy,
         "deadline_utc": deadline_utc,
+        "deadline_defaulted": deadline_defaulted,
         "timeout_policy": timeout_policy,
         "binding_scope_text": data.get("binding_scope_text"),
         "vi_credential_ref": data.get("vi_credential_ref"),
@@ -1211,9 +1263,13 @@ def propose_obligation_public():
     if closure_policy not in _CLOSURE_POLICIES:
         return jsonify({"error": f"invalid closure_policy, must be one of: {_CLOSURE_POLICIES}"}), 400
 
-    deadline_utc = data.get("deadline_utc")
-    if closure_policy in _DEADLINE_REQUIRED_POLICIES and not deadline_utc:
-        return jsonify({"error": f"deadline_utc is required for closure_policy '{closure_policy}' (prevents indefinite hang)"}), 400
+    deadline_utc, deadline_defaulted, deadline_error = _resolve_deadline_for_policy(
+        closure_policy,
+        data.get("deadline_utc"),
+        now,
+    )
+    if deadline_error:
+        return jsonify({"error": deadline_error}), 400
 
     obl = {
         "obligation_id": obl_id,
@@ -1238,6 +1294,7 @@ def propose_obligation_public():
         "success_condition": data.get("success_condition"),
         "closure_policy": closure_policy,
         "deadline_utc": deadline_utc,
+        "deadline_defaulted": deadline_defaulted,
         "timeout_policy": data.get("timeout_policy", "claimant_self_resolve"),
         "binding_scope_text": data.get("binding_scope_text"),
         "reviewer": data.get("reviewer"),
@@ -5492,4 +5549,3 @@ def _mark_dead_lettered_by_id(obl_id, reason):
     if obl:
         _mark_dead_lettered(obl, reason)
         save_obligations(obls)
-
